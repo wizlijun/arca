@@ -48,6 +48,11 @@ impl DatasetConfig {
     /// 序列化失败——那会让 `<dataset>/.arca/dataset.toml` 被静默写成空文件，
     /// 丢失 `dataset_id`/`hub_instance_id` 这类不可变身份信息，且调用方毫无察觉
     /// （违反 I5）。改为返回 `Result`，失败原因交给调用方处理。
+    ///
+    /// `Err` 分支目前不可达：字段全是标量（`u32`/`String`/`Option<String>`/
+    /// `Option<UrlStyle>`），没有表或表数组，`toml` crate 序列化任意取值都不会失败。
+    /// 保留 `Result` 是为未来加字段留防线，没有为 `Err` 分支单独写测试，用这条注释
+    /// 说明判断依据，避免它"静默地无人验证"。
     pub fn to_toml(&self) -> Result<String, FormatError> {
         toml::to_string_pretty(self).map_err(|e| FormatError::Malformed {
             line: 0,
@@ -91,5 +96,20 @@ url_style = "path"
     #[test]
     fn 拒绝缺失必填字段() {
         assert!(DatasetConfig::parse("schema = 1\n").is_err());
+    }
+
+    #[test]
+    fn 往返序列化保持一致() {
+        let text = r#"
+schema = 1
+dataset_id = "9c41000000000000000000000000abcd"
+hub_instance_id = "3f2a000000000000000000000000beef"
+public_base_url = "https://cdn.example.com/assets"
+url_style = "hash"
+"#;
+        let cfg = DatasetConfig::parse(text).unwrap();
+        let serialized = cfg.to_toml().unwrap();
+        let reparsed = DatasetConfig::parse(&serialized).unwrap();
+        assert_eq!(cfg, reparsed);
     }
 }
