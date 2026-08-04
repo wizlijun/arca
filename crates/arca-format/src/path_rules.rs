@@ -6,7 +6,7 @@
 //!
 //! 参考 lazync：`shared/src/nc_path_rules.pas`（继承其规则集与边界处理）。
 //!
-//! TODO(M0)：规则集定义、规范化函数、校验函数、golden vectors。
+//! TODO(M0)：golden vectors（属 Task 5/7 范围）。
 
 use arca_chunk::hash::ContentHash;
 
