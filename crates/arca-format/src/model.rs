@@ -159,4 +159,26 @@ mod tests {
         assert!(VersionId::new("2026-08-04T10:23:02Z", &"0".repeat(32)).is_err()); // 非紧凑形式
         assert!(VersionId::new("20260804T102302Z", "abc").is_err());               // 随机段长度不对
     }
+
+    /// 回归测试（I5）：`timestamp` 恰好 16 字节但由多字节 UTF-8 字符组成，
+    /// 若实现退化回按字符边界切片 `str`（如 `timestamp[..8]`），当某个多字节
+    /// 字符横跨切点时会 panic；本测试确保只返回 `Err`，不 panic。
+    #[test]
+    fn version_id_对多字节输入不_panic() {
+        // "京都鸭" 3 个汉字（各 3 字节）+ "ABCDEFG" 7 个 ASCII 字符 = 16 字节，
+        // 第 8 字节落在「鸭」这个字符内部，不是字符边界。
+        let timestamp = "京都鸭ABCDEFG";
+        assert_eq!(timestamp.len(), 16);
+        assert!(VersionId::new(timestamp, &"0".repeat(32)).is_err());
+    }
+
+    /// 回归测试（I5）：`item_id` 恰好 32 字节但由多字节 UTF-8 字符组成，确保
+    /// `ItemId::parse` 只返回 `Err`，不 panic。
+    #[test]
+    fn item_id_对多字节输入不_panic() {
+        // 10 个汉字（各 3 字节）+ "AB" 2 个 ASCII 字符 = 32 字节。
+        let text = "京都鸭川书法兰亭序扫AB";
+        assert_eq!(text.len(), 32);
+        assert!(ItemId::parse(text).is_err());
+    }
 }
