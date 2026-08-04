@@ -35,9 +35,9 @@ impl IndexRecord {
         if wire.v > RECORD_VERSION {
             return Err(FormatError::UnsupportedVersion { found: wire.v, max: RECORD_VERSION });
         }
-        let item_id = ItemId::parse(&wire.item_id).map_err(|_| FormatError::Malformed {
+        let item_id = ItemId::parse(&wire.item_id).map_err(|e| FormatError::Malformed {
             line: 0,
-            reason: format!("item_id {:?} 不合法", wire.item_id),
+            reason: format!("item_id {:?} 不合法：{e}", wire.item_id),
         })?;
         let path = crate::path_rules::check(&wire.path)?;
         Ok(IndexRecord { item_id, path })
@@ -89,5 +89,19 @@ mod tests {
     fn 拒绝未来的记录版本() {
         let text = r#"{"v":99,"item_id":"3f2a000000000000000000000000beef","path":"a.png"}"#;
         assert!(IndexRecord::parse(text).is_err(), "高于已知版本必须拒绝（I10）");
+    }
+
+    #[test]
+    fn 换行字段被转义而不是裸换行() {
+        // 只测 to_json 的转义行为，不走 parse 往返——path_rules::check 本就会拒绝含
+        // 裸换行的路径（parse 侧已有『拒绝不合规路径』测试覆盖），这里要验证的是
+        // serde_json 序列化本身确实做了转义，而不是原样吐出裸字节。
+        let record = IndexRecord {
+            item_id: ItemId::parse("3f2a000000000000000000000000beef").unwrap(),
+            path: "a\nb.png".into(),
+        };
+        let text = record.to_json().unwrap();
+        assert!(!text.contains('\n'), "应转义而不是裸换行：{text}");
+        assert!(text.contains("\\n"), "应含转义后的 \\n：{text}");
     }
 }

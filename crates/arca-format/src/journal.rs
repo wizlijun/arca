@@ -33,9 +33,10 @@ pub struct JournalEvent {
     pub seq: u64,
     pub op: Op,
     pub item_id: ItemId,
-    /// `upsert`：新写入版本的 id；`tombstone`/`rename`：改动前最后一个存活版本的 id
-    /// （tombstone/rename 都不产生新版本，沿用旧 id）。
-    pub version_id: Option<VersionId>,
+    /// 三种 op 都必填（FORMAT.md §7.2 字段表，没有为空的情形）：
+    /// `upsert` 是新写入版本的 id；`tombstone`/`rename` 是改动前最后一个存活版本的
+    /// id（tombstone/rename 都不产生新版本，沿用旧 id）。
+    pub version_id: VersionId,
     pub path: String,
     /// 仅 `rename` 必填（改名前的路径）；`upsert`/`tombstone` 不出现，线上表示为
     /// 该字段整体缺失（而非序列化为 `null`，见 `to_line`）。
@@ -50,7 +51,7 @@ struct Wire {
     seq: u64,
     op: Op,
     item_id: String,
-    version_id: Option<String>,
+    version_id: String,
     path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     from: Option<String>,
@@ -69,7 +70,7 @@ impl JournalEvent {
             seq: self.seq,
             op: self.op,
             item_id: self.item_id.to_hex(),
-            version_id: self.version_id.as_ref().map(|v| v.as_str().to_string()),
+            version_id: self.version_id.as_str().to_string(),
             path: self.path.clone(),
             from: self.from.clone(),
             actor: self.actor.clone(),
@@ -93,11 +94,10 @@ impl JournalEvent {
         }
         let bad = |reason: String| FormatError::Malformed { line: line_no, reason };
 
-        let item_id = ItemId::parse(&wire.item_id).map_err(|_| bad(format!("item_id {:?} 不合法", wire.item_id)))?;
-        let version_id = match wire.version_id {
-            Some(ref v) => Some(parse_version_id(v).map_err(|_| bad(format!("version_id {v:?} 不合法")))?),
-            None => None,
-        };
+        let item_id = ItemId::parse(&wire.item_id)
+            .map_err(|e| bad(format!("item_id {:?} 不合法：{e}", wire.item_id)))?;
+        let version_id = parse_version_id(&wire.version_id)
+            .map_err(|e| bad(format!("version_id {:?} 不合法：{e}", wire.version_id)))?;
         match wire.op {
             Op::Rename if wire.from.is_none() => {
                 return Err(bad("op=rename 必须携带 from（改名前路径）".to_string()))
@@ -193,13 +193,18 @@ mod tests {
         assert!(Cursor::parse("").is_err());
     }
 
+    /// 测试用固定 version_id：三种 op 均必填（FORMAT.md §7.2 字段表），不存在为空的情形。
+    fn 样例version_id() -> crate::model::VersionId {
+        crate::model::VersionId::new("20260804T102302Z", &"0".repeat(32)).unwrap()
+    }
+
     #[test]
     fn 事件往返一致() {
         let event = JournalEvent {
             seq: 42,
             op: Op::Upsert,
             item_id: crate::model::ItemId::parse("3f2a000000000000000000000000beef").unwrap(),
-            version_id: Some(crate::model::VersionId::new("20260804T102302Z", &"0".repeat(32)).unwrap()),
+            version_id: 样例version_id(),
             path: "京都/鸭川.png".into(),
             from: None,
             actor: crate::model::Actor::default(),
@@ -212,16 +217,32 @@ mod tests {
 
     #[test]
     fn rename_事件携带来源路径() {
-        let line = r#"{"v":1,"seq":1,"op":"rename","item_id":"3f2a000000000000000000000000beef","version_id":null,"path":"新.png","from":"旧.png","actor":{"account":"","device":"","session":""},"at":"2026-08-04T10:00:00Z"}"#;
-        let event = JournalEvent::parse_line(line, 1).unwrap();
+        let line = format!(
+            r#"{{"v":1,"seq":1,"op":"rename","item_id":"3f2a000000000000000000000000beef","version_id":"{}","path":"新.png","from":"旧.png","actor":{{"account":"","device":"","session":""}},"at":"2026-08-04T10:00:00Z"}}"#,
+            样例version_id().as_str()
+        );
+        let event = JournalEvent::parse_line(&line, 1).unwrap();
         assert_eq!(event.op, Op::Rename);
         assert_eq!(event.from.as_deref(), Some("旧.png"));
     }
 
     #[test]
     fn 拒绝未知操作码而不是忽略() {
-        let line = r#"{"v":1,"seq":1,"op":"魔法","item_id":"3f2a000000000000000000000000beef","version_id":null,"path":"a.png","from":null,"actor":{"account":"","device":"","session":""},"at":"t"}"#;
-        assert!(JournalEvent::parse_line(line, 1).is_err());
+        let line = format!(
+            r#"{{"v":1,"seq":1,"op":"魔法","item_id":"3f2a000000000000000000000000beef","version_id":"{}","path":"a.png","from":null,"actor":{{"account":"","device":"","session":""}},"at":"t"}}"#,
+            样例version_id().as_str()
+        );
+        assert!(JournalEvent::parse_line(&line, 1).is_err());
+    }
+
+    #[test]
+    fn 拒绝_version_id_为_null_或缺失的事件() {
+        // FORMAT.md §7.2 字段表：三种 op 的 version_id 都给出了具体来源，没有为空的情形。
+        let with_null = r#"{"v":1,"seq":1,"op":"upsert","item_id":"3f2a000000000000000000000000beef","version_id":null,"path":"a.png","actor":{"account":"","device":"","session":""},"at":"t"}"#;
+        assert!(JournalEvent::parse_line(with_null, 1).is_err(), "version_id 为 null 必须拒绝");
+
+        let missing = r#"{"v":1,"seq":1,"op":"upsert","item_id":"3f2a000000000000000000000000beef","path":"a.png","actor":{"account":"","device":"","session":""},"at":"t"}"#;
+        assert!(JournalEvent::parse_line(missing, 1).is_err(), "version_id 整体缺失同样必须拒绝");
     }
 
     #[test]
@@ -231,7 +252,7 @@ mod tests {
             seq: 1,
             op: Op::Upsert,
             item_id: crate::model::ItemId::parse("3f2a000000000000000000000000beef").unwrap(),
-            version_id: None,
+            version_id: 样例version_id(),
             path: "a.png".into(),
             from: None,
             actor: crate::model::Actor::default(),
@@ -243,14 +264,20 @@ mod tests {
 
     #[test]
     fn 拒绝非_rename_却携带_from的事件() {
-        let line = r#"{"v":1,"seq":1,"op":"upsert","item_id":"3f2a000000000000000000000000beef","version_id":null,"path":"a.png","from":"b.png","actor":{"account":"","device":"","session":""},"at":"t"}"#;
-        assert!(JournalEvent::parse_line(line, 1).is_err(), "upsert 携带 from 是结构性矛盾，必须拒绝而非忽略");
+        let line = format!(
+            r#"{{"v":1,"seq":1,"op":"upsert","item_id":"3f2a000000000000000000000000beef","version_id":"{}","path":"a.png","from":"b.png","actor":{{"account":"","device":"","session":""}},"at":"t"}}"#,
+            样例version_id().as_str()
+        );
+        assert!(JournalEvent::parse_line(&line, 1).is_err(), "upsert 携带 from 是结构性矛盾，必须拒绝而非忽略");
     }
 
     #[test]
     fn 拒绝_rename_却缺失_from的事件() {
-        let line = r#"{"v":1,"seq":1,"op":"rename","item_id":"3f2a000000000000000000000000beef","version_id":null,"path":"a.png","actor":{"account":"","device":"","session":""},"at":"t"}"#;
-        assert!(JournalEvent::parse_line(line, 1).is_err(), "rename 必须携带 from（改名前路径）");
+        let line = format!(
+            r#"{{"v":1,"seq":1,"op":"rename","item_id":"3f2a000000000000000000000000beef","version_id":"{}","path":"a.png","actor":{{"account":"","device":"","session":""}},"at":"t"}}"#,
+            样例version_id().as_str()
+        );
+        assert!(JournalEvent::parse_line(&line, 1).is_err(), "rename 必须携带 from（改名前路径）");
     }
 
     #[test]
@@ -259,7 +286,7 @@ mod tests {
             seq: 1,
             op: Op::Upsert,
             item_id: crate::model::ItemId::parse("3f2a000000000000000000000000beef").unwrap(),
-            version_id: None,
+            version_id: 样例version_id(),
             path: "a.png".into(),
             from: None,
             actor: crate::model::Actor::default(),
@@ -276,7 +303,7 @@ mod tests {
             seq: 1,
             op: Op::Upsert,
             item_id: crate::model::ItemId::parse("3f2a000000000000000000000000beef").unwrap(),
-            version_id: None,
+            version_id: 样例version_id(),
             path: "a.png".into(),
             from: None,
             actor: crate::model::Actor::default(),
@@ -285,5 +312,22 @@ mod tests {
         let line = event.to_line().unwrap();
         let text = format!("{line}\n损坏的行\n{line}\n");
         assert!(parse_stream(&text).is_err(), "中间行损坏必须失败，不得跳过");
+    }
+
+    #[test]
+    fn 换行字段被转义而不是裸换行() {
+        let event = JournalEvent {
+            seq: 1,
+            op: Op::Upsert,
+            item_id: crate::model::ItemId::parse("3f2a000000000000000000000000beef").unwrap(),
+            version_id: 样例version_id(),
+            path: "a\nb.png".into(),
+            from: None,
+            actor: crate::model::Actor::default(),
+            at: "t".into(),
+        };
+        let line = event.to_line().unwrap();
+        assert!(!line.contains('\n'), "应转义而不是裸换行：{line}");
+        assert!(line.contains("\\n"), "应含转义后的 \\n：{line}");
     }
 }

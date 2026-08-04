@@ -57,14 +57,12 @@ pub fn parse_line(line: &str, line_no: usize) -> Result<Version, FormatError> {
     }
     let bad = |reason: String| FormatError::Malformed { line: line_no, reason };
     Ok(Version {
-        version_id: parse_version_id(&wire.version_id).map_err(|_| {
-            bad(format!("version_id {:?} 不合法", wire.version_id))
-        })?,
-        item_id: ItemId::parse(&wire.item_id).map_err(|_| bad(format!("item_id {:?} 不合法", wire.item_id)))?,
+        version_id: parse_version_id(&wire.version_id)
+            .map_err(|e| bad(format!("version_id {:?} 不合法：{e}", wire.version_id)))?,
+        item_id: ItemId::parse(&wire.item_id)
+            .map_err(|e| bad(format!("item_id {:?} 不合法：{e}", wire.item_id)))?,
         parent: match wire.parent {
-            Some(ref p) => Some(
-                parse_version_id(p).map_err(|_| bad(format!("parent {p:?} 不合法")))?,
-            ),
+            Some(ref p) => Some(parse_version_id(p).map_err(|e| bad(format!("parent {p:?} 不合法：{e}")))?),
             None => None,
         },
         hash: ContentHash::parse(&wire.hash).map_err(|e| bad(format!("哈希不合规：{e}")))?,
@@ -188,5 +186,29 @@ mod tests {
         let v1 = 样例版本(None);
         let text = format!("{}\n损坏的行\n{}\n", super::to_line(&v1).unwrap(), super::to_line(&v1).unwrap());
         assert!(super::parse_chain(&text).is_err(), "中间行损坏必须失败，不得跳过");
+    }
+
+    #[test]
+    fn 拒绝首条记录_parent_非_none() {
+        let v1 = 样例版本(Some(VersionId::new("20260804T102302Z", &"0".repeat(32)).unwrap()));
+        let text = format!("{}\n", super::to_line(&v1).unwrap());
+        assert!(super::parse_chain(&text).is_err(), "首条记录的 parent 必须为 null");
+    }
+
+    #[test]
+    fn 拒绝_parent_指向自身的记录() {
+        let mut v1 = 样例版本(None);
+        v1.parent = Some(v1.version_id.clone());
+        let text = format!("{}\n", super::to_line(&v1).unwrap());
+        assert!(super::parse_chain(&text).is_err(), "parent 指向自身也是链断裂的一种，必须拒绝");
+    }
+
+    #[test]
+    fn 换行字段被转义而不是裸换行() {
+        let mut version = 样例版本(None);
+        version.actor.device = "mac\nstudio".to_string();
+        let line = super::to_line(&version).unwrap();
+        assert!(!line.contains('\n'), "应转义而不是裸换行：{line}");
+        assert!(line.contains("\\n"), "应含转义后的 \\n：{line}");
     }
 }
