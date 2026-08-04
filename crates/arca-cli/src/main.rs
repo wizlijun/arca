@@ -8,8 +8,46 @@
 //! - Rule of Silence：成功时安静；数据走 stdout，进度与诊断走 stderr；处处可加 `--json`；
 //! - 与 git 同名的动词语义必须一致：status / fetch / pull / push；`sync` = pull + push。
 
+#![forbid(unsafe_code)]
+
 mod commands;
 
-fn main() {
-    todo!("CLI 骨架：M1 交付 setup/adopt/add/verify/history/restore/gc/bundle + plumbing（spec §12.3）");
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "arca", about = "git 仓库的二进制附件层")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// 巡检一个存储根的完整性（只读，绝不修改任何文件）
+    Fsck {
+        /// 存储根路径（含 files/ 与 .arca/）
+        root: std::path::PathBuf,
+    },
+}
+
+fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Fsck { root } => {
+            let report = arca_store::fsck::check_root(&root);
+            // Rule of Silence：数据走 stdout，诊断走 stderr（spec §3.2）
+            for problem in &report.problems {
+                eprintln!("{problem:?}");
+            }
+            println!(
+                "检查 {} 个文件、{} 个块，发现 {} 个问题",
+                report.checked_files, report.checked_chunks, report.problems.len()
+            );
+            if report.problems.is_empty() {
+                std::process::ExitCode::SUCCESS
+            } else {
+                std::process::ExitCode::from(1)
+            }
+        }
+    }
 }

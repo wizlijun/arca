@@ -12,4 +12,4 @@ arca-format = { path = "../arca-format" }
 arca-chunk = { path = "../arca-chunk" }
 
 [dev-dependencies]
-# 计划依赖（实现时启用）：tempfile
+tempfile = "3.27.0"

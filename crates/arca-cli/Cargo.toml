@@ -17,4 +17,6 @@ arca-format = { path = "../arca-format" }
 arca-chunk = { path = "../arca-chunk" }
 arca-git = { path = "../arca-git" }
 arca-publish = { path = "../arca-publish" }
-# 计划依赖（实现时启用）：clap, serde_json
+clap = { version = "4.6.5", features = ["derive"] }
+arca-store = { version = "0.0.1", path = "../arca-store" }
+# 计划依赖（实现时启用）：serde_json（--json 输出，M1）
