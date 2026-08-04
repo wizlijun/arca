@@ -27,6 +27,7 @@ arca/
     ├── arca-format           ← 格式的纯数据结构 + 解析/序列化 + golden vectors
     ├── arca-core             ← 对账/提交状态机（sans-io，两端共用）
     ├── arca-chunk            ← FastCDC + BLAKE3 + zstd
+    ├── arca-store            ← hub 存储根 IO：布局读写 · 原子提交 · fsck 巡检
     ├── arca-git              ← git 集成：注册表 · .gitignore 反选块 · 清单 · 钩子
     ├── arca-publish          ← 发布映射：publish-map · referenced-only · 静态导出
     ├── arcad                 ← 服务端 daemon（全系统唯一常驻进程）

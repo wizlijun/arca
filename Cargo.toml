@@ -9,6 +9,7 @@ members = [
     "crates/arca-format",
     "crates/arca-core",
     "crates/arca-chunk",
+    "crates/arca-store",
     "crates/arca-git",
     "crates/arca-publish",
     "crates/arcad",
