@@ -42,6 +42,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "cursor"
+path = "fuzz_targets/cursor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "index"
 path = "fuzz_targets/index.rs"
 test = false

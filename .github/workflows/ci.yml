@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    - cron: "0 18 * * *"   # 每晚跑逃生舱演示（UTC 18:00）
+    - cron: "0 18 * * *"   # 每晚跑逃生舱演示 + 完整 fuzz 回归（UTC 18:00）
 
 jobs:
   test:
@@ -19,6 +19,14 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # fuzz/ 故意不在根 workspace 里（保持 workspace 干净、避免污染主构建的
+      # 依赖解析），但这意味着上面三条命令没有一条会碰到它——如果哪次改动
+      # 让某个 fuzz target 编不过（比如改了被 fuzz 的函数签名），必须在这里
+      # 就报错，而不是等到有人手动跑 cargo fuzz build 才发现。只 check 不
+      # build/run：不需要 nightly 或 cargo-fuzz 本身，实测 stable 工具链
+      # 就能 check 通过（libfuzzer-sys 只在真正 fuzz build/run 时才需要
+      # cargo-fuzz 注入的 sanitizer coverage RUSTFLAGS，plain check 不需要）。
+      - run: cargo check --manifest-path fuzz/Cargo.toml --locked
 
   msrv:
     name: MSRV 1.85 构建门禁
@@ -34,15 +42,22 @@ jobs:
   escape-hatch:
     name: 逃生舱恢复演示（I1）
     runs-on: ubuntu-latest
-    # 验证的是长期承诺而非本次改动（见
-    # crates/arca-conformance/tests/escape-hatch/README.md），因此只在每晚
-    # 定时触发时跑，不占用每次 push/PR 的 CI 时间。
-    if: github.event_name == 'schedule'
+    # I1 是头号承诺，不能只靠事后（cron）发现回归——每次 push/PR 都跑。
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - name: 安装 b3sum
-        run: cargo install b3sum --locked
+        # 用 BLAKE3 官方预编译二进制而非 `cargo install b3sum`：后者要编译，
+        # 本机实测约 1-2 分钟；下载预编译二进制实测 <5 秒（本机到 GitHub 的
+        # 下载耗时，CI runner 到 github.com 的下载通常更快，同为 GitHub
+        # 基础设施内网）。版本号与校验和都固定值锁死（1.8.5，与
+        # crates/arca-chunk/Cargo.toml 里 blake3 crate 的版本一致），
+        # 不用 "latest"，避免上游发新版后 CI 静默换了一个没验证过的二进制。
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/b3sum" \
+            https://github.com/BLAKE3-team/BLAKE3/releases/download/1.8.5/b3sum_linux_x64_bin
+          echo "f50bce4fc682c2eba7e417fdc271c3e7ea6e9511568213878dbf2c115facf6f4  $RUNNER_TEMP/b3sum" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/b3sum"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: 造夹具并恢复
         run: |
           chmod +x crates/arca-conformance/tests/escape-hatch/*.sh
@@ -58,3 +73,37 @@ jobs:
             echo "篡改未被检出——逃生舱校验失效" >&2
             exit 1
           fi
+
+  fuzz:
+    name: fuzz 回归（含 ASAN，每晚）／${{ matrix.target }}
+    runs-on: ubuntu-latest
+    # 每晚而非每次 PR：60 秒 × 11 个 target 即使并行也不该占用日常 PR 反馈
+    # 时间；但必须真的跑起来，否则「fuzz 覆盖了 I5」就只是写在报告里的话。
+    # ubuntu-latest 上 ASAN 工作正常（本机 macOS + Apple Silicon 的 ASAN
+    # 启动即挂起是本机环境问题，见 task-11-report.md），这里不传
+    # --sanitizer none，用 cargo-fuzz 默认的 ASAN——decompress 背后
+    # zstd-sys 的 FFI/C 库边界只有 ASAN 能覆盖，纯 `let _ =` 的 target
+    # 本身不做正确性断言，靠的就是 ASAN 抓内存破坏。
+    if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - manifest
+          - items
+          - journal
+          - cursor
+          - index
+          - format_json
+          - dataset
+          - registry
+          - path_rules
+          - trace
+          - decompress
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-12-04
+      - run: cargo install cargo-fuzz
+      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
