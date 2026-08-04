@@ -77,8 +77,9 @@ fn 缺少_format_json_时报告而不是崩溃() {
 }
 
 /// 权限错误与「文件不存在」是不同性质的故障，不可折叠成同一个诊断（I5）。
-/// 用 chmod 0o000 模拟「读不了」而非「不存在」——CI/开发机都以非 root 用户跑测试，
-/// 拿掉读权限后自身也无法读取（root 会绕过权限位，这条测试因此假定非 root 运行）。
+/// 用 chmod 0o000 模拟「读不了」而非「不存在」——但 chmod 对 root 无效、部分文件系统
+/// 也不支持权限位，所以 chmod 之后先自证一次假设是否成立，不成立就跳过（打印说明，
+/// 不静默跳过），不假设当前一定以非 root 身份运行。
 #[test]
 #[cfg(unix)]
 fn 检出文件读取权限错误而不是缺失() {
@@ -88,6 +89,14 @@ fn 检出文件读取权限错误而不是缺失() {
     造一个健康的存储根(dir.path());
     let file = dir.path().join("files/note.txt");
     fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // chmod 对 root 无效，某些文件系统也不支持权限位；
+    // 先验证假设成立，不成立就跳过而不是假装测过了。
+    if fs::read(&file).is_ok() {
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        eprintln!("跳过：当前用户不受 chmod 0o000 限制（root 或文件系统不支持权限位）");
+        return;
+    }
 
     let report = check_root(dir.path());
     // 恢复权限，否则 tempdir 在 Drop 时清理不掉这个文件。
@@ -122,6 +131,14 @@ fn 检出块文件权限错误而不是内容损坏() {
     let chunk_path = shard.join(format!("{hex}.zst"));
     fs::write(&chunk_path, packed).unwrap();
     fs::set_permissions(&chunk_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+    // chmod 对 root 无效，某些文件系统也不支持权限位；
+    // 先验证假设成立，不成立就跳过而不是假装测过了。
+    if fs::read(&chunk_path).is_ok() {
+        fs::set_permissions(&chunk_path, fs::Permissions::from_mode(0o644)).unwrap();
+        eprintln!("跳过：当前用户不受 chmod 0o000 限制（root 或文件系统不支持权限位）");
+        return;
+    }
 
     let report = check_root(dir.path());
     fs::set_permissions(&chunk_path, fs::Permissions::from_mode(0o644)).unwrap();
