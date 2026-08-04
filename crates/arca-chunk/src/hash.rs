@@ -149,4 +149,19 @@ mod tests {
         // 大写十六进制不接受：文本表示必须确定性（同内容必同字节）
         assert!(ContentHash::parse(&format!("blake3:{}", EMPTY_HEX.to_uppercase())).is_err());
     }
+
+    #[test]
+    fn sha256_空输入匹配官方向量() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_输出恒为64位小写十六进制() {
+        let hex = sha256_hex(b"git manages text, arca manages binaries");
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+    }
 }
