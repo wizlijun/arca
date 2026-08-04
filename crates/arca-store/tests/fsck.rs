@@ -76,6 +76,66 @@ fn 缺少_format_json_时报告而不是崩溃() {
     assert!(report.problems.iter().any(|p| matches!(p, Problem::MissingFormatJson)));
 }
 
+/// 权限错误与「文件不存在」是不同性质的故障，不可折叠成同一个诊断（I5）。
+/// 用 chmod 0o000 模拟「读不了」而非「不存在」——CI/开发机都以非 root 用户跑测试，
+/// 拿掉读权限后自身也无法读取（root 会绕过权限位，这条测试因此假定非 root 运行）。
+#[test]
+#[cfg(unix)]
+fn 检出文件读取权限错误而不是缺失() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    造一个健康的存储根(dir.path());
+    let file = dir.path().join("files/note.txt");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let report = check_root(dir.path());
+    // 恢复权限，否则 tempdir 在 Drop 时清理不掉这个文件。
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(
+        report.problems.iter().any(|p| matches!(p, Problem::IoError { .. })),
+        "权限错误应报告为 IoError，不是 MissingFile，实得 {:?}", report.problems
+    );
+    assert!(
+        !report.problems.iter().any(|p| matches!(p, Problem::MissingFile { .. })),
+        "权限错误不应被误报成文件缺失，实得 {:?}", report.problems
+    );
+}
+
+/// 同上，但覆盖 chunks/ 分支：读不到块（IO 错误）与读到了但内容不对
+/// （`CorruptChunk`）必须分开报告。
+#[test]
+#[cfg(unix)]
+fn 检出块文件权限错误而不是内容损坏() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    造一个健康的存储根(dir.path());
+
+    let content = b"chunk content";
+    let hash = ContentHash::from_bytes(content);
+    let packed = arca_chunk::compress::compress(content).unwrap();
+    let hex = hash.to_hex();
+    let shard = dir.path().join(".arca/chunks").join(&hex[..2]);
+    fs::create_dir_all(&shard).unwrap();
+    let chunk_path = shard.join(format!("{hex}.zst"));
+    fs::write(&chunk_path, packed).unwrap();
+    fs::set_permissions(&chunk_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let report = check_root(dir.path());
+    fs::set_permissions(&chunk_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(
+        report.problems.iter().any(|p| matches!(p, Problem::IoError { .. })),
+        "权限错误应报告为 IoError，不是 CorruptChunk，实得 {:?}", report.problems
+    );
+    assert!(
+        !report.problems.iter().any(|p| matches!(p, Problem::CorruptChunk { .. })),
+        "权限错误不应被误报成块内容损坏，实得 {:?}", report.problems
+    );
+}
+
 #[test]
 fn fsck_绝不修改任何文件() {
     let dir = tempfile::tempdir().unwrap();

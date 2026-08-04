@@ -5,13 +5,12 @@
 //!
 //! 消费者：`arca fsck`（CLI）与 M2 的 `arcad` / `arca gc`——
 //! gc 与 fsck 共享引用计数校验。
-//!
-//! TODO(M0)：check_root 及其报告结构，见实现计划 Task 9。
 
 use arca_chunk::hash::ContentHash;
 use arca_format::hub_layout::{layout, FormatJson};
 use arca_format::{items, path_rules};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 
 /// 一条巡检发现的问题。变体覆盖 FORMAT.md §5–§8 定义的各类损坏形态。
@@ -21,7 +20,7 @@ pub enum Problem {
     MissingFormatJson,
     /// `format.json` 存在但无法解析或版本不受支持。
     BadFormatJson(String),
-    /// 当前版本在 `files/` 下缺失。
+    /// 当前版本在 `files/` 下缺失（`ErrorKind::NotFound`）。
     MissingFile { path: String },
     /// `files/` 下的字节内容哈希与版本记录不一致。
     HashMismatch { path: String, expected: String, actual: String },
@@ -31,8 +30,12 @@ pub enum Problem {
     OrphanIndex { key: String },
     /// `items/<xx>/<item_id>.jsonl` 无法解析为合法版本链。
     BrokenChain { item: String, reason: String },
-    /// `chunks/<xx>/<hash>.zst` 解压后哈希与文件名不一致，或无法解压。
+    /// `chunks/<xx>/<hash>.zst` 读出来了，但解压失败或解压后哈希与文件名不一致——
+    /// 内容本身有问题，不是"读不到"（那是 [`Problem::IoError`]）。
     CorruptChunk { hash: String },
+    /// 读取失败但不是"文件不存在"（权限、损坏的挂载点等 IO 错误）——与「内容不对」
+    /// 是不同性质的故障，绝不可折叠成同一个诊断（I5：如实报告失败的性质）。
+    IoError { path: String, reason: String },
 }
 
 /// 巡检报告：发现的问题 + 已检查的文件/块计数。
@@ -100,7 +103,13 @@ pub fn check_root(root: &Path) -> FsckReport {
             let physical = root.join(layout::FILES_DIR).join(&logical);
             report.checked_files += 1;
             match fs::read(&physical) {
-                Err(_) => report.problems.push(Problem::MissingFile { path: logical }),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    report.problems.push(Problem::MissingFile { path: logical })
+                }
+                Err(e) => report.problems.push(Problem::IoError {
+                    path: logical,
+                    reason: e.to_string(),
+                }),
                 Ok(bytes) => {
                     if bytes.len() as u64 != current.size {
                         report.problems.push(Problem::SizeMismatch {
@@ -122,7 +131,8 @@ pub fn check_root(root: &Path) -> FsckReport {
         }
     }
 
-    // 3. 块存储：每个块解压后哈希必须与文件名一致
+    // 3. 块存储：每个块解压后哈希必须与文件名一致。读不到（IO 错误）与读到了但
+    //    内容不对（解压失败/哈希不符）是两种不同性质的故障，分别报告（I5）。
     for shard in read_dir_sorted(&root.join(layout::CHUNKS_DIR)) {
         for chunk_file in read_dir_sorted(&shard) {
             report.checked_chunks += 1;
@@ -130,9 +140,17 @@ pub fn check_root(root: &Path) -> FsckReport {
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let ok = fs::read(&chunk_file)
-                .ok()
-                .and_then(|packed| arca_chunk::compress::decompress(&packed).ok())
+            let packed = match fs::read(&chunk_file) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    report.problems.push(Problem::IoError {
+                        path: chunk_file.display().to_string(),
+                        reason: e.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let ok = arca_chunk::compress::decompress(&packed)
                 .map(|raw| ContentHash::from_bytes(&raw).to_hex() == name)
                 .unwrap_or(false);
             if !ok {

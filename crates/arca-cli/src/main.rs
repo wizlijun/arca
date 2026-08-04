@@ -35,17 +35,19 @@ fn main() -> std::process::ExitCode {
     match cli.command {
         Command::Fsck { root } => {
             let report = arca_store::fsck::check_root(&root);
-            // Rule of Silence：数据走 stdout，诊断走 stderr（spec §3.2）
-            for problem in &report.problems {
-                eprintln!("{problem:?}");
-            }
-            println!(
-                "检查 {} 个文件、{} 个块，发现 {} 个问题",
-                report.checked_files, report.checked_chunks, report.problems.len()
-            );
+            // Rule of Silence（spec §3.2）：成功时安静，退出码 0 本身就是答案。
+            // 摘要行是诊断，不是可脚本消费的数据，连同逐条问题一起走 stderr；
+            // 干净时完全不打印任何东西。
             if report.problems.is_empty() {
                 std::process::ExitCode::SUCCESS
             } else {
+                for problem in &report.problems {
+                    eprintln!("{problem:?}");
+                }
+                eprintln!(
+                    "检查 {} 个文件、{} 个块，发现 {} 个问题",
+                    report.checked_files, report.checked_chunks, report.problems.len()
+                );
                 std::process::ExitCode::from(1)
             }
         }
