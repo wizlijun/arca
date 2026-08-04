@@ -8,5 +8,9 @@ rust-version.workspace = true
 homepage.workspace = true
 
 [dependencies]
+arca-chunk = { version = "0.0.1", path = "../arca-chunk" }
+
+[dev-dependencies]
+proptest = "1.8.0"
 # 计划依赖（实现时启用）：serde, toml
 # 纪律（spec §11.3）：零重依赖、可嵌入；损坏输入 → 明确错误，绝不 panic（fuzz 覆盖）
