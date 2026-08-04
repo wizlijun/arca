@@ -76,8 +76,10 @@ impl JournalEvent {
             actor: self.actor.clone(),
             at: self.at.clone(),
         };
-        serde_json::to_string(&wire)
-            .map_err(|e| FormatError::Malformed { line: 0, reason: format!("journal 事件序列化失败：{e}") })
+        serde_json::to_string(&wire).map_err(|e| FormatError::Malformed {
+            line: 0,
+            reason: format!("journal 事件序列化失败：{e}"),
+        })
     }
 
     /// 解析单行事件。除结构/取值合法性外，还校验 FORMAT.md §7.2 字段表规定的
@@ -90,9 +92,15 @@ impl JournalEvent {
             reason: format!("JSON 解析失败：{e}"),
         })?;
         if wire.v > RECORD_VERSION {
-            return Err(FormatError::UnsupportedVersion { found: wire.v, max: RECORD_VERSION });
+            return Err(FormatError::UnsupportedVersion {
+                found: wire.v,
+                max: RECORD_VERSION,
+            });
         }
-        let bad = |reason: String| FormatError::Malformed { line: line_no, reason };
+        let bad = |reason: String| FormatError::Malformed {
+            line: line_no,
+            reason,
+        };
 
         let item_id = ItemId::parse(&wire.item_id)
             .map_err(|e| bad(format!("item_id {:?} 不合法：{e}", wire.item_id)))?;
@@ -159,13 +167,19 @@ impl Cursor {
             reason: format!("游标 {text:?} 缺少 ':' 分隔符"),
         })?;
         if epoch.is_empty() {
-            return Err(FormatError::Malformed { line: 0, reason: "游标 epoch 部分为空".to_string() });
+            return Err(FormatError::Malformed {
+                line: 0,
+                reason: "游标 epoch 部分为空".to_string(),
+            });
         }
         let seq: u64 = seq.parse().map_err(|_| FormatError::Malformed {
             line: 0,
             reason: format!("游标 seq 部分 {seq:?} 不是无符号整数"),
         })?;
-        Ok(Cursor { epoch: epoch.to_string(), seq })
+        Ok(Cursor {
+            epoch: epoch.to_string(),
+            seq,
+        })
     }
 }
 
@@ -181,7 +195,10 @@ mod tests {
 
     #[test]
     fn 游标往返一致() {
-        let cursor = Cursor { epoch: "abc123".into(), seq: 42 };
+        let cursor = Cursor {
+            epoch: "abc123".into(),
+            seq: 42,
+        };
         assert_eq!(cursor.to_string(), "abc123:42");
         assert_eq!(Cursor::parse("abc123:42").unwrap(), cursor);
     }
@@ -239,10 +256,16 @@ mod tests {
     fn 拒绝_version_id_为_null_或缺失的事件() {
         // FORMAT.md §7.2 字段表：三种 op 的 version_id 都给出了具体来源，没有为空的情形。
         let with_null = r#"{"v":1,"seq":1,"op":"upsert","item_id":"3f2a000000000000000000000000beef","version_id":null,"path":"a.png","actor":{"account":"","device":"","session":""},"at":"t"}"#;
-        assert!(JournalEvent::parse_line(with_null, 1).is_err(), "version_id 为 null 必须拒绝");
+        assert!(
+            JournalEvent::parse_line(with_null, 1).is_err(),
+            "version_id 为 null 必须拒绝"
+        );
 
         let missing = r#"{"v":1,"seq":1,"op":"upsert","item_id":"3f2a000000000000000000000000beef","path":"a.png","actor":{"account":"","device":"","session":""},"at":"t"}"#;
-        assert!(JournalEvent::parse_line(missing, 1).is_err(), "version_id 整体缺失同样必须拒绝");
+        assert!(
+            JournalEvent::parse_line(missing, 1).is_err(),
+            "version_id 整体缺失同样必须拒绝"
+        );
     }
 
     #[test]
@@ -259,7 +282,10 @@ mod tests {
             at: "t".into(),
         };
         let line = event.to_line().unwrap();
-        assert!(!line.contains("\"from\""), "upsert 不应携带 from 字段：{line}");
+        assert!(
+            !line.contains("\"from\""),
+            "upsert 不应携带 from 字段：{line}"
+        );
     }
 
     #[test]
@@ -268,7 +294,10 @@ mod tests {
             r#"{{"v":1,"seq":1,"op":"upsert","item_id":"3f2a000000000000000000000000beef","version_id":"{}","path":"a.png","from":"b.png","actor":{{"account":"","device":"","session":""}},"at":"t"}}"#,
             样例version_id().as_str()
         );
-        assert!(JournalEvent::parse_line(&line, 1).is_err(), "upsert 携带 from 是结构性矛盾，必须拒绝而非忽略");
+        assert!(
+            JournalEvent::parse_line(&line, 1).is_err(),
+            "upsert 携带 from 是结构性矛盾，必须拒绝而非忽略"
+        );
     }
 
     #[test]
@@ -277,7 +306,10 @@ mod tests {
             r#"{{"v":1,"seq":1,"op":"rename","item_id":"3f2a000000000000000000000000beef","version_id":"{}","path":"a.png","actor":{{"account":"","device":"","session":""}},"at":"t"}}"#,
             样例version_id().as_str()
         );
-        assert!(JournalEvent::parse_line(&line, 1).is_err(), "rename 必须携带 from（改名前路径）");
+        assert!(
+            JournalEvent::parse_line(&line, 1).is_err(),
+            "rename 必须携带 from（改名前路径）"
+        );
     }
 
     #[test]
@@ -292,7 +324,10 @@ mod tests {
             actor: crate::model::Actor::default(),
             at: "t".into(),
         };
-        let text = format!("{}\n{{\"v\":1,\"seq\":2,\"op\":\"up", event.to_line().unwrap());
+        let text = format!(
+            "{}\n{{\"v\":1,\"seq\":2,\"op\":\"up",
+            event.to_line().unwrap()
+        );
         let events = parse_stream(&text).expect("末行不完整应截断到最后完整行");
         assert_eq!(events.len(), 1);
     }

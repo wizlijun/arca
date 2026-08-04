@@ -22,9 +22,15 @@ fn 造一个健康的存储根(root: &Path) -> ContentHash {
 
     let item_line = format!(
         r#"{{"v":1,"version_id":"20260804T102302Z-{}","item_id":"3f2a000000000000000000000000beef","parent":null,"hash":"{}","size":{},"mtime":"2026-08-04T10:00:00Z","actor":{{"account":"","device":"","session":""}},"committed_at":"2026-08-04T10:00:00Z"}}"#,
-        "0".repeat(32), hash.to_text(), content.len()
+        "0".repeat(32),
+        hash.to_text(),
+        content.len()
     );
-    fs::write(root.join(".arca/items/3f/3f2a000000000000000000000000beef.jsonl"), format!("{item_line}\n")).unwrap();
+    fs::write(
+        root.join(".arca/items/3f/3f2a000000000000000000000000beef.jsonl"),
+        format!("{item_line}\n"),
+    )
+    .unwrap();
 
     let key = arca_format::path_rules::index_key("note.txt");
     let shard = root.join(".arca/index").join(&key.to_hex()[..2]);
@@ -32,7 +38,8 @@ fn 造一个健康的存储根(root: &Path) -> ContentHash {
     fs::write(
         shard.join(format!("{}.json", key.to_hex())),
         r#"{"v":1,"item_id":"3f2a000000000000000000000000beef","path":"note.txt"}"#,
-    ).unwrap();
+    )
+    .unwrap();
 
     hash
 }
@@ -42,7 +49,11 @@ fn 健康的存储根零问题() {
     let dir = tempfile::tempdir().unwrap();
     造一个健康的存储根(dir.path());
     let report = check_root(dir.path());
-    assert!(report.problems.is_empty(), "不应有问题，实得 {:?}", report.problems);
+    assert!(
+        report.problems.is_empty(),
+        "不应有问题，实得 {:?}",
+        report.problems
+    );
     assert_eq!(report.checked_files, 1);
 }
 
@@ -54,8 +65,12 @@ fn 检出内容被篡改() {
 
     let report = check_root(dir.path());
     assert!(
-        report.problems.iter().any(|p| matches!(p, Problem::HashMismatch { .. })),
-        "应检出哈希不匹配，实得 {:?}", report.problems
+        report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::HashMismatch { .. })),
+        "应检出哈希不匹配，实得 {:?}",
+        report.problems
     );
 }
 
@@ -66,14 +81,20 @@ fn 检出当前版本文件缺失() {
     fs::remove_file(dir.path().join("files/note.txt")).unwrap();
 
     let report = check_root(dir.path());
-    assert!(report.problems.iter().any(|p| matches!(p, Problem::MissingFile { .. })));
+    assert!(report
+        .problems
+        .iter()
+        .any(|p| matches!(p, Problem::MissingFile { .. })));
 }
 
 #[test]
 fn 缺少_format_json_时报告而不是崩溃() {
     let dir = tempfile::tempdir().unwrap();
     let report = check_root(dir.path());
-    assert!(report.problems.iter().any(|p| matches!(p, Problem::MissingFormatJson)));
+    assert!(report
+        .problems
+        .iter()
+        .any(|p| matches!(p, Problem::MissingFormatJson)));
 }
 
 /// 权限错误与「文件不存在」是不同性质的故障，不可折叠成同一个诊断（I5）。
@@ -103,12 +124,20 @@ fn 检出文件读取权限错误而不是缺失() {
     fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
 
     assert!(
-        report.problems.iter().any(|p| matches!(p, Problem::IoError { .. })),
-        "权限错误应报告为 IoError，不是 MissingFile，实得 {:?}", report.problems
+        report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::IoError { .. })),
+        "权限错误应报告为 IoError，不是 MissingFile，实得 {:?}",
+        report.problems
     );
     assert!(
-        !report.problems.iter().any(|p| matches!(p, Problem::MissingFile { .. })),
-        "权限错误不应被误报成文件缺失，实得 {:?}", report.problems
+        !report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::MissingFile { .. })),
+        "权限错误不应被误报成文件缺失，实得 {:?}",
+        report.problems
     );
 }
 
@@ -144,12 +173,20 @@ fn 检出块文件权限错误而不是内容损坏() {
     fs::set_permissions(&chunk_path, fs::Permissions::from_mode(0o644)).unwrap();
 
     assert!(
-        report.problems.iter().any(|p| matches!(p, Problem::IoError { .. })),
-        "权限错误应报告为 IoError，不是 CorruptChunk，实得 {:?}", report.problems
+        report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::IoError { .. })),
+        "权限错误应报告为 IoError，不是 CorruptChunk，实得 {:?}",
+        report.problems
     );
     assert!(
-        !report.problems.iter().any(|p| matches!(p, Problem::CorruptChunk { .. })),
-        "权限错误不应被误报成块内容损坏，实得 {:?}", report.problems
+        !report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::CorruptChunk { .. })),
+        "权限错误不应被误报成块内容损坏，实得 {:?}",
+        report.problems
     );
 }
 

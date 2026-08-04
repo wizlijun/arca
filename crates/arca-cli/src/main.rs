@@ -46,7 +46,9 @@ fn main() -> std::process::ExitCode {
                 }
                 eprintln!(
                     "检查 {} 个文件、{} 个块，发现 {} 个问题",
-                    report.checked_files, report.checked_chunks, report.problems.len()
+                    report.checked_files,
+                    report.checked_chunks,
+                    report.problems.len()
                 );
                 std::process::ExitCode::from(1)
             }

@@ -43,8 +43,10 @@ pub fn to_line(version: &Version) -> Result<String, FormatError> {
         actor: version.actor.clone(),
         committed_at: version.committed_at.clone(),
     };
-    serde_json::to_string(&wire)
-        .map_err(|e| FormatError::Malformed { line: 0, reason: format!("版本记录序列化失败：{e}") })
+    serde_json::to_string(&wire).map_err(|e| FormatError::Malformed {
+        line: 0,
+        reason: format!("版本记录序列化失败：{e}"),
+    })
 }
 
 pub fn parse_line(line: &str, line_no: usize) -> Result<Version, FormatError> {
@@ -53,16 +55,24 @@ pub fn parse_line(line: &str, line_no: usize) -> Result<Version, FormatError> {
         reason: format!("JSON 解析失败：{e}"),
     })?;
     if wire.v > RECORD_VERSION {
-        return Err(FormatError::UnsupportedVersion { found: wire.v, max: RECORD_VERSION });
+        return Err(FormatError::UnsupportedVersion {
+            found: wire.v,
+            max: RECORD_VERSION,
+        });
     }
-    let bad = |reason: String| FormatError::Malformed { line: line_no, reason };
+    let bad = |reason: String| FormatError::Malformed {
+        line: line_no,
+        reason,
+    };
     Ok(Version {
         version_id: parse_version_id(&wire.version_id)
             .map_err(|e| bad(format!("version_id {:?} 不合法：{e}", wire.version_id)))?,
         item_id: ItemId::parse(&wire.item_id)
             .map_err(|e| bad(format!("item_id {:?} 不合法：{e}", wire.item_id)))?,
         parent: match wire.parent {
-            Some(ref p) => Some(parse_version_id(p).map_err(|e| bad(format!("parent {p:?} 不合法：{e}")))?),
+            Some(ref p) => {
+                Some(parse_version_id(p).map_err(|e| bad(format!("parent {p:?} 不合法：{e}")))?)
+            }
             None => None,
         },
         hash: ContentHash::parse(&wire.hash).map_err(|e| bad(format!("哈希不合规：{e}")))?,
@@ -128,7 +138,11 @@ mod tests {
             hash: ContentHash::from_bytes(b"content"),
             size: 2411008,
             mtime: "2026-08-04T10:22:31Z".into(),
-            actor: Actor { account: "bruce".into(), device: "mac".into(), session: "s1".into() },
+            actor: Actor {
+                account: "bruce".into(),
+                device: "mac".into(),
+                session: "s1".into(),
+            },
             committed_at: "2026-08-04T10:23:05Z".into(),
         }
     }
@@ -155,7 +169,11 @@ mod tests {
             parent: Some(v1.version_id.clone()),
             ..样例版本(None)
         };
-        let text = format!("{}\n{}\n", super::to_line(&v1).unwrap(), super::to_line(&v2).unwrap());
+        let text = format!(
+            "{}\n{}\n",
+            super::to_line(&v1).unwrap(),
+            super::to_line(&v2).unwrap()
+        );
         let chain = super::parse_chain(&text).unwrap();
         assert_eq!(chain.len(), 2);
     }
@@ -165,10 +183,17 @@ mod tests {
         let v1 = 样例版本(None);
         let 孤儿 = crate::model::Version {
             version_id: VersionId::new("20260804T102400Z", &"1".repeat(32)).unwrap(),
-            parent: Some(VersionId::new("20260804T999999Z", &"9".repeat(32)).unwrap_or_else(|_| v1.version_id.clone())),
+            parent: Some(
+                VersionId::new("20260804T999999Z", &"9".repeat(32))
+                    .unwrap_or_else(|_| v1.version_id.clone()),
+            ),
             ..样例版本(None)
         };
-        let text = format!("{}\n{}\n", super::to_line(&v1).unwrap(), super::to_line(&孤儿).unwrap());
+        let text = format!(
+            "{}\n{}\n",
+            super::to_line(&v1).unwrap(),
+            super::to_line(&孤儿).unwrap()
+        );
         // parent 不指向上一行 → 链断裂，必须报错而非跳过
         assert!(super::parse_chain(&text).is_err());
     }
@@ -184,15 +209,27 @@ mod tests {
     #[test]
     fn 中间行损坏则失败() {
         let v1 = 样例版本(None);
-        let text = format!("{}\n损坏的行\n{}\n", super::to_line(&v1).unwrap(), super::to_line(&v1).unwrap());
-        assert!(super::parse_chain(&text).is_err(), "中间行损坏必须失败，不得跳过");
+        let text = format!(
+            "{}\n损坏的行\n{}\n",
+            super::to_line(&v1).unwrap(),
+            super::to_line(&v1).unwrap()
+        );
+        assert!(
+            super::parse_chain(&text).is_err(),
+            "中间行损坏必须失败，不得跳过"
+        );
     }
 
     #[test]
     fn 拒绝首条记录_parent_非_none() {
-        let v1 = 样例版本(Some(VersionId::new("20260804T102302Z", &"0".repeat(32)).unwrap()));
+        let v1 = 样例版本(Some(
+            VersionId::new("20260804T102302Z", &"0".repeat(32)).unwrap(),
+        ));
         let text = format!("{}\n", super::to_line(&v1).unwrap());
-        assert!(super::parse_chain(&text).is_err(), "首条记录的 parent 必须为 null");
+        assert!(
+            super::parse_chain(&text).is_err(),
+            "首条记录的 parent 必须为 null"
+        );
     }
 
     #[test]
@@ -200,7 +237,10 @@ mod tests {
         let mut v1 = 样例版本(None);
         v1.parent = Some(v1.version_id.clone());
         let text = format!("{}\n", super::to_line(&v1).unwrap());
-        assert!(super::parse_chain(&text).is_err(), "parent 指向自身也是链断裂的一种，必须拒绝");
+        assert!(
+            super::parse_chain(&text).is_err(),
+            "parent 指向自身也是链断裂的一种，必须拒绝"
+        );
     }
 
     #[test]

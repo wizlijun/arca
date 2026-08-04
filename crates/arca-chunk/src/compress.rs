@@ -85,7 +85,10 @@ mod tests {
 
     #[test]
     fn 空输入往返一致() {
-        assert_eq!(decompress(&compress(b"").unwrap()).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            decompress(&compress(b"").unwrap()).unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
@@ -131,7 +134,9 @@ mod tests {
     #[test]
     fn 恰好等于块上限的数据仍能正常解压往返() {
         // 上一条测试的边界回归：MAX_CHUNK+1 被拒绝不代表 MAX_CHUNK 本身被误拒。
-        let data: Vec<u8> = (0..crate::cdc::MAX_CHUNK as u32).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u8> = (0..crate::cdc::MAX_CHUNK as u32)
+            .map(|i| (i % 251) as u8)
+            .collect();
         let packed = compress(&data).unwrap();
         assert_eq!(decompress(&packed).unwrap(), data);
     }

@@ -6,9 +6,15 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatError {
     /// 格式版本高于本实现已知的最高版本 → 拒绝，不尽力解析（I10）。
-    UnsupportedVersion { found: u32, max: u32 },
+    UnsupportedVersion {
+        found: u32,
+        max: u32,
+    },
     /// 结构损坏。`line` 为 1 起的行号，0 表示非行式格式。
-    Malformed { line: usize, reason: String },
+    Malformed {
+        line: usize,
+        reason: String,
+    },
     BadPath(PathStatus),
     BadHash(String),
     Io(String),

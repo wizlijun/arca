@@ -46,18 +46,29 @@ impl FormatJson {
     /// `format` 各自演进，不能只查其中一个）；`hash_algo` 非 `"blake3"` 拒绝，
     /// v1 只认这一种，绝不"尽力"按其他算法解读（I5）。
     pub fn parse(text: &str) -> Result<Self, FormatError> {
-        let wire: Wire = serde_json::from_str(text)
-            .map_err(|e| FormatError::Malformed { line: 0, reason: format!("format.json 解析失败：{e}") })?;
+        let wire: Wire = serde_json::from_str(text).map_err(|e| FormatError::Malformed {
+            line: 0,
+            reason: format!("format.json 解析失败：{e}"),
+        })?;
         if wire.v > RECORD_VERSION {
-            return Err(FormatError::UnsupportedVersion { found: wire.v, max: RECORD_VERSION });
+            return Err(FormatError::UnsupportedVersion {
+                found: wire.v,
+                max: RECORD_VERSION,
+            });
         }
         if wire.format > MAX_FORMAT_VERSION {
-            return Err(FormatError::UnsupportedVersion { found: wire.format, max: MAX_FORMAT_VERSION });
+            return Err(FormatError::UnsupportedVersion {
+                found: wire.format,
+                max: MAX_FORMAT_VERSION,
+            });
         }
         if wire.hash_algo != HASH_ALGO_BLAKE3 {
             return Err(FormatError::Malformed {
                 line: 0,
-                reason: format!("不支持的 hash_algo {:?}；v1 只认 {HASH_ALGO_BLAKE3:?}", wire.hash_algo),
+                reason: format!(
+                    "不支持的 hash_algo {:?}；v1 只认 {HASH_ALGO_BLAKE3:?}",
+                    wire.hash_algo
+                ),
             });
         }
         Ok(FormatJson {
@@ -83,8 +94,10 @@ impl FormatJson {
             hash_algo: self.hash_algo.clone(),
             created_at: self.created_at.clone(),
         };
-        serde_json::to_string(&wire)
-            .map_err(|e| FormatError::Malformed { line: 0, reason: format!("format.json 序列化失败：{e}") })
+        serde_json::to_string(&wire).map_err(|e| FormatError::Malformed {
+            line: 0,
+            reason: format!("format.json 序列化失败：{e}"),
+        })
     }
 }
 
@@ -147,13 +160,19 @@ mod tests {
         let text = r#"{"v":1,"format":1,"dataset_id":"9c41000000000000000000000000abcd","hash_algo":"blake3","created_at":"2026-08-04T10:00:00Z"}"#;
         let parsed = FormatJson::parse(text).unwrap();
         assert_eq!(parsed.dataset_id, "9c41000000000000000000000000abcd");
-        assert_eq!(FormatJson::parse(&parsed.to_json().unwrap()).unwrap(), parsed);
+        assert_eq!(
+            FormatJson::parse(&parsed.to_json().unwrap()).unwrap(),
+            parsed
+        );
     }
 
     #[test]
     fn 拒绝未来的格式版本() {
         let text = r#"{"v":1,"format":99,"dataset_id":"a","hash_algo":"blake3","created_at":"t"}"#;
-        assert!(FormatJson::parse(text).is_err(), "高于已知版本必须拒绝（I10）");
+        assert!(
+            FormatJson::parse(text).is_err(),
+            "高于已知版本必须拒绝（I10）"
+        );
     }
 
     #[test]
@@ -165,13 +184,19 @@ mod tests {
     #[test]
     fn 分片路径按前两位十六进制() {
         let id = ItemId::parse("3f2a000000000000000000000000beef").unwrap();
-        assert_eq!(layout::item_path(&id), ".arca/items/3f/3f2a000000000000000000000000beef.jsonl");
+        assert_eq!(
+            layout::item_path(&id),
+            ".arca/items/3f/3f2a000000000000000000000000beef.jsonl"
+        );
     }
 
     #[test]
     fn 拒绝未来的记录版本() {
         let text = r#"{"v":99,"format":1,"dataset_id":"a","hash_algo":"blake3","created_at":"t"}"#;
-        assert!(FormatJson::parse(text).is_err(), "记录 v 字段高于已知版本也必须拒绝，与 format 字段分开校验（FORMAT.md §0）");
+        assert!(
+            FormatJson::parse(text).is_err(),
+            "记录 v 字段高于已知版本也必须拒绝，与 format 字段分开校验（FORMAT.md §0）"
+        );
     }
 
     #[test]
@@ -184,7 +209,13 @@ mod tests {
     fn index_path与chunk_path按哈希前两位十六进制分片() {
         let hash = arca_chunk::hash::ContentHash::from_bytes(b"hello");
         let hex = hash.to_hex();
-        assert_eq!(layout::index_path(&hash), format!(".arca/index/{}/{}.json", &hex[..2], hex));
-        assert_eq!(layout::chunk_path(&hash), format!(".arca/chunks/{}/{}.zst", &hex[..2], hex));
+        assert_eq!(
+            layout::index_path(&hash),
+            format!(".arca/index/{}/{}.json", &hex[..2], hex)
+        );
+        assert_eq!(
+            layout::chunk_path(&hash),
+            format!(".arca/chunks/{}/{}.zst", &hex[..2], hex)
+        );
     }
 }

@@ -79,7 +79,8 @@ impl Manifest {
             if line.is_empty() {
                 return Err(FormatError::Malformed {
                     line: line_no,
-                    reason: "正文行为空；manifest 整体重写、无追加残留，空行只可能是损坏".to_string(),
+                    reason: "正文行为空；manifest 整体重写、无追加残留，空行只可能是损坏"
+                        .to_string(),
                 });
             }
             let entry = parse_entry(line, line_no)?;
@@ -114,16 +115,21 @@ impl Manifest {
 }
 
 fn parse_header(header: &str) -> Result<(), FormatError> {
-    let version = header.strip_prefix("#%arca-manifest v").ok_or(FormatError::Malformed {
-        line: 1,
-        reason: format!("头部应为 {HEADER:?}，实得 {header:?}"),
-    })?;
+    let version = header
+        .strip_prefix("#%arca-manifest v")
+        .ok_or(FormatError::Malformed {
+            line: 1,
+            reason: format!("头部应为 {HEADER:?}，实得 {header:?}"),
+        })?;
     let found: u32 = version.parse().map_err(|_| FormatError::Malformed {
         line: 1,
         reason: format!("版本号 {version:?} 不是整数"),
     })?;
     if found > MAX_VERSION {
-        return Err(FormatError::UnsupportedVersion { found, max: MAX_VERSION });
+        return Err(FormatError::UnsupportedVersion {
+            found,
+            max: MAX_VERSION,
+        });
     }
     Ok(())
 }
@@ -156,7 +162,12 @@ fn parse_entry(line: &str, line_no: usize) -> Result<ManifestEntry, FormatError>
             reason: "mtime 字段为空".to_string(),
         });
     }
-    Ok(ManifestEntry { path, hash, size, mtime: fields[3].to_string() })
+    Ok(ManifestEntry {
+        path,
+        hash,
+        size,
+        mtime: fields[3].to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -183,8 +194,18 @@ mod tests {
     #[test]
     fn 序列化按路径字节序排序且往返一致() {
         let entries = vec![
-            ManifestEntry { path: "z.png".into(), hash: 样例哈希(b"z"), size: 1, mtime: "2026-08-04T10:00:00Z".into() },
-            ManifestEntry { path: "a.png".into(), hash: 样例哈希(b"a"), size: 2, mtime: "2026-08-04T10:00:00Z".into() },
+            ManifestEntry {
+                path: "z.png".into(),
+                hash: 样例哈希(b"z"),
+                size: 1,
+                mtime: "2026-08-04T10:00:00Z".into(),
+            },
+            ManifestEntry {
+                path: "a.png".into(),
+                hash: 样例哈希(b"a"),
+                size: 2,
+                mtime: "2026-08-04T10:00:00Z".into(),
+            },
         ];
         let manifest = Manifest::from_entries(entries).unwrap();
         let text = manifest.to_string();
@@ -199,11 +220,18 @@ mod tests {
     fn 同内容必产生同字节() {
         let mk = |order: [&str; 2]| {
             Manifest::from_entries(
-                order.iter().map(|p| ManifestEntry {
-                    path: (*p).into(), hash: 样例哈希(p.as_bytes()), size: 1,
-                    mtime: "2026-08-04T10:00:00Z".into(),
-                }).collect()
-            ).unwrap().to_string()
+                order
+                    .iter()
+                    .map(|p| ManifestEntry {
+                        path: (*p).into(),
+                        hash: 样例哈希(p.as_bytes()),
+                        size: 1,
+                        mtime: "2026-08-04T10:00:00Z".into(),
+                    })
+                    .collect(),
+            )
+            .unwrap()
+            .to_string()
         };
         assert_eq!(mk(["a.png", "b.png"]), mk(["b.png", "a.png"]));
     }
@@ -226,7 +254,10 @@ mod tests {
 
     #[test]
     fn 拒绝不合规路径() {
-        let text = format!("#%arca-manifest v1\n../逃逸.png\t{}\t1\t2026-08-04T10:00:00Z\n", 样例哈希(b"x").to_text());
+        let text = format!(
+            "#%arca-manifest v1\n../逃逸.png\t{}\t1\t2026-08-04T10:00:00Z\n",
+            样例哈希(b"x").to_text()
+        );
         assert!(Manifest::parse(&text).is_err());
     }
 
@@ -248,7 +279,10 @@ mod tests {
         match Manifest::parse(&text) {
             Err(crate::error::FormatError::Malformed { line, reason }) => {
                 assert_eq!(line, 4, "应报第二次出现（第 4 行）");
-                assert!(reason.contains("a.png"), "reason 应指明具体重复的路径：{reason}");
+                assert!(
+                    reason.contains("a.png"),
+                    "reason 应指明具体重复的路径：{reason}"
+                );
             }
             other => panic!("应报重复路径损坏，实得 {other:?}"),
         }
@@ -257,8 +291,18 @@ mod tests {
     #[test]
     fn from_entries_传入重复路径应返回错误() {
         let entries = vec![
-            ManifestEntry { path: "a.png".into(), hash: 样例哈希(b"a"), size: 1, mtime: "2026-08-04T10:00:00Z".into() },
-            ManifestEntry { path: "a.png".into(), hash: 样例哈希(b"a2"), size: 2, mtime: "2026-08-04T10:00:00Z".into() },
+            ManifestEntry {
+                path: "a.png".into(),
+                hash: 样例哈希(b"a"),
+                size: 1,
+                mtime: "2026-08-04T10:00:00Z".into(),
+            },
+            ManifestEntry {
+                path: "a.png".into(),
+                hash: 样例哈希(b"a2"),
+                size: 2,
+                mtime: "2026-08-04T10:00:00Z".into(),
+            },
         ];
         match Manifest::from_entries(entries) {
             Err(crate::error::FormatError::Malformed { line, reason }) => {
@@ -306,7 +350,10 @@ mod tests {
     #[test]
     fn 拒绝空_mtime_字段() {
         // mtime 是不透明 String（不做 RFC3339 格式校验），但空串结构性缺失，明确拒绝。
-        let text = format!("#%arca-manifest v1\na.png\t{}\t1\t\n", 样例哈希(b"a").to_text());
+        let text = format!(
+            "#%arca-manifest v1\na.png\t{}\t1\t\n",
+            样例哈希(b"a").to_text()
+        );
         match Manifest::parse(&text) {
             Err(crate::error::FormatError::Malformed { line, reason }) => {
                 assert_eq!(line, 2);

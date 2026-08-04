@@ -141,9 +141,9 @@ mod tests {
     #[test]
     fn item_id_拒绝非法输入而不是_panic() {
         assert!(ItemId::parse("").is_err());
-        assert!(ItemId::parse("3f2a").is_err());                      // 太短
-        assert!(ItemId::parse(&"a".repeat(33)).is_err());             // 太长
-        assert!(ItemId::parse(&"3F2A".repeat(8)).is_err());           // 大写不接受
+        assert!(ItemId::parse("3f2a").is_err()); // 太短
+        assert!(ItemId::parse(&"a".repeat(33)).is_err()); // 太长
+        assert!(ItemId::parse(&"3F2A".repeat(8)).is_err()); // 大写不接受
         assert!(ItemId::parse("zz2a000000000000000000000000beef").is_err());
     }
 
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn version_id_拒绝错误形状() {
         assert!(VersionId::new("2026-08-04T10:23:02Z", &"0".repeat(32)).is_err()); // 非紧凑形式
-        assert!(VersionId::new("20260804T102302Z", "abc").is_err());               // 随机段长度不对
+        assert!(VersionId::new("20260804T102302Z", "abc").is_err()); // 随机段长度不对
     }
 
     /// 回归测试（I5）：`timestamp` 恰好 16 字节但由多字节 UTF-8 字符组成，

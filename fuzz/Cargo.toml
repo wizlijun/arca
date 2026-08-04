@@ -1,0 +1,91 @@
+[package]
+name = "arca-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# fuzz/ 不加入根 workspace（brief 要求）；这里显式声明空 workspace 表，
+# 让 cargo 把它当独立包处理，而不是误判为"漏加进根 workspace 的成员"。
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.arca-format]
+path = "../crates/arca-format"
+
+[dependencies.arca-chunk]
+path = "../crates/arca-chunk"
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "items"
+path = "fuzz_targets/items.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal"
+path = "fuzz_targets/journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index"
+path = "fuzz_targets/index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_json"
+path = "fuzz_targets/format_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dataset"
+path = "fuzz_targets/dataset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry"
+path = "fuzz_targets/registry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_rules"
+path = "fuzz_targets/path_rules.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trace"
+path = "fuzz_targets/trace.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress"
+path = "fuzz_targets/decompress.rs"
+test = false
+doc = false
+bench = false

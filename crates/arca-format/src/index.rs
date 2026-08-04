@@ -30,10 +30,15 @@ impl IndexRecord {
     /// 文件由 hub 直接落盘，路径字段必须已经是合规的规范化显示路径，容忍非法值
     /// 等于把上游未校验的输入悄悄放进存储层（I5：绝不猜测/绝不尽力解析）。
     pub fn parse(text: &str) -> Result<Self, FormatError> {
-        let wire: Wire = serde_json::from_str(text)
-            .map_err(|e| FormatError::Malformed { line: 0, reason: format!("JSON 解析失败：{e}") })?;
+        let wire: Wire = serde_json::from_str(text).map_err(|e| FormatError::Malformed {
+            line: 0,
+            reason: format!("JSON 解析失败：{e}"),
+        })?;
         if wire.v > RECORD_VERSION {
-            return Err(FormatError::UnsupportedVersion { found: wire.v, max: RECORD_VERSION });
+            return Err(FormatError::UnsupportedVersion {
+                found: wire.v,
+                max: RECORD_VERSION,
+            });
         }
         let item_id = ItemId::parse(&wire.item_id).map_err(|e| FormatError::Malformed {
             line: 0,
@@ -50,9 +55,15 @@ impl IndexRecord {
     /// 比「压根没写」更难诊断。`Wire` 全是标量/字符串字段，`Err` 分支当前不可达，
     /// 保留 `Result` 签名为未来加字段留防线。
     pub fn to_json(&self) -> Result<String, FormatError> {
-        let wire = Wire { v: RECORD_VERSION, item_id: self.item_id.to_hex(), path: self.path.clone() };
-        serde_json::to_string(&wire)
-            .map_err(|e| FormatError::Malformed { line: 0, reason: format!("index 记录序列化失败：{e}") })
+        let wire = Wire {
+            v: RECORD_VERSION,
+            item_id: self.item_id.to_hex(),
+            path: self.path.clone(),
+        };
+        serde_json::to_string(&wire).map_err(|e| FormatError::Malformed {
+            line: 0,
+            reason: format!("index 记录序列化失败：{e}"),
+        })
     }
 }
 
@@ -76,7 +87,9 @@ mod tests {
     fn 拒绝畸形_json() {
         assert!(IndexRecord::parse("").is_err());
         assert!(IndexRecord::parse("{不是json}").is_err());
-        assert!(IndexRecord::parse(r#"{"v":1,"item_id":"3f2a000000000000000000000000beef"}"#).is_err());
+        assert!(
+            IndexRecord::parse(r#"{"v":1,"item_id":"3f2a000000000000000000000000beef"}"#).is_err()
+        );
     }
 
     #[test]
@@ -88,7 +101,10 @@ mod tests {
     #[test]
     fn 拒绝未来的记录版本() {
         let text = r#"{"v":99,"item_id":"3f2a000000000000000000000000beef","path":"a.png"}"#;
-        assert!(IndexRecord::parse(text).is_err(), "高于已知版本必须拒绝（I10）");
+        assert!(
+            IndexRecord::parse(text).is_err(),
+            "高于已知版本必须拒绝（I10）"
+        );
     }
 
     #[test]

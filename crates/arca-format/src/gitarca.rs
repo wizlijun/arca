@@ -39,7 +39,11 @@ impl Registry {
     /// 构造一个当前 schema 版本的注册表，供 M1 的 `arca init` / `arca register`
     /// 生成 `.gitarca`（评审指出：只有 `parse` 没有构造器，下游没法生成新注册表）。
     pub fn new(hub: BTreeMap<String, HubEntry>, dataset: Vec<DatasetEntry>) -> Self {
-        Self { schema: MAX_SCHEMA, hub, dataset }
+        Self {
+            schema: MAX_SCHEMA,
+            hub,
+            dataset,
+        }
     }
 
     pub fn parse(text: &str) -> Result<Self, FormatError> {
@@ -48,7 +52,10 @@ impl Registry {
             reason: format!("TOML 解析失败：{e}"),
         })?;
         if registry.schema > MAX_SCHEMA {
-            return Err(FormatError::UnsupportedVersion { found: registry.schema, max: MAX_SCHEMA });
+            return Err(FormatError::UnsupportedVersion {
+                found: registry.schema,
+                max: MAX_SCHEMA,
+            });
         }
         Ok(registry)
     }
@@ -161,7 +168,10 @@ hub  = "home"
     fn 拒绝引用了不存在的_hub() {
         let text = "schema = 1\n[[dataset]]\npath = \"assets\"\nhub = \"ghost\"\n";
         let reg = Registry::parse(text).unwrap();
-        assert!(reg.validate().is_err(), "引用不存在的 hub 必须拒绝（spec §4.3.2）");
+        assert!(
+            reg.validate().is_err(),
+            "引用不存在的 hub 必须拒绝（spec §4.3.2）"
+        );
     }
 
     #[test]
@@ -179,7 +189,10 @@ hub  = "home"
                     [[dataset]]\npath = \"assets\"\nhub = \"h\"\n\
                     [[dataset]]\npath = \"assets/inner\"\nhub = \"h\"\n";
         let reg = Registry::parse(text).unwrap();
-        assert!(reg.validate().is_err(), "归属必须唯一，嵌套拒绝（spec §4.3.2）");
+        assert!(
+            reg.validate().is_err(),
+            "归属必须唯一，嵌套拒绝（spec §4.3.2）"
+        );
     }
 
     #[test]
@@ -196,7 +209,10 @@ hub  = "home"
                     [[dataset]]\npath = \"assets\"\nhub = \"h\"\n\
                     [[dataset]]\npath = \"assets2\"\nhub = \"h\"\n";
         let reg = Registry::parse(text).unwrap();
-        assert!(reg.validate().is_ok(), "assets 与 assets2 只是前缀相同，不是嵌套");
+        assert!(
+            reg.validate().is_ok(),
+            "assets 与 assets2 只是前缀相同，不是嵌套"
+        );
     }
 
     #[test]
@@ -233,12 +249,18 @@ hub  = "home"
                 url: "https://nas.example.com:8443".to_string(),
             },
         );
-        let dataset = vec![DatasetEntry { path: "assets".to_string(), hub: "home".to_string() }];
+        let dataset = vec![DatasetEntry {
+            path: "assets".to_string(),
+            hub: "home".to_string(),
+        }];
         let reg = Registry::new(hub, dataset);
 
         let text = reg.to_toml().unwrap();
         let reparsed = Registry::parse(&text).unwrap();
         assert_eq!(reg, reparsed);
-        assert_eq!(reparsed.hub("home").unwrap().url, "https://nas.example.com:8443");
+        assert_eq!(
+            reparsed.hub("home").unwrap().url,
+            "https://nas.example.com:8443"
+        );
     }
 }

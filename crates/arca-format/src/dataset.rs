@@ -37,7 +37,10 @@ impl DatasetConfig {
             reason: format!("TOML 解析失败：{e}"),
         })?;
         if cfg.schema > MAX_SCHEMA {
-            return Err(FormatError::UnsupportedVersion { found: cfg.schema, max: MAX_SCHEMA });
+            return Err(FormatError::UnsupportedVersion {
+                found: cfg.schema,
+                max: MAX_SCHEMA,
+            });
         }
         Ok(cfg)
     }
@@ -89,7 +92,8 @@ url_style = "path"
 
     #[test]
     fn 拒绝未知_url_style_而不是猜测() {
-        let text = "schema = 1\ndataset_id = \"a\"\nhub_instance_id = \"b\"\nurl_style = \"magic\"\n";
+        let text =
+            "schema = 1\ndataset_id = \"a\"\nhub_instance_id = \"b\"\nurl_style = \"magic\"\n";
         assert!(DatasetConfig::parse(text).is_err());
     }
 

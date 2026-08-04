@@ -23,9 +23,17 @@ pub enum Problem {
     /// 当前版本在 `files/` 下缺失（`ErrorKind::NotFound`）。
     MissingFile { path: String },
     /// `files/` 下的字节内容哈希与版本记录不一致。
-    HashMismatch { path: String, expected: String, actual: String },
+    HashMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
     /// `files/` 下的字节大小与版本记录不一致。
-    SizeMismatch { path: String, expected: u64, actual: u64 },
+    SizeMismatch {
+        path: String,
+        expected: u64,
+        actual: u64,
+    },
     /// item 没有任何 index 记录指向它——悬空引用。
     OrphanIndex { key: String },
     /// `items/<xx>/<item_id>.jsonl` 无法解析为合法版本链。
@@ -95,9 +103,13 @@ pub fn check_root(root: &Path) -> FsckReport {
                     continue;
                 }
             };
-            let Some(current) = chain.last() else { continue };
+            let Some(current) = chain.last() else {
+                continue;
+            };
             let Some(logical) = lookup_path(root, &current.item_id.to_hex()) else {
-                report.problems.push(Problem::OrphanIndex { key: current.item_id.to_hex() });
+                report.problems.push(Problem::OrphanIndex {
+                    key: current.item_id.to_hex(),
+                });
                 continue;
             };
             let physical = root.join(layout::FILES_DIR).join(&logical);
@@ -169,8 +181,12 @@ pub fn check_root(root: &Path) -> FsckReport {
 fn lookup_path(root: &Path, item_id_hex: &str) -> Option<String> {
     for shard in read_dir_sorted(&root.join(layout::INDEX_DIR)) {
         for record in read_dir_sorted(&shard) {
-            let Ok(text) = fs::read_to_string(&record) else { continue };
-            let Ok(parsed) = arca_format::index::IndexRecord::parse(&text) else { continue };
+            let Ok(text) = fs::read_to_string(&record) else {
+                continue;
+            };
+            let Ok(parsed) = arca_format::index::IndexRecord::parse(&text) else {
+                continue;
+            };
             if parsed.item_id.to_hex() == item_id_hex {
                 // 路径必须合规，否则视为损坏记录而非可用映射
                 return path_rules::check(&parsed.path).ok();
@@ -183,7 +199,9 @@ fn lookup_path(root: &Path, item_id_hex: &str) -> Option<String> {
 /// 排序读目录：使 fsck 的输出确定（同一状态必产生同一报告）。文件系统的
 /// `read_dir` 顺序不保证，不排序会让同一存储根两次巡检产生不同顺序的报告。
 fn read_dir_sorted(dir: &Path) -> Vec<std::path::PathBuf> {
-    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut paths: Vec<_> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
     paths.sort();
     paths

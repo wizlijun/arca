@@ -77,10 +77,7 @@ impl Sid {
         if segments.len() > MAX_SID_SEGMENTS {
             return Err(FormatError::Malformed {
                 line: 0,
-                reason: format!(
-                    "sid 有 {} 段，超过上限 {MAX_SID_SEGMENTS}",
-                    segments.len()
-                ),
+                reason: format!("sid 有 {} 段，超过上限 {MAX_SID_SEGMENTS}", segments.len()),
             });
         }
         for segment in &segments {
@@ -852,7 +849,9 @@ mod tests {
     #[test]
     fn sid_层次化后仍可解析且根段不变() {
         let parent = sid();
-        let child = parent.child("20260805T093013Z", "fedcba9876543210").unwrap();
+        let child = parent
+            .child("20260805T093013Z", "fedcba9876543210")
+            .unwrap();
         assert_eq!(child.depth(), 2);
         assert_eq!(child.root(), parent.as_str());
         assert_eq!(child.leaf(), "20260805T093013Z-fedcba9876543210");
@@ -1064,9 +1063,7 @@ mod tests {
 
     #[test]
     fn 高版本记录被拒绝而不是尽力解析() {
-        let line = format!(
-            r#"{{"v":2,"sid":"{TS}-{HEX}","seq":0,"t_abs":0,"event":"start"}}"#
-        );
+        let line = format!(r#"{{"v":2,"sid":"{TS}-{HEX}","seq":0,"t_abs":0,"event":"start"}}"#);
         assert!(matches!(
             TraceEvent::parse_line(&line),
             Err(FormatError::UnsupportedVersion { found: 2, max: 1 })
@@ -1106,10 +1103,14 @@ mod tests {
     /// 绝不因一行坏数据丢掉其余行（FORMAT.md §10.5）。
     #[test]
     fn 坏行跳过并计数而好行全部保留() {
-        let good_a = TraceEvent::new(sid(), 0, TraceRecord::new(EventKind::Start, 0)).to_json_line();
-        let good_b =
-            TraceEvent::new(sid(), 1, TraceRecord::new(EventKind::Exit, 10).with("code", 1u64))
-                .to_json_line();
+        let good_a =
+            TraceEvent::new(sid(), 0, TraceRecord::new(EventKind::Start, 0)).to_json_line();
+        let good_b = TraceEvent::new(
+            sid(),
+            1,
+            TraceRecord::new(EventKind::Exit, 10).with("code", 1u64),
+        )
+        .to_json_line();
         let text = format!(
             "{good_a}\n垃圾行\n{{\"v\":9,\"sid\":\"{TS}-{HEX}\",\"seq\":2,\"t_abs\":0,\"event\":\"x\"}}\n{good_b}\n{{\"v\":1,\"sid\":\n"
         );
@@ -1194,7 +1195,10 @@ mod tests {
         );
 
         let events = sink.into_events(&sid());
-        assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(
+            events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
     }
 
     #[test]
@@ -1207,7 +1211,10 @@ mod tests {
         assert_eq!(sink.dropped(), 0);
         let events = sink.drain(&sid());
         assert_eq!(events.len(), 4);
-        assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(
+            events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
     }
 
     /// 丢弃必须留痕：`seq` 出现空洞 + 合成一条 `trace.dropped`。
@@ -1227,7 +1234,10 @@ mod tests {
         assert_eq!(events[0].record.field("count"), Some(&FieldValue::U64(7)));
         assert_eq!(events[0].seq, u64::MAX);
         // 留存的原始 seq 是 7/8/9——空洞本身就是丢弃的证据。
-        assert_eq!(events[1..].iter().map(|e| e.seq).collect::<Vec<_>>(), [7, 8, 9]);
+        assert_eq!(
+            events[1..].iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [7, 8, 9]
+        );
         // drain 后计数归零，但 seq 继续单调。
         assert_eq!(sink.dropped(), 0);
         sink.record(TraceRecord::new(EventKind::Exit, 11));

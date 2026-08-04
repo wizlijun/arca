@@ -108,8 +108,15 @@ mod tests {
 
         let a = split(&base);
         let b = split(&modified);
-        let 共享 = a.iter().filter(|c| b.iter().any(|d| d.hash == c.hash)).count();
-        assert!(共享 * 2 > a.len(), "多数块应保持不变，实得 {共享}/{}", a.len());
+        let 共享 = a
+            .iter()
+            .filter(|c| b.iter().any(|d| d.hash == c.hash))
+            .count();
+        assert!(
+            共享 * 2 > a.len(),
+            "多数块应保持不变，实得 {共享}/{}",
+            a.len()
+        );
     }
 
     #[test]

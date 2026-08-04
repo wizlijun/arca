@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 18 * * *"   # 每晚跑逃生舱演示（UTC 18:00）
+
+jobs:
+  test:
+    name: 测试与静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  msrv:
+    name: MSRV 1.85 构建门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      # Cargo.lock 已入库，依赖版本可复现；本作业保证任何一次 cargo update
+      # 若把某个依赖推到需要更高 rustc 的版本，会在这里大声失败，
+      # 而不是等到用户在 rustc 1.85 的机器上构建时才发现。
+      - run: cargo check --workspace --locked --all-targets
+
+  escape-hatch:
+    name: 逃生舱恢复演示（I1）
+    runs-on: ubuntu-latest
+    # 验证的是长期承诺而非本次改动（见
+    # crates/arca-conformance/tests/escape-hatch/README.md），因此只在每晚
+    # 定时触发时跑，不占用每次 push/PR 的 CI 时间。
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 安装 b3sum
+        run: cargo install b3sum --locked
+      - name: 造夹具并恢复
+        run: |
+          chmod +x crates/arca-conformance/tests/escape-hatch/*.sh
+          crates/arca-conformance/tests/escape-hatch/make-fixture.sh "$RUNNER_TEMP/arca-fixture"
+          crates/arca-conformance/tests/escape-hatch/recover.sh "$RUNNER_TEMP/arca-fixture" "$RUNNER_TEMP/arca-recovered"
+      - name: 断言篡改会被检出
+        # 一个永远成功的校验脚本比没有更糟：篡改夹具本体（不是 dest——
+        # recover.sh 每次都会用 cp -R 整体重新覆盖 dest，篡改 dest 会被
+        # 下一次恢复悄悄冲掉，测不出问题）后 recover.sh 必须以非零退出。
+        run: |
+          printf 'tampered' > "$RUNNER_TEMP/arca-fixture/files/note.txt"
+          if crates/arca-conformance/tests/escape-hatch/recover.sh "$RUNNER_TEMP/arca-fixture" "$RUNNER_TEMP/arca-recovered2"; then
+            echo "篡改未被检出——逃生舱校验失效" >&2
+            exit 1
+          fi

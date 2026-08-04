@@ -46,7 +46,9 @@ impl ContentHash {
     }
 
     pub fn parse(text: &str) -> Result<Self, HashParseError> {
-        let hex = text.strip_prefix("blake3:").ok_or(HashParseError::MissingPrefix)?;
+        let hex = text
+            .strip_prefix("blake3:")
+            .ok_or(HashParseError::MissingPrefix)?;
         if hex.len() != 64 {
             return Err(HashParseError::BadLength(hex.len()));
         }
@@ -162,6 +164,8 @@ mod tests {
     fn sha256_输出恒为64位小写十六进制() {
         let hex = sha256_hex(b"git manages text, arca manages binaries");
         assert_eq!(hex.len(), 64);
-        assert!(hex.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert!(hex
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
     }
 }

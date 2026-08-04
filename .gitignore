@@ -1,2 +1,7 @@
 /target
 .DS_Store
+
+# fuzz/Cargo.toml 与 fuzz/fuzz_targets/ 入库；构建产物、语料库、崩溃样本不入库。
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts

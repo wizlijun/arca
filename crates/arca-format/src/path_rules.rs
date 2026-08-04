@@ -127,7 +127,11 @@ fn has_invalid_char(segment: &str) -> bool {
 }
 
 fn is_reserved(segment: &str) -> bool {
-    let base = segment.split('.').next().unwrap_or(segment).to_ascii_uppercase();
+    let base = segment
+        .split('.')
+        .next()
+        .unwrap_or(segment)
+        .to_ascii_uppercase();
     WINDOWS_RESERVED.contains(&base.as_str())
 }
 
@@ -201,8 +205,8 @@ mod tests {
         let deep = vec!["d"; MAX_PATH_DEPTH + 1].join("/");
         assert_eq!(check(&deep), Err(PathStatus::TooDeep));
 
-        let long = format!("{}/x", "a".repeat(MAX_SEGMENT_BYTES))
-            .repeat(MAX_RELATIVE_PATH_BYTES / 8);
+        let long =
+            format!("{}/x", "a".repeat(MAX_SEGMENT_BYTES)).repeat(MAX_RELATIVE_PATH_BYTES / 8);
         assert_eq!(check(&long).unwrap_err(), PathStatus::TooLong);
     }
 
