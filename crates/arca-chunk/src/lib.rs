@@ -14,3 +14,4 @@
 pub mod cdc;
 pub mod compress;
 pub mod hash;
+pub mod store;

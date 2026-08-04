@@ -9,5 +9,6 @@ homepage.workspace = true
 
 [dependencies]
 blake3 = "1.8.5"
+fastcdc = "4.0.1"
 sha2 = "0.10.9"
-# 计划依赖（Task 8 启用）：fastcdc, zstd
+zstd = "0.13.3"
