@@ -1,0 +1,20 @@
+[package]
+name = "arca-cli"
+description = "arca 命令行（独立 `arca …` 与子命令 `git arca …` 双形态）"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "arca"
+path = "src/main.rs"
+
+[dependencies]
+arca-core = { path = "../arca-core" }
+arca-format = { path = "../arca-format" }
+arca-chunk = { path = "../arca-chunk" }
+arca-git = { path = "../arca-git" }
+arca-publish = { path = "../arca-publish" }
+# 计划依赖（实现时启用）：clap, serde_json

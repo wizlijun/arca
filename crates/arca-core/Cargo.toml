@@ -1,0 +1,15 @@
+[package]
+name = "arca-core"
+description = "对账与提交状态机（sans-io：纯状态机，无 IO，客户端与 hub 两端共用）"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+
+[dependencies]
+arca-format = { path = "../arca-format" }
+# 纪律（spec §11.3）：core 无运行时依赖（无 tokio）、零重依赖、可嵌入
+
+[dev-dependencies]
+# 计划依赖：proptest（收敛性属性测试，§11.2）

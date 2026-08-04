@@ -1,0 +1,14 @@
+[package]
+name = "arcad"
+description = "arca 服务端 daemon —— 全系统唯一常驻进程（NAS / 服务器，单二进制）"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+
+[dependencies]
+arca-core = { path = "../arca-core" }
+arca-format = { path = "../arca-format" }
+arca-chunk = { path = "../arca-chunk" }
+# 计划依赖（实现时启用）：axum, hyper, tokio

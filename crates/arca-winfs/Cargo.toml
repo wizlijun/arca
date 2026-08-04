@@ -1,0 +1,15 @@
+[package]
+name = "arca-winfs"
+description = "Windows Cloud Files API（CfAPI）占位符适配层"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+
+[dependencies]
+arca-format = { path = "../arca-format" }
+
+# 计划依赖（实现时启用，仅 Windows）：
+# [target.'cfg(windows)'.dependencies]
+# windows = { version = "…", features = ["Win32_Storage_CloudFilters", …] }

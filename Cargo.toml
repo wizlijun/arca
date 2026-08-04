@@ -1,0 +1,42 @@
+# arca workspace —— 布局见 docs/2026-08-03-arca-spec.md §11.1
+#
+# 注意：arca-macfs 是 Swift 工程（File Provider 扩展 + XPC 薄壳），
+# 不在 cargo workspace 内，见 crates/arca-macfs/README.md。
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/arca-format",
+    "crates/arca-core",
+    "crates/arca-chunk",
+    "crates/arca-git",
+    "crates/arca-publish",
+    "crates/arcad",
+    "crates/arca-agentd",
+    "crates/arca-catalog",
+    "crates/arca-cli",
+    "crates/arca-winfs",
+    "crates/arca-mcp",
+    "crates/arca-conformance",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+authors = ["arca contributors"]
+homepage = "https://gitarca.com"
+
+# 依赖选型见 spec §11.3：用标准件，不发明。
+# 骨架阶段暂不引入任何外部依赖；实现各模块时按下表取用：
+#
+#   blake3      —— 内容哈希（原生地址）
+#   fastcdc     —— 历史版本与传输层的 CDC 分块
+#   zstd        —— chunks 落盘压缩
+#   axum/hyper  —— arcad HTTP API
+#   tokio       —— 仅边缘（arcad / agentd）；arca-core 无运行时依赖
+#   rusqlite    —— 客户端投影（可抛弃，I9）
+#   windows-rs  —— CfAPI 适配
+#   serde/toml  —— 格式解析
+#   proptest    —— 收敛性属性测试（§11.2）
+[workspace.dependencies]

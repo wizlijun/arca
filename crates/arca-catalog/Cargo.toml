@@ -1,0 +1,11 @@
+[package]
+name = "arca-catalog"
+description = "目录卡工具（独立可执行，核心不依赖它——do one thing well）"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+
+[dependencies]
+arca-format = { path = "../arca-format" }

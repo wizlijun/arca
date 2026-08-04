@@ -1,0 +1,12 @@
+[package]
+name = "arca-format"
+description = "arca 磁盘格式的纯数据结构 + 解析/序列化 + golden vectors（FORMAT.md 的落地）"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+
+[dependencies]
+# 计划依赖（实现时启用）：serde, toml
+# 纪律（spec §11.3）：零重依赖、可嵌入；损坏输入 → 明确错误，绝不 panic（fuzz 覆盖）

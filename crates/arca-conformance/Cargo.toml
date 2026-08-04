@@ -1,0 +1,14 @@
+[package]
+name = "arca-conformance"
+description = "一致性测试套件——对第三方实现同样适用（格式活得比实现久）"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+
+[dependencies]
+arca-format = { path = "../arca-format" }
+arca-core = { path = "../arca-core" }
+arca-chunk = { path = "../arca-chunk" }
+# 计划依赖（实现时启用）：proptest

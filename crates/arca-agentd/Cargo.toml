@@ -1,0 +1,14 @@
+[package]
+name = "arca-agentd"
+description = "可选客户端 daemon：自动同步 watcher · 占位符投影供给（手动模式不依赖它）"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+
+[dependencies]
+arca-core = { path = "../arca-core" }
+arca-format = { path = "../arca-format" }
+arca-chunk = { path = "../arca-chunk" }
+# 计划依赖（实现时启用）：tokio, rusqlite（投影）, notify（watcher）
