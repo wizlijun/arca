@@ -157,8 +157,15 @@ hub 侧两条 append-only 事件流，均为 JSON Lines（§1）。
 {"v":1,"seq":43,"op":"tombstone","item_id":"3f2a…","version_id":"20260804T102302Z-…","path":"京都/鸭川.png","actor":{"account":"bruce","device":"mac-studio","session":"s1"},"at":"2026-08-04T11:00:00Z"}
 ```
 
+`rename` 示例用另一个 item（`8b1d…`）演示，避免与上面的 `tombstone` 示例连成一条
+"删除后又改名"的隐含时间线——本文件未定义 tombstone 之后能否 rename，示例不应替读者做这个判断：
+
 ```json
-{"v":1,"seq":44,"op":"rename","item_id":"3f2a…","version_id":"20260804T102302Z-…","path":"京都/河边.png","from":"京都/鸭川.png","actor":{"account":"bruce","device":"mac-studio","session":"s1"},"at":"2026-08-04T11:05:00Z"}
+{"v":1,"seq":44,"op":"upsert","item_id":"8b1d…","version_id":"20260804T110400Z-…","path":"书法/兰亭序.jpg","actor":{"account":"bruce","device":"mac-studio","session":"s1"},"at":"2026-08-04T11:04:00Z"}
+```
+
+```json
+{"v":1,"seq":45,"op":"rename","item_id":"8b1d…","version_id":"20260804T110400Z-…","path":"书法/兰亭序-扫描.jpg","from":"书法/兰亭序.jpg","actor":{"account":"bruce","device":"mac-studio","session":"s1"},"at":"2026-08-04T11:05:00Z"}
 ```
 
 游标为 `<epoch>:<seq>`；`seq` 在一个 epoch 内单调递增、无空洞。
