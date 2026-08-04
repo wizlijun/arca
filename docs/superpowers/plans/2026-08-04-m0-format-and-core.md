@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 交付 arca 的磁盘格式规范与内容寻址地基——`FORMAT.md` v1 定稿、`arca-format` 解析器、`arca-chunk` 原语、`arcad fsck` 巡检，并用 golden vectors、fuzz、逃生舱恢复演示把「格式先于代码」与「绝不销毁数据」变成可执行断言。
+**Goal:** 交付 arca 的磁盘格式规范与内容寻址地基——`FORMAT.md` v1 定稿、`arca-format` 解析器、`arca-chunk` 原语、`arca fsck` 巡检，并用 golden vectors、fuzz、逃生舱恢复演示把「格式先于代码」与「绝不销毁数据」变成可执行断言。
 
-**Architecture:** 三层依赖：`arca-chunk`（BLAKE3 / FastCDC / zstd，无上游依赖）→ `arca-format`（纯数据结构与解析/序列化，依赖 arca-chunk 的哈希类型）→ `arcad`（唯一做 IO 的 M0 消费者，提供 `arcad fsck` 子命令）。全部解析器遵循「损坏输入 → 明确错误，绝不 panic」（I5），由 cargo-fuzz 守护。
+**Architecture:** 三层依赖：`arca-chunk`（BLAKE3 / FastCDC / zstd，无上游依赖）→ `arca-format`（纯数据结构与解析/序列化，依赖 arca-chunk 的哈希类型）→ `arca-cli`（唯一做 IO 的 M0 消费者，提供 `arca fsck` 子命令；放 MIT 侧而非 AGPL 的 arcad，因为 M1 的 `file://` 直连要求 MIT 的 CLI 能直接读写 hub 存储根）。全部解析器遵循「损坏输入 → 明确错误，绝不 panic」（I5），由 cargo-fuzz 守护。
 
-**Tech Stack:** Rust 2021 / MSRV 1.75 · blake3 · fastcdc · zstd · serde + serde_json（JSON Lines）· toml · clap（仅 arcad）· proptest · cargo-fuzz
+**Tech Stack:** Rust 2021 / MSRV 1.75 · blake3 · fastcdc · zstd · serde + serde_json（JSON Lines）· toml · clap（仅 arca-cli）· proptest · cargo-fuzz
 
 ## Global Constraints
 
@@ -62,12 +62,12 @@
 | `crates/arca-format/src/journal.rs` | `journal/*.jsonl` 事件记录 + `epoch:seq` 游标 |
 | `crates/arca-format/src/index.rs` | `index/*.json` 路径→item_id 映射 |
 | `crates/arca-format/src/error.rs` | `FormatError`：所有解析错误的统一类型 |
-| `crates/arcad/src/fsck.rs` | 存储根完整性巡检（M0 唯一的 IO 消费者） |
+| `crates/arca-cli/src/fsck.rs` | 存储根完整性巡检（M0 唯一的 IO 消费者；MIT 侧，理由见 Task 9） |
 | `crates/arca-conformance/tests/escape-hatch/recover.sh` | 逃生舱恢复演示（不含任何 arca 代码） |
 | `fuzz/` | cargo-fuzz 工程，每个解析器一个 target |
 | `.github/workflows/ci.yml` | check / test / clippy / 逃生舱演示 |
 
-**修改：** 各 `Cargo.toml`（加依赖）、`FORMAT.md`（Task 1 定稿）、`crates/arcad/src/main.rs`（加 `fsck` 子命令）、`crates/arcad/src/gc.rs`（注释指向 `fsck.rs`）。
+**修改：** 各 `Cargo.toml`（加依赖）、`FORMAT.md`（Task 1 定稿）、`crates/arca-cli/src/main.rs`（加 `fsck` 子命令）、`crates/arcad/src/gc.rs`（注释指向 arca-cli 的 `fsck.rs`）。
 
 **说明：** `arca-format/src/journal.rs` 只定义**磁盘记录格式**；`arca-core/src/journal.rs` 定义**两端共用的事件语义**，M2 再实现，届时后者引用前者。两者不重复。
 
@@ -1989,33 +1989,37 @@ git commit -m "arca-chunk: FastCDC 切块、zstd 压缩与块存储路径计算"
 
 ---
 
-### Task 9: arcad fsck 存储根巡检
+### Task 9: arca fsck 存储根巡检（MIT 侧）
+
+> **为什么在 arca-cli 而不是 arcad**：arcad 是 AGPL-3.0，arca-cli 是 MIT，依赖方向单向（spec §12.2）。
+> M1 的 `file://` 直连要求 MIT 的 CLI 能不经任何 daemon 直接读写 hub 存储根，因此存储根的读取与校验逻辑必须在 MIT 侧。
+> M2 的 arcad 复用本模块是合法方向。
 
 **Files:**
-- Create: `crates/arcad/src/fsck.rs`
-- Modify: `crates/arcad/src/main.rs`, `crates/arcad/src/gc.rs`（注释指向 fsck）, `crates/arcad/Cargo.toml`
-- Test: `crates/arcad/tests/fsck.rs`
+- Create: `crates/arca-cli/src/fsck.rs`
+- Modify: `crates/arca-cli/src/main.rs`, `crates/arca-cli/src/gc.rs`（注释指向 fsck）, `crates/arca-cli/Cargo.toml`
+- Test: `crates/arca-cli/tests/fsck.rs`
 
 **Interfaces:**
 - Consumes: `arca_format::{hub_layout, items, index, manifest, model}`、`arca_chunk::{hash, compress, store}`
-- Produces: `arcad::fsck::{check_root(root: &Path) -> FsckReport, FsckReport { problems: Vec<Problem>, checked_files: usize, checked_chunks: usize }, Problem}`。`Problem` 变体：`MissingFormatJson`、`BadFormatJson(String)`、`MissingFile { path: String }`、`HashMismatch { path: String, expected: String, actual: String }`、`SizeMismatch { path: String, expected: u64, actual: u64 }`、`OrphanIndex { key: String }`、`BrokenChain { item: String, reason: String }`、`CorruptChunk { hash: String }`。
+- Produces: `arca_cli::fsck::{check_root(root: &Path) -> FsckReport, FsckReport { problems: Vec<Problem>, checked_files: usize, checked_chunks: usize }, Problem}`。`Problem` 变体：`MissingFormatJson`、`BadFormatJson(String)`、`MissingFile { path: String }`、`HashMismatch { path: String, expected: String, actual: String }`、`SizeMismatch { path: String, expected: u64, actual: u64 }`、`OrphanIndex { key: String }`、`BrokenChain { item: String, reason: String }`、`CorruptChunk { hash: String }`。
 
 - [ ] **Step 1: 加依赖**
 
 ```bash
-cargo add --package arcad clap --features derive
-cargo add --package arcad --dev tempfile
+cargo add --package arca-cli clap --features derive
+cargo add --package arca-cli --dev tempfile
 ```
 
 - [ ] **Step 2: 写失败的测试**
 
-创建 `crates/arcad/tests/fsck.rs`：
+创建 `crates/arca-cli/tests/fsck.rs`：
 
 ```rust
 //! fsck 巡检的集成测试。构造真实的存储根目录，注入损坏，断言可诊断。
 
 use arca_chunk::hash::ContentHash;
-use arcad::fsck::{check_root, Problem};
+use arca_cli::fsck::{check_root, Problem};
 use std::fs;
 use std::path::Path;
 
@@ -2105,33 +2109,33 @@ fn fsck_绝不修改任何文件() {
 
 - [ ] **Step 3: 运行确认失败**
 
-Run: `cargo test -p arcad`
-Expected: 编译失败，`arcad` 不是库 crate
+Run: `cargo test -p arca-cli`
+Expected: 编译失败，`arca-cli` 不是库 crate
 
-- [ ] **Step 4: 把 arcad 改造成 lib + bin**
+- [ ] **Step 4: 把 arca-cli 改造成 lib + bin**
 
-在 `crates/arcad/Cargo.toml` 加入：
+`crates/arca-cli/Cargo.toml` 里已有 `[[bin]] name = "arca"`，在它上方补一个 `[lib]`：
 
 ```toml
 [lib]
-name = "arcad"
+name = "arca_cli"
 path = "src/lib.rs"
-
-[[bin]]
-name = "arcad"
-path = "src/main.rs"
 ```
 
-创建 `crates/arcad/src/lib.rs`：
+创建 `crates/arca-cli/src/lib.rs`：
 
 ```rust
-//! arcad 的库形态——供 `arcad` 可执行文件与集成测试共用。
-//! 服务端实现从 M2 开始；M0 只交付 fsck（spec §12.3）。
+//! arca CLI 的库形态——供 `arca` 可执行文件与集成测试共用。
+//!
+//! fsck 放在 MIT 的 arca-cli 而非 AGPL 的 arcad：M1 的 `file://` 直连要求 MIT 侧
+//! 能直接读写 hub 存储根（spec §3.1、§12.2 的依赖方向约束）。M2 的 arcad
+//! 反过来依赖本 crate 是合法方向。
 
+pub mod commands;
 pub mod fsck;
 ```
 
-（`main.rs` 保留自己的 `mod` 声明用于 M2 的模块；M0 阶段 `main.rs` 只 `use arcad::fsck`。）
+（`main.rs` 里原有的 `mod commands;` 挪进了 lib.rs：把那一行删掉，改用 `use arca_cli::fsck;`。）
 
 - [ ] **Step 5: 实现 fsck.rs**
 
@@ -2286,13 +2290,13 @@ fn read_dir_sorted(dir: &Path) -> Vec<std::path::PathBuf> {
 
 - [ ] **Step 6: 接上 main.rs 的 fsck 子命令**
 
-替换 `crates/arcad/src/main.rs` 的 `fn main()`（保留文件顶部 doc comment 与 M2 的 `mod` 声明，但把它们标注为 M2 未启用）：
+替换 `crates/arca-cli/src/main.rs` 的 `fn main()`（保留文件顶部 doc comment，删掉 `mod commands;` 一行——它已挪到 lib.rs）。M0 只接一个 `fsck` 子命令，其余命令属 M1：
 
 ```rust
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "arcad", about = "arca 服务端 daemon")]
+#[command(name = "arca", about = "git 仓库的二进制附件层")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -2311,7 +2315,7 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Fsck { root } => {
-            let report = arcad::fsck::check_root(&root);
+            let report = arca_cli::fsck::check_root(&root);
             // Rule of Silence：数据走 stdout，诊断走 stderr（spec §3.2）
             for problem in &report.problems {
                 eprintln!("{problem:?}");
@@ -2332,14 +2336,14 @@ fn main() -> std::process::ExitCode {
 
 - [ ] **Step 7: 运行测试确认通过**
 
-Run: `cargo test -p arcad`
+Run: `cargo test -p arca-cli`
 Expected: 5 个测试 PASS
 
 - [ ] **Step 8: 提交**
 
 ```bash
-git add crates/arcad
-git commit -m "arcad: fsck 存储根巡检（只读诊断，M0 唯一的 IO 消费者）"
+git add crates/arca-cli
+git commit -m "arca-cli: fsck 存储根巡检（只读诊断，放 MIT 侧以备 M1 的 file:// 直连复用）"
 ```
 
 ---
