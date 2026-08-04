@@ -2497,7 +2497,9 @@ fuzz_target!(|data: &[u8]| {
 });
 ```
 
-`items.rs` 对 `arca_format::items::parse_chain`、`registry.rs` 对 `arca_format::gitarca::Registry::parse`、`path_rules.rs` 对 `arca_format::path_rules::check` 同构。
+`items.rs` 对 `arca_format::items::parse_chain`、`registry.rs` 对 `arca_format::gitarca::Registry::parse`、`path_rules.rs` 对 `arca_format::path_rules::check`、`trace.rs` 对 `arca_format::trace::read_lines` 同构。
+
+注意 trace 的容错纪律与其他解析器**相反**：坏行跳过并计数、绝不失败（trace 设计 §10），所以它的 fuzz 断言是「不 panic 且返回值的 skipped 计数自洽」，而不是「返回 Err」。
 
 - [ ] **Step 3: 各跑 60 秒确认无 panic**
 
@@ -2589,6 +2591,78 @@ git push origin main
 
 ---
 
+### Task 12: arca-format::trace 事件 schema 与 sink
+
+> **范围来源**：`docs/superpowers/specs/2026-08-05-trace-design.md`（设计定稿，commit e44e687）
+> 与 `FORMAT.md` §10。该设计把 M0 的交付明确为：
+> 「FORMAT.md §10 schema · `arca-format::trace`（`TraceEvent` / `TraceRecord` /
+> `EventKind` / `ErrorClass` / `Sid` / 三个 sink）· golden vectors」。
+> 发射点（`reconcile.decide` 等）属 M1，本任务**只落 schema 与 sink**，不接任何调用方。
+
+**为什么它属于 M0 而不是以后**：`event` 是封闭枚举、受 I10 约束——一旦有实现开始发事件，
+枚举就不能再随意改。先把 schema 与 golden vectors 定死，后续里程碑只填发射点。
+
+**Files:**
+- Create: `crates/arca-format/src/trace.rs`
+- Create: `crates/arca-format/tests/golden/trace/basic.jsonl`
+- Modify: `crates/arca-format/src/lib.rs`（加 `pub mod trace;`，保持字母序）
+
+**Interfaces:**
+- Consumes: `FormatError`（仅用于写侧序列化失败；读侧不用它，见下）
+- Produces: `arca_format::trace::{TraceEvent, TraceRecord, EventKind, ErrorClass, Sid,
+  read_lines, RingSink, VecSink, NullSink}`。具体字段与枚举取值**以 FORMAT.md §10 与
+  设计文档 §4 为准，逐字采用，不得自创**。
+
+- [ ] **Step 1: 通读需求**
+
+先读 `docs/superpowers/specs/2026-08-05-trace-design.md` 全文，再读 `FORMAT.md` §10。
+两者是同一套东西的设计论证与字节级契约。**本任务不修改这两个文件。**
+
+- [ ] **Step 2: 写失败的测试**
+
+按设计文档 §10「测试」一节列的五类各写至少一条：
+
+1. **golden vector 往返**：`tests/golden/trace/basic.jsonl` 逐行解析后重新序列化，字节相等。
+2. **坏行容错**（与 journal 相反的纪律）：截断行、非法 JSON、未知 `event`、高于已知的 `v`，
+   四种输入都应被**跳过并计数**，绝不 panic、绝不丢弃其余合法行。断言 skipped 计数准确、
+   合法行全部保留。
+3. **载荷键序确定性**：同一组载荷字段以不同插入顺序构造，序列化字节必须相同
+   （按键名字节序升序，设计 §4.2）。
+4. **Rule of Silence**：`NullSink` 不产生任何输出；成功路径不写文件。
+5. **环形缓冲**：`RingSink` 容量满后丢弃最旧事件，`dropped` 计数如实反映（默认容量 4096）。
+
+- [ ] **Step 3: 运行确认失败**
+
+Run: `cargo test -p arca-format trace`
+Expected: 编译失败，模块不存在
+
+- [ ] **Step 4: 实现**
+
+按 FORMAT.md §10 实现信封、`sid`、事件族封闭枚举、`error` 的 `class` 分类、
+坏行跳过并计数的读取器，以及三个 sink（`RingSink` 环形缓冲、`VecSink` 供测试断言决策序列、
+`NullSink` 空实现）。
+
+三条纪律：
+- **读侧绝不失败**：`read_lines` 返回「解析出的记录 + skipped 计数」，不返回 `Result`。
+  这与 items/journal 的「中间行损坏即失败」是有意相反的——trace 是诊断轨迹，
+  为了排障不能因为一行坏了就什么都读不到。
+- **写侧序列化失败要可见**：沿用 Task 6/7 的先例，不要 `unwrap_or_default()` 静默变空串。
+- **`arca-format` 仍是 sans-io**：sink 是 trait + 内存实现，落盘属 M1 的 CLI 层。
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cargo test -p arca-format` 与 `cargo clippy -p arca-format --all-targets -- -D warnings`
+Expected: 全绿、无警告
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add crates/arca-format
+git commit -m "arca-format: trace 事件 schema 与三个 sink（坏行跳过并计数，与 journal 相反）"
+```
+
+---
+
 ## Self-Review
 
 **1. Spec 覆盖检查（对 M0 验收标准，spec §12.3）：**
@@ -2601,6 +2675,7 @@ git push origin main
 | fsck | Task 9 |
 | coreutils 恢复演示进 CI | Task 10、11 |
 | fuzz 无 panic | Task 11（60 秒门禁；72 小时长跑另行排期，见下） |
+| trace schema（M0 交付，见 trace 设计 §9） | Task 12 |
 | golden vectors 就绪 | Task 5（manifest）；items/registry 的 golden 随 Task 7 的往返测试覆盖 |
 
 **已知缺口（有意留给后续里程碑，不在本计划内）：**
