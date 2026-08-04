@@ -8,4 +8,6 @@ rust-version.workspace = true
 homepage.workspace = true
 
 [dependencies]
+blake3 = "1.8.5"
+sha2 = "0.10.9"
 # 计划依赖（实现时启用）：blake3, fastcdc, zstd
