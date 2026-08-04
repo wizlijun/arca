@@ -65,7 +65,8 @@ arca 特有的三条补充：
   例 `20260804T102302Z-0123456789abcdef0123456789abcdef`；
   前缀使版本 ID 的字典序即时间序（继承 lazync STORAGE.md §Historical Versions）。
 - **actor**：`{"account": "<字符串>", "device": "<字符串>", "session": "<字符串>"}`；
-  三者皆可为空字符串，表示未知；journal 每条事件必须携带（I8）。
+  三者皆可为空字符串，表示未知；三个键也都允许在 JSON 中整体缺失，
+  缺失与空字符串同义（实现侧用 serde 的 `#[serde(default)]`）；journal 每条事件必须携带（I8）。
 
 ## 4. hub 存储根布局
 
@@ -88,6 +89,15 @@ dataset_root/
 
 所有目录必须位于同一文件系统，rename 提交才是原子的
 （继承 lazync STORAGE.md）。两级十六进制分片避免单目录条目数过大。
+
+`journal/epoch` 指针文件：单行文本，内容为当前 epoch 的 32 位小写十六进制标识
+（以 LF 结尾，见 §1）；它是唯一告诉读者 `journal/<epoch>.jsonl`（§7.2）里哪个才是当前 epoch
+的文件，重要性类比 `format.json` 之于数据集身份。三种情况的处置：
+
+- **缺失**：全新未初始化的存储根的合法状态，代表"尚无 journal"，不是错误。
+  首次写入 journal 前必须先原子创建该文件（tmp → fsync → rename，同 §6 index 记录的原子替换手法）。
+- **内容不是合法的 32 位小写十六进制** → 拒绝并给出明确报错（I5：绝不猜测应该用哪个 epoch）。
+- 切换 epoch（M2 压缩流程的一部分）同样走 tmp → fsync → rename 原子替换，绝不原地覆盖。
 
 ## 5. format.json
 
@@ -133,9 +143,31 @@ hub 侧两条 append-only 事件流，均为 JSON Lines（§1）。
 {"v":1,"seq":42,"op":"upsert","item_id":"3f2a…","version_id":"20260804T102302Z-…","path":"京都/鸭川.png","actor":{"account":"bruce","device":"mac-studio","session":"s1"},"at":"2026-08-04T10:23:05Z"}
 ```
 
-`op` ∈ `upsert` / `tombstone` / `rename`（`rename` 额外含 `"from"` 字段）。
+`op` ∈ `upsert` / `tombstone` / `rename`。字段随 `op` 变化，语义依据 spec §5.3
+（删除 = tombstone；改名/移动 = 身份不动、映射搬家）：`tombstone` 与 `rename` 都不改变内容，
+因此不在 items 版本链（§7.1）产生新版本，`version_id` 沿用该 item 最后一个存活版本的 id。
+
+| 字段 | `upsert` | `tombstone` | `rename` |
+| --- | --- | --- | --- |
+| `version_id` | 新写入版本的 id | 删除前最后一个存活版本的 id | 改名前最后一个存活版本的 id（内容未变） |
+| `path` | 当前路径 | 被删除前的路径 | 改名后的新路径 |
+| `from` | 不出现 | 不出现 | 必填，改名前的路径 |
+
+```json
+{"v":1,"seq":43,"op":"tombstone","item_id":"3f2a…","version_id":"20260804T102302Z-…","path":"京都/鸭川.png","actor":{"account":"bruce","device":"mac-studio","session":"s1"},"at":"2026-08-04T11:00:00Z"}
+```
+
+```json
+{"v":1,"seq":44,"op":"rename","item_id":"3f2a…","version_id":"20260804T102302Z-…","path":"京都/河边.png","from":"京都/鸭川.png","actor":{"account":"bruce","device":"mac-studio","session":"s1"},"at":"2026-08-04T11:05:00Z"}
+```
+
 游标为 `<epoch>:<seq>`；`seq` 在一个 epoch 内单调递增、无空洞。
 客户端游标早于保留区间 → 返回 `reset_required`，走全量对账兜底。压缩规则 M2 定义。
+
+损坏处置：**末行不完整时截断到最后一个完整行边界，中间行损坏则失败而非跳过**——
+与 §7.1 items 版本链相同的处置纪律，直接继承自 lazync STORAGE.md §Incremental Change Journal
+（该节描述的正是 lazync 侧 `journal.bin` 的截断行为，是这条纪律真正的出处；
+arca 把它同时用于 journal 与 items 版本链）。
 
 ## 8. chunks 块存储
 
@@ -170,7 +202,7 @@ vault 侧的目录结构与职责划分见 spec §4.3；本节给出各文件的
 | `[[dataset]]` | `path` | 数据集相对 vault 根的路径 |
 | `[[dataset]]` | `hub` | 引用的 `[hub.<名>]` 键名 |
 
-示例（原样摘自 spec §4.3）：
+示例（改编自 spec §4.3，删去了其中的第二个 hub 与行内注释）：
 
 ```toml
 schema = 1
