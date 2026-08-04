@@ -1,7 +1,7 @@
 [package]
 name = "arca-publish"
 description = "发布映射：publish-map 生成 · referenced-only 扫描 · 静态导出"
-license = "Apache-2.0"
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

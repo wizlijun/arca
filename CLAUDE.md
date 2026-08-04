@@ -96,6 +96,9 @@ spec §2 定义了 I1–I11，全文以编号引用。实现时最常触及的�
 ## 约定
 
 - 只在 `main` 分支工作，不开特性分支。
-- 许可证统一 **Apache-2.0**；官网 gitarca.com。
+- 许可证分层（spec §12.2）：**除 `crates/arcad/` 外全部 MIT**，服务端 `arcad` 为 **AGPL-3.0-only**。
+  依赖方向单向：MIT 库可进 arcad，反之不行——**两端共用的逻辑必须留在 arca-core / arca-format**，
+  否则会被 AGPL 污染而无法在客户端复用。新建 crate 时 `license` 字段照此填。
+- 官网 gitarca.com。
 - CLI 遵循 git 的 plumbing / porcelain 分层与 Rule of Silence：成功时安静，
   数据走 stdout、诊断走 stderr，处处可加 `--json`；与 git 同名的动词语义必须一致。

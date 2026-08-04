@@ -1,7 +1,7 @@
 [package]
 name = "arca-agentd"
 description = "可选客户端 daemon：自动同步 watcher · 占位符投影供给（手动模式不依赖它）"
-license = "Apache-2.0"
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

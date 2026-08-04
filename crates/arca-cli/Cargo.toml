@@ -1,7 +1,7 @@
 [package]
 name = "arca-cli"
 description = "arca 命令行（独立 `arca …` 与子命令 `git arca …` 双形态）"
-license = "Apache-2.0"
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

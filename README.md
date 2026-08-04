@@ -55,6 +55,15 @@ arca/
 
 ## 许可证
 
-全部组件（含服务端 arcad）统一采用 **Apache-2.0**，见 [LICENSE](LICENSE)。
+分许可证：客户端与库最大化嵌入，服务端保留商业留白。
+
+| 组件 | 许可证 |
+| --- | --- |
+| 客户端、CLI、库、占位符层、conformance（除 `crates/arcad/` 外的全部 crate） | **MIT**，见 [LICENSE](LICENSE) |
+| 服务端 daemon `crates/arcad/` | **AGPL-3.0-only**，见 [LICENSE-AGPL-3.0](LICENSE-AGPL-3.0) |
+
+MIT 的库可被 AGPL 的 arcad 使用；反向不成立——**任何代码进 arcad 即受 AGPL 约束**，
+因此两端共用的逻辑必须落在 arca-core / arca-format 等 MIT crate 里（这与 §3.1 的分层约束同向）。
+理由见 spec §12.2。
 
 贡献采用 DCO。

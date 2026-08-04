@@ -1,7 +1,7 @@
 [package]
 name = "arca-format"
 description = "arca 磁盘格式的纯数据结构 + 解析/序列化 + golden vectors（FORMAT.md 的落地）"
-license = "Apache-2.0"
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

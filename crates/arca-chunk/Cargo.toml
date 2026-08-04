@@ -1,7 +1,7 @@
 [package]
 name = "arca-chunk"
 description = "内容寻址原语：FastCDC 分块 + BLAKE3 哈希 + zstd 压缩"
-license = "Apache-2.0"
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,7 +1,9 @@
 [package]
 name = "arcad"
 description = "arca 服务端 daemon —— 全系统唯一常驻进程（NAS / 服务器，单二进制）"
-license = "Apache-2.0"
+# 全仓唯一的 AGPL crate（spec §12.2）：其余 crate 为 MIT，可被此处使用；
+# 反向不成立——两端共用的逻辑必须留在 arca-core / arca-format，不得下沉到这里。
+license = "AGPL-3.0-only"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

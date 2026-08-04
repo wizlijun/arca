@@ -13,7 +13,7 @@
 以下约束适用于**每一个任务**，不再逐任务重复。
 
 - **MSRV 1.75，edition 2021**；`version`/`edition`/`rust-version`/`homepage` 一律 `.workspace = true` 继承。
-- **许可证 Apache-2.0**（所有 crate 一致），官网 `https://gitarca.com`。
+- **许可证**：`crates/arcad/` 为 `AGPL-3.0-only`，其余 crate 一律 `MIT`（spec §12.2）；官网 `https://gitarca.com`。
 - **只在 `main` 分支工作**，不开特性分支；每个任务结束提交一次。
 - **核心 crate 保持 `#![forbid(unsafe_code)]`**（`arca-format`、`arca-core`、`arca-chunk`、`arca-publish`、`arca-git`、`arca-conformance`）。
 - **文档与注释用中文**，与既有骨架一致；每个模块 doc comment 保留其 spec 章节引用。

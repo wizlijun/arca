@@ -1,7 +1,7 @@
 [package]
 name = "arca-conformance"
 description = "一致性测试套件——对第三方实现同样适用（格式活得比实现久）"
-license = "Apache-2.0"
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

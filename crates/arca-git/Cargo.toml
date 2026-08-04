@@ -1,7 +1,7 @@
 [package]
 name = "arca-git"
 description = "git 集成：.gitarca 注册表维护 · .gitignore 反选块 · 清单读写 · pre-push 钩子 · 追踪冲突检测"
-license = "Apache-2.0"
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

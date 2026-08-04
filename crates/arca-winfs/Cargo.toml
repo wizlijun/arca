@@ -1,7 +1,7 @@
 [package]
 name = "arca-winfs"
 description = "Windows Cloud Files API（CfAPI）占位符适配层"
-license = "Apache-2.0"
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

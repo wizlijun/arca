@@ -1,7 +1,7 @@
 [package]
 name = "arca-core"
 description = "对账与提交状态机（sans-io：纯状态机，无 IO，客户端与 hub 两端共用）"
-license = "Apache-2.0"
+license = "MIT"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
