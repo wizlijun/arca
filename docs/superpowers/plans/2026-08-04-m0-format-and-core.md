@@ -272,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn 拒绝错误前缀而不是 panic() {
+    fn 拒绝错误前缀而不是_panic() {
         assert!(ContentHash::parse("sha256:00").is_err());
         assert!(ContentHash::parse("blake3:xyz").is_err());
         assert!(ContentHash::parse("blake3:").is_err());
@@ -466,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn 拒绝控制字符包括 tab 与换行() {
+    fn 拒绝控制字符包括_tab_与换行() {
         // manifest 的 Tab 分隔依赖这一条（spec §4.4.1）
         assert_eq!(check("a\tb"), Err(PathStatus::InvalidChar));
         assert_eq!(check("a\nb"), Err(PathStatus::InvalidChar));
@@ -481,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn 拒绝 windows 保留名() {
+    fn 拒绝_windows_保留名() {
         assert_eq!(check("CON"), Err(PathStatus::ReservedName));
         assert_eq!(check("dir/nul.txt"), Err(PathStatus::ReservedName));
         assert_eq!(check("com9.dat"), Err(PathStatus::ReservedName));
@@ -653,7 +653,7 @@ cargo add --package arca-format --dev proptest
     proptest! {
         /// I5：任意输入都不得 panic，只能返回明确结果。
         #[test]
-        fn 任意输入都不 panic(raw in ".*") {
+        fn 任意输入都不_panic(raw in ".*") {
             let _ = normalize(&raw);
             let _ = check(&raw);
             let _ = index_key(&raw);
@@ -709,14 +709,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn item_id 往返一致() {
+    fn item_id_往返一致() {
         let id = ItemId::from_bytes([0x3f, 0x2a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xbe, 0xef]);
         assert_eq!(id.to_hex(), "3f2a000000000000000000000000beef");
         assert_eq!(ItemId::parse(&id.to_hex()).unwrap(), id);
     }
 
     #[test]
-    fn item_id 拒绝非法输入而不是 panic() {
+    fn item_id_拒绝非法输入而不是_panic() {
         assert!(ItemId::parse("").is_err());
         assert!(ItemId::parse("3f2a").is_err());                      // 太短
         assert!(ItemId::parse(&"a".repeat(33)).is_err());             // 太长
@@ -725,14 +725,14 @@ mod tests {
     }
 
     #[test]
-    fn version_id 的字典序即时间序() {
+    fn version_id_的字典序即时间序() {
         let early = VersionId::new("20260804T102302Z", &"0".repeat(32)).unwrap();
         let late = VersionId::new("20260804T102303Z", &"0".repeat(32)).unwrap();
         assert!(early.as_str() < late.as_str());
     }
 
     #[test]
-    fn version_id 拒绝错误形状() {
+    fn version_id_拒绝错误形状() {
         assert!(VersionId::new("2026-08-04T10:23:02Z", &"0".repeat(32)).is_err()); // 非紧凑形式
         assert!(VersionId::new("20260804T102302Z", "abc").is_err());               // 随机段长度不对
     }
@@ -1213,12 +1213,12 @@ hub  = "home"
     }
 
     #[test]
-    fn 拒绝未知 schema 版本() {
+    fn 拒绝未知_schema_版本() {
         assert!(Registry::parse("schema = 99\n").is_err());
     }
 
     #[test]
-    fn 拒绝引用了不存在的 hub() {
+    fn 拒绝引用了不存在的_hub() {
         let text = "schema = 1\n[[dataset]]\npath = \"assets\"\nhub = \"ghost\"\n";
         let reg = Registry::parse(text).unwrap();
         assert!(reg.validate().is_err(), "引用不存在的 hub 必须拒绝（spec §4.3.2）");
@@ -1243,7 +1243,7 @@ hub  = "home"
     }
 
     #[test]
-    fn 拒绝损坏的 toml 而不是 panic() {
+    fn 拒绝损坏的_toml_而不是_panic() {
         assert!(Registry::parse("[[[").is_err());
         assert!(Registry::parse("").is_err());
     }
@@ -1311,7 +1311,7 @@ impl Registry {
     /// spec §4.3.2 的一致性规则：引用存在、路径唯一、不得嵌套。
     /// 违反即拒绝，绝不静默激活（I5）。
     pub fn validate(&self) -> Result<(), FormatError> {
-        let mut seen: Vec<&str> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
         for entry in &self.dataset {
             if !self.hub.contains_key(&entry.hub) {
                 return Err(FormatError::Malformed {
@@ -1321,7 +1321,7 @@ impl Registry {
             }
             let normalized = crate::path_rules::normalize(&entry.path);
             for existing in &seen {
-                if *existing == normalized {
+                if existing.as_str() == normalized {
                     return Err(FormatError::Malformed {
                         line: 0,
                         reason: format!("路径 {normalized:?} 被登记了两次"),
@@ -1336,18 +1336,11 @@ impl Registry {
                     });
                 }
             }
-            seen.push(Box::leak(normalized.into_boxed_str()));
+            seen.push(normalized);
         }
         Ok(())
     }
 }
-```
-
-**注意：** 上面 `Box::leak` 是不可接受的写法（泄漏内存）。实现时改为收集 `Vec<String>` 并比较 `&str`：
-
-```rust
-        let mut seen: Vec<String> = Vec::new();
-        // ... 循环内比较 existing.as_str()，末尾 seen.push(normalized);
 ```
 
 - [ ] **Step 4: 写 dataset.rs 的测试与实现**
@@ -1382,7 +1375,7 @@ url_style = "path"
     }
 
     #[test]
-    fn 拒绝未知 url_style 而不是猜测() {
+    fn 拒绝未知_url_style_而不是猜测() {
         let text = "schema = 1\ndataset_id = \"a\"\nhub_instance_id = \"b\"\nurl_style = \"magic\"\n";
         assert!(DatasetConfig::parse(text).is_err());
     }
@@ -1498,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn 首版的 parent 为 null() {
+    fn 首版的_parent_为_null() {
         let line = to_line(&样例版本(None));
         assert!(line.contains("\"parent\":null"));
     }
@@ -1703,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn rename 事件携带来源路径() {
+    fn rename_事件携带来源路径() {
         let line = r#"{"v":1,"seq":1,"op":"rename","item_id":"3f2a000000000000000000000000beef","version_id":null,"path":"新.png","from":"旧.png","actor":{"account":"","device":"","session":""},"at":"2026-08-04T10:00:00Z"}"#;
         let event = JournalEvent::parse_line(line, 1).unwrap();
         assert_eq!(event.op, Op::Rename);
@@ -1732,7 +1725,7 @@ mod tests {
     use crate::model::ItemId;
 
     #[test]
-    fn format_json 往返一致() {
+    fn format_json_往返一致() {
         let text = r#"{"v":1,"format":1,"dataset_id":"9c41000000000000000000000000abcd","hash_algo":"blake3","created_at":"2026-08-04T10:00:00Z"}"#;
         let parsed = FormatJson::parse(text).unwrap();
         assert_eq!(parsed.dataset_id, "9c41000000000000000000000000abcd");
@@ -1878,7 +1871,7 @@ mod tests {
     }
 
     #[test]
-    fn 损坏输入返回错误而不是 panic() {
+    fn 损坏输入返回错误而不是_panic() {
         assert!(decompress(b"not zstd at all").is_err());
         assert!(decompress(&[]).is_err());
     }
@@ -2091,14 +2084,14 @@ fn 检出当前版本文件缺失() {
 }
 
 #[test]
-fn 缺少 format_json 时报告而不是崩溃() {
+fn 缺少_format_json_时报告而不是崩溃() {
     let dir = tempfile::tempdir().unwrap();
     let report = check_root(dir.path());
     assert!(report.problems.iter().any(|p| matches!(p, Problem::MissingFormatJson)));
 }
 
 #[test]
-fn fsck 绝不修改任何文件() {
+fn fsck_绝不修改任何文件() {
     let dir = tempfile::tempdir().unwrap();
     造一个健康的存储根(dir.path());
     fs::write(dir.path().join("files/note.txt"), b"tampered!!").unwrap();
@@ -2590,7 +2583,11 @@ git push origin main
 - `trash/`、`uploads/`、`locks/` 的格式与 chunks 引用计数属 M2（FORMAT.md §10 已明示）。
 - `arca-core` 的对账状态机属 M1–M2，本计划不触碰。
 
-**2. Placeholder 扫描：** 已消除。Task 6 Step 3 中刻意保留了一处「注意：`Box::leak` 不可接受」的纠正说明——这是给实现者的明确指令，不是占位符。
+**2. Placeholder 扫描：** 已消除，无 TBD / TODO / 「稍后填写」。
+
+**2b. 执行前预检（2026-08-04）：** 修正了两处会让实现者浪费一轮的缺陷——
+18 个测试函数名含空格（Rust 标识符非法，已改为下划线；CJK 标识符本身经实测可通过
+`clippy -D warnings`），以及 `Registry::validate` 中的 `Box::leak` 内存泄漏写法（已改为 `Vec<String>`）。
 
 **3. 类型一致性检查：**
 - `ContentHash` 的方法名在 Task 2 定义（`from_bytes`/`hasher`/`to_hex`/`to_text`/`parse`/`as_bytes`），Task 3、5、7、8、9 的引用一致。
