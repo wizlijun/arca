@@ -6,13 +6,13 @@
 
 **Architecture:** 三层依赖：`arca-chunk`（BLAKE3 / FastCDC / zstd，无上游依赖）→ `arca-format`（纯数据结构与解析/序列化，依赖 arca-chunk 的哈希类型）→ `arca-store`（存储根 IO，M0 唯一做 IO 的层）→ `arca-cli`（薄壳命令 `arca fsck`）。`arca-store` 单独成 crate，是因为 M1 的 `file://` 直连与 M2 的 arcad 都要读写存储根。全部解析器遵循「损坏输入 → 明确错误，绝不 panic」（I5），由 cargo-fuzz 守护。
 
-**Tech Stack:** Rust 2021 / MSRV 1.75 · blake3 · fastcdc · zstd · serde + serde_json（JSON Lines）· toml · clap（仅 arca-cli）· proptest · cargo-fuzz
+**Tech Stack:** Rust 2021 / MSRV 1.85 · blake3 · fastcdc · zstd · serde + serde_json（JSON Lines）· toml · clap（仅 arca-cli）· proptest · cargo-fuzz
 
 ## Global Constraints
 
 以下约束适用于**每一个任务**，不再逐任务重复。
 
-- **MSRV 1.75，edition 2021**；`version`/`edition`/`rust-version`/`homepage` 一律 `.workspace = true` 继承。
+- **MSRV 1.85，edition 2021**；`version`/`edition`/`rust-version`/`homepage` 一律 `.workspace = true` 继承。
 - **许可证**：`crates/arcad/` 为 `AGPL-3.0-only`，其余 crate 一律 `MIT`（spec §12.2）；官网 `https://gitarca.com`。
 - **只在 `main` 分支工作**，不开特性分支；每个任务结束提交一次。
 - **核心 crate 保持 `#![forbid(unsafe_code)]`**（`arca-format`、`arca-core`、`arca-chunk`、`arca-publish`、`arca-git`、`arca-conformance`）。
@@ -2537,14 +2537,14 @@ jobs:
       - run: cargo test --workspace
 
   msrv:
-    name: MSRV 1.75 构建门禁
+    name: MSRV 1.85 构建门禁
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.75
+      - uses: dtolnay/rust-toolchain@1.85
       # Cargo.lock 已入库，依赖版本可复现；本作业保证任何一次 cargo update
       # 若把某个依赖推到需要更高 rustc 的版本，会在这里大声失败，
-      # 而不是等到用户在 rustc 1.75 的机器上构建时才发现。
+      # 而不是等到用户在 rustc 1.85 的机器上构建时才发现。
       - run: cargo check --workspace --locked --all-targets
 
   escape-hatch:

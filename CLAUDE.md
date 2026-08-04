@@ -19,7 +19,7 @@ cargo clippy --workspace --all-targets
 cargo fmt                            # 需先 rustup component add rustfmt（当前未安装）
 ```
 
-MSRV 1.75，edition 2021。`arca-macfs` 是 Swift 工程，不在 cargo workspace 内，
+MSRV 1.85，edition 2021。`arca-macfs` 是 Swift 工程，不在 cargo workspace 内，
 不参与上述命令。
 
 ## 唯一真相源：spec
