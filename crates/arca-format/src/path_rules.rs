@@ -32,6 +32,24 @@ pub enum PathStatus {
     ReservedName,
 }
 
+impl PathStatus {
+    /// 稳定的短标识，用于 trace 的 `path.reject` 事件与 `--json` 输出
+    /// （FORMAT.md §10.3、PROTOCOL.md §7）。**受兼容性承诺约束：只增不改**——
+    /// agent 按它分支，改一个字符就是破坏性变更。`Debug` 输出不承担这个角色。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PathStatus::Empty => "empty",
+            PathStatus::Absolute => "absolute",
+            PathStatus::ParentRef => "parent_ref",
+            PathStatus::TooLong => "too_long",
+            PathStatus::TooDeep => "too_deep",
+            PathStatus::SegmentTooLong => "segment_too_long",
+            PathStatus::InvalidChar => "invalid_char",
+            PathStatus::ReservedName => "reserved_name",
+        }
+    }
+}
+
 const WINDOWS_RESERVED: [&str; 22] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",

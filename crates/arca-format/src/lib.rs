@@ -19,3 +19,4 @@ pub mod journal;
 pub mod manifest;
 pub mod model;
 pub mod path_rules;
+pub mod trace;

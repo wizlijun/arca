@@ -1,0 +1,11 @@
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":0,"t_abs":0,"event":"start","argv":"arca push assets","at":"2026-08-05T09:30:12Z","cwd":"/Users/bruce/vault","exe":"0.0.1"}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":1,"t_abs":1204,"event":"mount.check","dataset_id":"9c41000000000000000000000000abcd","expect":"9c41000000000000000000000000abcd","found":"9c41000000000000000000000000abcd","ok":true}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":2,"t_abs":1310,"event":"region_enter","label":"reconcile","nesting":1}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":3,"t_abs":40088,"event":"scan.summary","bytes":1886712784,"files":3000,"rejected":1}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":4,"t_abs":40102,"event":"path.reject","path":"京都/con.png","status":"reserved_name"}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":5,"t_abs":48211,"event":"reconcile.decide","action":"conflict","base":"blake3:9f2c0000000000000000000000000000000000000000000000000000000000ab","item_id":"3f2a000000000000000000000000beef","local":"modified","path":"京都/鸭川.png","reason":"three_way_divergent","remote":"modified"}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":6,"t_abs":48930,"event":"commit.attempt","hash":"blake3:c71a0000000000000000000000000000000000000000000000000000000000cd","if_match":"blake3:9f2c0000000000000000000000000000000000000000000000000000000000ab","item_id":"3f2a000000000000000000000000beef","size":2411008}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":7,"t_abs":91104,"event":"commit.result","item_id":"3f2a000000000000000000000000beef","outcome":"precondition_failed","version_id":null}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":8,"t_abs":91442,"event":"error","class":"protocol","code":"commit.stale_parent","detail":"父版本已过期，需重新对账","retryable":false}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":9,"t_abs":91520,"event":"region_leave","label":"reconcile","nesting":1}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":10,"t_abs":91604,"event":"exit","code":1}

@@ -1,0 +1,8 @@
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":0,"t_abs":0,"event":"start","argv":"arca push assets","at":"2026-08-05T09:30:12Z","cwd":"/Users/bruce/vault","exe":"0.0.1"}
+这不是 JSON
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":1,"t_abs":900,"event":"future.thing","hint":"未来版本的事件名：原样保留，向前兼容"}
+{"v":2,"sid":"20260805T093012Z-0123456789abcdef","seq":2,"t_abs":950,"event":"start"}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":3,"t_abs":1000,"event":"start","argv":["嵌套","载荷不允许"]}
+{"v":1,"sid":"bad-sid","seq":4,"t_abs":1100,"event":"exit","code":1}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":5,"t_abs":1200,"event":"exit","code":1}
+{"v":1,"sid":"20260805T093012Z-0123456789ab

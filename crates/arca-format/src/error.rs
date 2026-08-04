@@ -27,7 +27,7 @@ impl fmt::Display for FormatError {
                     write!(f, "第 {line} 行格式损坏：{reason}")
                 }
             }
-            FormatError::BadPath(status) => write!(f, "路径不合规：{status:?}"),
+            FormatError::BadPath(status) => write!(f, "路径不合规：{}", status.as_str()),
             FormatError::BadHash(text) => write!(f, "哈希不合规：{text}"),
             FormatError::Io(msg) => write!(f, "IO 错误：{msg}"),
         }
