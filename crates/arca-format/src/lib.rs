@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dataset;
+pub mod error;
 pub mod gitarca;
 pub mod hub_layout;
 pub mod manifest;
