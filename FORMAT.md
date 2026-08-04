@@ -283,7 +283,151 @@ Tab 与换行已被路径规则的控制字符规则排除（§2），分隔无�
 catalog 的格式由独立工具 `arca-catalog` 定义（spec §4.4）；`client/` 是纯本地、可丢弃的状态，
 不构成跨设备/跨实现的字节级契约。
 
-## 10. 已知限制
+## 10. trace 事件格式
+
+诊断轨迹。设计论证见 `docs/superpowers/specs/2026-08-05-trace-design.md`；
+命名与结构对齐 git 的 `trace2`（`GIT_TRACE2_EVENT`）。
+
+**定位：trace 是可丢弃的诊断产物，不是真相。**真相在 journal（§7.2）与 `.txn`。
+本节之所以进本规范而非留给实现自由发挥，是因为 agent 要解析它——
+`event` 的取值与 `error` 的 `class` 取值受兼容性承诺约束（§0）。
+
+### 10.1 信封
+
+JSON Lines（§1），一行一个事件。每行固定携带四个信封字段，其后是该事件类型的载荷字段：
+
+```json
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":17,"t_abs":48211,"event":"reconcile.decide","action":"conflict","local":"modified","path":"京都/鸭川.png","reason":"three_way_divergent","remote":"modified"}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `v` | 记录格式版本（§1），恒为第一个键 |
+| `sid` | 会话标识，见 §10.2 |
+| `seq` | 该 `sid` 内单调递增、无空洞（同 §7.2 的纪律，使「中间丢了事件」可检测） |
+| `t_abs` | 自本会话 `start` 事件起的**单调**微秒数，十进制整数 |
+| `event` | 事件类型，封闭枚举，见 §10.3 |
+
+`t_abs` **不是墙钟**。墙钟只在 `start` 事件的 `at` 字段出现一次（RFC 3339，§1）。
+两个理由：注入模拟时钟即可逐字节复现 trace（spec §11.2 的确定性要求）；
+单调时钟不受 NTP 跳变影响，区间测量才有意义。
+
+**载荷字段的值只允许标量**：字符串、整数、布尔、`null`；**不允许嵌套对象或数组**。
+需要表达集合时用多条事件。这条限制使 `jq` 处理无需展开嵌套，也防止 schema 随手失控。
+
+**载荷字段按键名的 UTF-8 字节序升序排列**，同 §9.3 manifest 的纪律：同内容必产生同字节。
+四个信封字段不参与排序，恒按上表顺序前置。这使解析→重新序列化逐字节稳定，
+`arca trace show --children` 归并多个会话时的输出因而对第三方实现可比对（arca-conformance）。
+载荷字段名与信封字段同名时以信封为准，载荷侧的同名字段被丢弃（绝不产生重复键）。
+
+### 10.2 sid
+
+`<紧凑时间戳><16 位小写十六进制随机>`，中间以 `-` 分隔，例：
+
+```
+20260805T093012Z-0123456789abcdef
+```
+
+时间戳形式同 `version_id`（§3）的前缀，使**字典序即时间序**。
+
+**sid 是层次化的**：子进程继承父 sid 并以 `/` 追加自己的一段
+（借 git trace2）。`arca sync` 内部调用 `arca fetch` / `arca push` 时形如：
+
+```
+20260805T093012Z-0123456789abcdef/20260805T093013Z-fedcba9876543210
+```
+
+段数上限 8；超过则拒绝（I5，防止无界嵌套把路径撑爆）。
+
+### 10.3 事件族
+
+`event` 取值是封闭枚举。会话骨架（借 git trace2）：
+
+| `event` | 载荷 |
+| --- | --- |
+| `start` | `at`（墙钟 RFC 3339）· `exe`（arca 版本）· `argv` · `cwd` |
+| `exit` | `code` |
+| `region_enter` / `region_leave` | `label` · `nesting` |
+| `error` | 见 §10.4 |
+| `panic` | `payload` · `location` |
+| `trace.dropped` | `count`——环形缓冲挤掉的事件数，见 §10.6 |
+
+arca 领域事件：
+
+| `event` | 载荷 | 里程碑 |
+| --- | --- | --- |
+| `mount.check` | `dataset_id` · `expect` · `found` · `ok` | M1（I11） |
+| `lock.acquire` / `lock.wait` / `lock.release` | `holder` · `waited_us` | M1 |
+| `path.reject` | `path` · `status` | M0 |
+| `scan.summary` | `files` · `bytes` · `rejected` | M1 |
+| `reconcile.decide` | `path` · `item_id` · `local` · `remote` · `base` · `action` · `reason` | M1 |
+| `commit.attempt` | `item_id` · `if_match` · `hash` · `size` | M1 |
+| `commit.result` | `item_id` · `outcome` · `version_id` | M1 |
+| `conflict.copy` | `path` · `copy_path` · `item_id` · `other_version_id` | M1 |
+| `txn.begin` / `txn.commit` / `txn.rollback` | `txn_id` · `kind` | M2 |
+| `transfer.summary` | `chunks_sent` · `chunks_skipped` · `bytes` | M2 |
+
+高频事实（逐文件扫描、逐块传输）走 `*.summary` 汇总；只有**决策**与**拒绝**逐条记录，
+否则 trace 体积会淹没信号。
+
+`txn.*` 事件是 `locks/<id>.txn`（§4）的**可丢镜像**：`.txn` 保持自己的格式与 fsync 保证、
+是崩溃恢复的权威依据；trace 里的副本只服务事后阅读。
+
+### 10.4 error 事件与处置类别
+
+```json
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":93,"t_abs":91442,"event":"error","code":"mount.identity_mismatch","class":"needs_human","retryable":false,"path":"","detail":"format.json 的 dataset_id 与绑定不符"}
+```
+
+`class` 取值封闭，是 agent 的处置依据——**agent 只看 `class` 就知道该做什么，无需理解 `code` 的语义**：
+
+| `class` | 含义 | 处置 |
+| --- | --- | --- |
+| `retryable` | 网络抖动、锁竞争 | 退避重试 |
+| `needs_human` | 卷身份不符、孤儿数据集、一致性冲突 | **停下**（I5），报告给人 |
+| `protocol` | CAS 412 等 | 走结构化冲突流程，不作为错误处理 |
+| `bug` | 内部不变量被破坏 | 提 issue |
+
+`code` 是稳定的短字符串，错误码表属 `PROTOCOL.md` §7。
+
+### 10.5 损坏处置：跳过并计数
+
+**与 §7 的 journal / items 相反：trace 的坏行跳过并计数，绝不因此丢弃其余行。**
+
+| 情况 | 处置 |
+| --- | --- |
+| 行不是合法 JSON / 缺信封字段 / 载荷含嵌套值 | 跳过该行，计入 skipped |
+| 行的 `v` 高于本实现已知版本 | 跳过该行，计入 skipped（不中止整个文件） |
+| `event` 是本实现不认识的名字 | **保留，原样透传**——向前兼容 |
+| 末行不完整（进程被杀） | 跳过该行 |
+
+这条纪律是刻意与 §7.1 / §7.2 相反的：journal 是真相，读错一行等于伪造历史，必须失败；
+trace 是事故现场的线索，为一行坏数据丢掉其余几千条线索是荒谬的。
+读取方**必须**把 skipped 计数报告给调用者，绝不静默（I5）。
+
+### 10.6 落盘位置与保留
+
+| 情况 | 行为 |
+| --- | --- |
+| 进程正常退出（code 0） | **不写任何文件**（Rule of Silence，spec §3.2） |
+| 非零退出 / panic | 把整个环形缓冲 flush 到 `<state>/trace/<sid 末段>.jsonl` |
+| `ARCA_TRACE_EVENT=<路径>` | 强制实时写入该路径（追加） |
+| `ARCA_TRACE_EVENT=1` / `=2` | 实时写 stdout / stderr（同 git 约定） |
+
+平时不产生文件，因此**不需要日志轮转**。保留由下一次进程启动时顺手 GC
+（客户端零常驻，没有别人能做这事）：`<state>/trace/` 超过 50 个文件或 14 天的删除。
+
+`<state>`：Linux `$XDG_STATE_HOME/arca`（缺省 `~/.local/state/arca`）·
+macOS `~/Library/Logs/arca` · Windows `%LOCALAPPDATA%\arca`。
+
+环形缓冲挤掉的事件数必须以 `trace.dropped` 事件如实落进文件——
+沉默地截断线索，读的人会误以为「前面什么都没发生」，这与 I5 同源。
+
+**trace 不 fsync**，这是刻意取舍：真正不能丢的是 `.txn` 与 journal，它们各自已有 fsync 保证；
+trace 丢了事实仍完整存在于二者中。给每条 trace 上 fsync 会让一次万文件同步多出几万次 fsync，
+并诱使人们把 trace 当真相依赖。
+
+## 11. 已知限制
 
 - **Unicode 规范化不做转换**（见 §2）：v1 按字节原样保存与比较路径，
   macOS 的 NFD 与其他平台的 NFC 会被视为不同路径。已知边界，v2 议题。
@@ -291,7 +435,11 @@ catalog 的格式由独立工具 `arca-catalog` 定义（spec §4.4）；`client
   未固定字节级格式。
 - **逃生舱恢复演示依赖 `b3sum`**（BLAKE3 官方 CLI），严格意义上不属于 coreutils——
   I1 的承诺是"不需要任何 arca 代码"，而非"只用 coreutils"，此处按前者执行并明示。
+- **trace 不定义 `thread` 字段**（§10）：arca-core 是单线程状态机，边缘的并发以 `region` 表达。
+  多线程 trace 是 v2 议题，届时按 §0 的 RFC 流程加字段。
+- **trace 含明文路径**（§10）：单机保留时不构成新的暴露面（读它的 agent 本就能读文件系统），
+  但 `arca bugreport` 是显式外发，M2 落地时须提供路径脱敏并默认提示。
 
-## 11. 不变量对照
+## 12. 不变量对照
 
 实现不得违反 spec §2 的 I1–I11；本规范每一节标注其约束来源。
