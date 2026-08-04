@@ -2536,6 +2536,17 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  msrv:
+    name: MSRV 1.75 构建门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75
+      # Cargo.lock 已入库，依赖版本可复现；本作业保证任何一次 cargo update
+      # 若把某个依赖推到需要更高 rustc 的版本，会在这里大声失败，
+      # 而不是等到用户在 rustc 1.75 的机器上构建时才发现。
+      - run: cargo check --workspace --locked --all-targets
+
   escape-hatch:
     name: 逃生舱恢复演示（I1）
     runs-on: ubuntu-latest
