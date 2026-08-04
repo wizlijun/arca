@@ -56,9 +56,22 @@ cp -R "$root/files/." "$dest/"
 #    在写到一半时被截断，只要截断点之前恰好也是以 `{` 开头，这一行就会被
 #    grep 误判为“完整”。下面这段 awk 额外要求行尾是 `}`、且整行花括号配平
 #    （开合数量相等）——足以挡住“末尾缺右花括号”和“写到某个嵌套对象的右
-#    花括号后被杀、外层还没收尾”这两种真实会发生的截断形态；它仍不是完整
-#    的 JSON 校验（比如字符串里恰好含不配对花括号的病态输入不会被挡住），
-#    但比单看行首字符强得多，且不需要引入 jq 依赖。
+#    花括号后被杀、外层还没收尾”这两种真实会发生的截断形态。
+#
+#    配平计数**排除字符串字面量内部的字符**（逐字符扫描、用 in_str 状态位
+#    跟踪是否在双引号内，遇到 `\` 时跳过下一个字符以正确处理 `\"`/`\\` 转义）：
+#    FORMAT.md §3 里 `actor.{account,device,session}` 是无字符限制的自由字符串，
+#    合法值完全可以含 `{`/`}`（比如设备名 "weird{name"）——如果直接数整行里
+#    的花括号字符（不管在不在字符串里），这类合法记录会被误判成“未配平”而被
+#    当成崩溃残留静默丢弃，后果比漏检更糟：一个真实提交过的版本会被当作
+#    从未发生过。items 记录的 JSON 结构只有一层嵌套（`actor`），且结构性
+#    花括号只出现在字符串外——因此“字符串外的开合数量相等”等价于“回到了
+#    嵌套深度 0”，对这个（深度 ≤ 1 的）schema 来说只可能发生在真正的收尾
+#    右花括号处，不是巧合意义上的近似，而是这个 schema 形状下的充分条件；
+#    schema 若在未来版本引入更深嵌套，这个论证需要重新核对。
+#    这仍不是通用 JSON 校验（比如故意构造深层嵌套或非法转义的病态输入
+#    理论上仍可能骗过），但已经堵上了「合法自由字符串含花括号」这个
+#    真实会发生的场景，且不需要引入 jq 依赖。
 # ---------------------------------------------------------------------------
 
 # 取一个 items/*.jsonl 版本链的“当前版本”：
@@ -68,13 +81,32 @@ cp -R "$root/files/." "$dest/"
 current_version() {
     awk '
         { lines[NR] = $0 }
-        function complete(line,    t, opens, closes) {
+        # 判断一行是否是“完整”的 items 记录：以 { 开头、以 } 结尾，且
+        # 字符串字面量之外的花括号配平（见上方脚本头注释的论证）。
+        function complete(line,    i, n, ch, in_str, opens, closes) {
             if (substr(line, 1, 1) != "{") return 0
-            if (substr(line, length(line), 1) != "}") return 0
-            t = line
-            opens = gsub(/\{/, "{", t)
-            t = line
-            closes = gsub(/\}/, "}", t)
+            n = length(line)
+            if (substr(line, n, 1) != "}") return 0
+            in_str = 0
+            opens = 0
+            closes = 0
+            for (i = 1; i <= n; i++) {
+                ch = substr(line, i, 1)
+                if (in_str) {
+                    if (ch == "\\") {
+                        i++  # 跳过被转义的下一个字符（\" 、\\ 均正确处理）
+                    } else if (ch == "\"") {
+                        in_str = 0
+                    }
+                } else if (ch == "\"") {
+                    in_str = 1
+                } else if (ch == "{") {
+                    opens++
+                } else if (ch == "}") {
+                    closes++
+                }
+            }
+            if (in_str) return 0  # 字符串未闭合，必是截断
             return (opens == closes)
         }
         END {
@@ -112,9 +144,11 @@ current_version() {
 
 problems=0
 file_count=0
+found_items=0
 
 for item in "$root"/.arca/items/*/*.jsonl; do
     test -e "$item" || continue
+    found_items=$((found_items + 1))
 
     if ! record=$(current_version "$item"); then
         echo "问题: $item 版本链无法确定当前版本" >&2
@@ -170,6 +204,23 @@ for item in "$root"/.arca/items/*/*.jsonl; do
 
     file_count=$((file_count + 1))
 done
+
+# ---------------------------------------------------------------------------
+# 3. 覆盖度交叉检查：files/ 下的实际文件数必须等于本次遍历到的 items 版本链数。
+#
+#    上面的 for 循环在 .arca/items/*/*.jsonl 没有任何匹配时（items 目录为空、
+#    或整个 .arca/items/ 目录缺失）一次都不会执行——`test -e "$item" || continue`
+#    会正确跳过那次不存在的 glob 展开，但循环体一次都没跑的净效果是：
+#    file_count=0、problems=0，脚本会打印“恢复并校验 0 个文件，0 个问题”并以
+#    退出码 0 收场，而与此同时 files/ 下的文件已经被第 1 步的 `cp -R` 原样
+#    拷进了 dest、从未被任何东西校验过。元数据树被清空或损坏，正是这个演示
+#    要抓的故障，绝不能让它看起来像是“没有文件可查所以自然零问题”。
+# ---------------------------------------------------------------------------
+total_files=$(find "$root/files" -type f | wc -l | tr -d ' ')
+if [ "$found_items" != "$total_files" ]; then
+    echo "问题: files/ 下有 $total_files 个文件，但只找到 $found_items 条 items 版本链记录（元数据树可能被清空、缺失或与 files/ 不同步）" >&2
+    problems=$((problems + 1))
+fi
 
 echo "恢复并校验 $file_count 个文件，$problems 个问题"
 test "$problems" -eq 0
