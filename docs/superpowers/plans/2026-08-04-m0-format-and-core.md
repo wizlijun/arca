@@ -931,7 +931,7 @@ git commit -m "arca-format: 身份/版本/actor 核心类型与统一错误类�
 
 **Interfaces:**
 - Consumes: `ContentHash`、`FormatError`、`path_rules::check`
-- Produces: `arca_format::manifest::{Manifest, ManifestEntry}`。签名：`Manifest::parse(&str) -> Result<Manifest, FormatError>`、`Manifest::to_string(&self) -> String`（确定性）、`Manifest::from_entries(Vec<ManifestEntry>) -> Manifest`（内部排序去重）、`ManifestEntry { path: String, hash: ContentHash, size: u64, mtime: String }`。Task 9 依赖。
+- Produces: `arca_format::manifest::{Manifest, ManifestEntry}`。签名：`Manifest::parse(&str) -> Result<Manifest, FormatError>`、`Manifest::to_string(&self) -> String`（确定性）、`Manifest::from_entries(Vec<ManifestEntry>) -> Result<Manifest, FormatError>`（内部按路径字节序排序；**重复路径拒绝而非去重**——静默挑一条属于 I5 禁止的猜测）、`ManifestEntry { path: String, hash: ContentHash, size: u64, mtime: String }`。Task 9 依赖。
 
 - [ ] **Step 1: 写失败的测试**
 
