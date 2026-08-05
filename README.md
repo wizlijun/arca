@@ -13,8 +13,17 @@ arca 是 git 仓库的二进制附件层：自托管、按相对路径原样可�
 
 ## 状态
 
-**早期骨架阶段**——项目结构已就位，实现尚未开始。
-设计规格见 [docs/2026-08-03-arca-spec.md](docs/2026-08-03-arca-spec.md)（v1.2 定稿）。
+**M0（格式与核心）已完成**，M1 尚未开始。设计规格见
+[docs/2026-08-03-arca-spec.md](docs/2026-08-03-arca-spec.md)（v1.2 定稿）。
+
+已实现：`FORMAT.md` 字节级格式契约定稿；`arca-format`（路径规则、身份/版本模型、行式清单、
+`.gitarca` 与 `dataset.toml`、hub 侧 JSON Lines 记录、trace 事件 schema）；`arca-chunk`
+（BLAKE3、FastCDC、zstd）；`arca-store` 的 fsck 存储根巡检；`arca fsck` 命令。
+配套 168 个测试、六种格式的 golden vectors、11 个 fuzz target，以及每晚在 CI 里跑的
+**逃生舱恢复演示**——用不含任何 arca 代码的 shell 脚本从存储根取回数据并逐个校验哈希，
+把「删掉 arca 数据照样可用」（I1）变成持续验证的承诺而不是一句话。
+
+其余 crate 仍是骨架（只有 doc comment 与 `TODO(Mn)` 标记）。
 
 ## 仓库布局
 
@@ -44,7 +53,7 @@ arca/
 
 | | 交付 |
 | --- | --- |
-| M0 | 格式与核心：FORMAT.md v1 · arca-format · arca-chunk · fsck |
+| **M0 ✅** | 格式与核心：FORMAT.md v1 · arca-format · arca-chunk · arca-store fsck · trace schema · fuzz 与 CI |
 | M1 | 单机纳管 + file:// 同步：CLI 基线闭环（无任何 daemon） |
 | M2 | arcad 与手动同步：CAS · tombstone · journal · 多 hub 独立故障域 |
 | M3 | agentd + Windows 占位符（★ 核心演示） |
