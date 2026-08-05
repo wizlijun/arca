@@ -71,6 +71,18 @@ impl FormatJson {
                 ),
             });
         }
+        // dataset_id 是这个文件存在的唯一理由——卷身份标记（I11）；FORMAT.md §1
+        // 规定其编码为 32 位小写十六进制，此前从未校验，两侧空 dataset_id 会被
+        // 判定"相等"，且是 crate 内唯一没有编码检查的标识符（评审 Important #8）。
+        if !crate::model::is_hex32(&wire.dataset_id) {
+            return Err(FormatError::Malformed {
+                line: 0,
+                reason: format!(
+                    "dataset_id {:?} 不是合法的 32 位小写十六进制（FORMAT.md §1）",
+                    wire.dataset_id
+                ),
+            });
+        }
         Ok(FormatJson {
             format: wire.format,
             dataset_id: wire.dataset_id,
@@ -101,6 +113,37 @@ impl FormatJson {
     }
 }
 
+/// `journal/epoch` 指针文件的解析（FORMAT.md §4）。三种处置这里各明确对应
+/// 一种返回值，绝不在调用点临时发挥（该文件的判断纪律与 `format.json` 同一
+/// 重要性量级——"缺失即未初始化、垃圾即停下"是 I11 邻近的语义）：
+///
+/// - `content` 为 `None`（调用方已确认文件不存在，例如 `fs::read_to_string`
+///   返回 `ErrorKind::NotFound`）→ `Ok(None)`：全新未初始化存储根的合法状态，
+///   代表"尚无 journal"，不是错误。
+/// - `content` 存在但不是合法的 32 位小写十六进制 → `Err`：拒绝并给出明确报错
+///   （I5：绝不猜测应该用哪个 epoch）。
+/// - `content` 是合法的 32 位小写十六进制 → `Ok(Some(epoch))`。
+///
+/// 本函数不做文件 I/O——`arca-format` 是纯解析/序列化层（同 crate 内其余
+/// `parse`/`to_*` 函数的纪律），文件是否存在由调用方（`arca-store`/`arcad`）
+/// 探测后经 `content` 参数告知；换行由写入侧的 LF 约定负责，这里容忍并剥除
+/// 末尾的 `\n`/`\r`（FORMAT.md §1：解析遇到 CR 结尾时容忍并剥除）。
+pub fn parse_epoch_pointer(content: Option<&str>) -> Result<Option<String>, FormatError> {
+    let Some(text) = content else {
+        return Ok(None);
+    };
+    let epoch = text.trim_end_matches(['\n', '\r']);
+    if !crate::model::is_hex32(epoch) {
+        return Err(FormatError::Malformed {
+            line: 0,
+            reason: format!(
+                "journal/epoch 内容 {epoch:?} 不是合法的 32 位小写十六进制（FORMAT.md §4）"
+            ),
+        });
+    }
+    Ok(Some(epoch.to_string()))
+}
+
 /// hub 存储根布局：目录/文件名常量与分片路径拼接（FORMAT.md §4）。
 ///
 /// 所有路径都是相对于 `dataset_root` 的相对路径，用 `/` 拼接（不做平台路径转换，
@@ -123,6 +166,9 @@ pub mod layout {
     pub const CHUNKS_DIR: &str = ".arca/chunks";
     /// 事件流 + `epoch` 指针文件（§7.2、§4）。
     pub const JOURNAL_DIR: &str = ".arca/journal";
+    /// `journal/epoch` 指针文件：单行文本，指向当前 epoch（§4）。见
+    /// [`super::parse_epoch_pointer`] 的三态处置。
+    pub const EPOCH_FILE: &str = ".arca/journal/epoch";
     /// 回收站，M2 定义。
     pub const TRASH_DIR: &str = ".arca/trash";
     /// 上传暂存，M2 定义。
@@ -168,7 +214,7 @@ mod tests {
 
     #[test]
     fn 拒绝未来的格式版本() {
-        let text = r#"{"v":1,"format":99,"dataset_id":"a","hash_algo":"blake3","created_at":"t"}"#;
+        let text = r#"{"v":1,"format":99,"dataset_id":"9c41000000000000000000000000abcd","hash_algo":"blake3","created_at":"t"}"#;
         assert!(
             FormatJson::parse(text).is_err(),
             "高于已知版本必须拒绝（I10）"
@@ -177,8 +223,72 @@ mod tests {
 
     #[test]
     fn 拒绝未知哈希算法() {
-        let text = r#"{"v":1,"format":1,"dataset_id":"a","hash_algo":"md5","created_at":"t"}"#;
+        let text = r#"{"v":1,"format":1,"dataset_id":"9c41000000000000000000000000abcd","hash_algo":"md5","created_at":"t"}"#;
         assert!(FormatJson::parse(text).is_err());
+    }
+
+    #[test]
+    fn 拒绝不合规编码的_dataset_id() {
+        // 评审 Important #8：dataset_id 是唯一存在理由就是充当卷身份标记（I11）
+        // 的文件，此前是 crate 内唯一没有编码检查的标识符——空 dataset_id 曾能
+        // 通过解析，而两侧的空 dataset_id 会被判定"相等"。
+        let too_short =
+            r#"{"v":1,"format":1,"dataset_id":"a","hash_algo":"blake3","created_at":"t"}"#;
+        assert!(FormatJson::parse(too_short).is_err(), "太短必须拒绝");
+
+        let empty = r#"{"v":1,"format":1,"dataset_id":"","hash_algo":"blake3","created_at":"t"}"#;
+        assert!(FormatJson::parse(empty).is_err(), "空字符串必须拒绝");
+
+        let uppercase = r#"{"v":1,"format":1,"dataset_id":"9C41000000000000000000000000ABCD","hash_algo":"blake3","created_at":"t"}"#;
+        assert!(FormatJson::parse(uppercase).is_err(), "大写必须拒绝");
+    }
+
+    // --- journal/epoch 指针文件（评审 Important #3）---------------------------
+
+    #[test]
+    fn epoch指针文件缺失是合法的未初始化态() {
+        assert_eq!(parse_epoch_pointer(None).unwrap(), None);
+    }
+
+    #[test]
+    fn epoch指针文件内容合法时返回该_epoch() {
+        let epoch = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            parse_epoch_pointer(Some(epoch)).unwrap(),
+            Some(epoch.to_string())
+        );
+        // 容忍并剥除末尾换行（FORMAT.md §1）。
+        assert_eq!(
+            parse_epoch_pointer(Some(&format!("{epoch}\n"))).unwrap(),
+            Some(epoch.to_string())
+        );
+        assert_eq!(
+            parse_epoch_pointer(Some(&format!("{epoch}\r\n"))).unwrap(),
+            Some(epoch.to_string())
+        );
+    }
+
+    #[test]
+    fn epoch指针文件内容非法必须拒绝() {
+        // I5：绝不猜测应该用哪个 epoch。
+        assert!(parse_epoch_pointer(Some("")).is_err(), "空内容必须拒绝");
+        assert!(
+            parse_epoch_pointer(Some("not-hex")).is_err(),
+            "非十六进制必须拒绝"
+        );
+        assert!(
+            parse_epoch_pointer(Some("0123456789ABCDEF0123456789ABCDEF")).is_err(),
+            "大写必须拒绝"
+        );
+        assert!(
+            parse_epoch_pointer(Some("../../../etc/passwd")).is_err(),
+            "路径穿越形态必须拒绝"
+        );
+    }
+
+    #[test]
+    fn epoch_file常量指向journal目录下的epoch文件() {
+        assert_eq!(layout::EPOCH_FILE, ".arca/journal/epoch");
     }
 
     #[test]
@@ -192,7 +302,7 @@ mod tests {
 
     #[test]
     fn 拒绝未来的记录版本() {
-        let text = r#"{"v":99,"format":1,"dataset_id":"a","hash_algo":"blake3","created_at":"t"}"#;
+        let text = r#"{"v":99,"format":1,"dataset_id":"9c41000000000000000000000000abcd","hash_algo":"blake3","created_at":"t"}"#;
         assert!(
             FormatJson::parse(text).is_err(),
             "记录 v 字段高于已知版本也必须拒绝，与 format 字段分开校验（FORMAT.md §0）"
