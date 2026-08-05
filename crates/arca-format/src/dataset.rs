@@ -42,6 +42,17 @@ impl DatasetConfig {
                 max: MAX_SCHEMA,
             });
         }
+        // dataset_id 是 hub 侧 format.json 的同一个卷身份标记（FORMAT.md §1、§9.2，
+        // I11），编码约定相同：32 位小写十六进制。评审 Important #8。
+        if !crate::model::is_hex32(&cfg.dataset_id) {
+            return Err(FormatError::Malformed {
+                line: 0,
+                reason: format!(
+                    "dataset_id {:?} 不是合法的 32 位小写十六进制（FORMAT.md §1）",
+                    cfg.dataset_id
+                ),
+            });
+        }
         Ok(cfg)
     }
 
@@ -92,14 +103,27 @@ url_style = "path"
 
     #[test]
     fn 拒绝未知_url_style_而不是猜测() {
-        let text =
-            "schema = 1\ndataset_id = \"a\"\nhub_instance_id = \"b\"\nurl_style = \"magic\"\n";
+        let text = "schema = 1\ndataset_id = \"9c41000000000000000000000000abcd\"\n\
+                    hub_instance_id = \"b\"\nurl_style = \"magic\"\n";
         assert!(DatasetConfig::parse(text).is_err());
     }
 
     #[test]
     fn 拒绝缺失必填字段() {
         assert!(DatasetConfig::parse("schema = 1\n").is_err());
+    }
+
+    #[test]
+    fn 拒绝不合规编码的_dataset_id() {
+        // 评审 Important #8：dataset_id 全局唯一、不可变，是 hub 侧 format.json
+        // 的同一个卷身份标记，此前未做编码校验。
+        let too_short =
+            "schema = 1\ndataset_id = \"a\"\nhub_instance_id = \"3f2a000000000000000000000000beef\"\n";
+        assert!(DatasetConfig::parse(too_short).is_err(), "太短必须拒绝");
+
+        let uppercase = "schema = 1\ndataset_id = \"9C41000000000000000000000000ABCD\"\n\
+                    hub_instance_id = \"3f2a000000000000000000000000beef\"\n";
+        assert!(DatasetConfig::parse(uppercase).is_err(), "大写必须拒绝");
     }
 
     #[test]
