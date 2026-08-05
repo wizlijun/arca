@@ -140,15 +140,42 @@ fn parse_version_id(text: &str) -> Result<VersionId, FormatError> {
 /// 解析整段事件流。处置纪律与 `items::parse_chain` 相同（FORMAT.md §7.2 明文要求
 /// 与 §7.1 一致）：末行不完整截断到最后一个完整行边界；边界内任何一行解析失败
 /// 都返回 `Err`，绝不跳过。
+///
+/// 同时校验 FORMAT.md §7.2 明文规定的 `seq` 纪律：一个 epoch 内单调递增、无空洞
+/// ——trace 设计文档点明了这条规则的目的：让「中间丢了事件」可检测。相邻两条记录
+/// 的 `seq` 必须恰好相差 1，否则视为损坏并返回 `Malformed{line, reason}`，与中间行
+/// JSON 损坏走同一条「拒绝而非跳过」纪律（I5）。
+///
+/// 本函数只读整段文本、从文件开头开始解析——**不支持从游标中间偏移开始读取**。
+/// 判断依据：当前没有任何调用方需要「从某个 seq 之后开始增量解析」这个用法
+/// （M1 尚未实现基于 `Cursor` 的增量拉取；那部分逻辑届时需要先在磁盘/网络层
+/// 定位起始字节偏移，再决定要不要给本函数加一个「期望的起始 seq」参数）。
+/// 现在加这样的参数纯属为一个不存在的调用方猜测接口形状，本身就违反 I5；
+/// 等 M1 真正需要增量读取时，再依据届时的真实调用点决定参数化方式。
 pub fn parse_stream(text: &str) -> Result<Vec<JournalEvent>, FormatError> {
     let complete_upto = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
     let complete = &text[..complete_upto];
 
     let mut events = Vec::new();
+    let mut prev_seq: Option<u64> = None;
     for (zero_based, raw) in complete.lines().enumerate() {
         let line_no = zero_based + 1;
         let line = raw.trim_end_matches('\r');
-        events.push(JournalEvent::parse_line(line, line_no)?);
+        let event = JournalEvent::parse_line(line, line_no)?;
+        if let Some(prev) = prev_seq {
+            if event.seq != prev.wrapping_add(1) {
+                return Err(FormatError::Malformed {
+                    line: line_no,
+                    reason: format!(
+                        "journal seq 不连续：上一条 {prev}，本条 {}；FORMAT.md §7.2 要求 \
+                         一个 epoch 内单调递增、无空洞",
+                        event.seq
+                    ),
+                });
+            }
+        }
+        prev_seq = Some(event.seq);
+        events.push(event);
     }
     Ok(events)
 }
@@ -161,15 +188,22 @@ pub struct Cursor {
 }
 
 impl Cursor {
+    /// 解析 `<epoch>:<seq>`。`epoch` 部分必须是合法的 32 位小写十六进制
+    /// （FORMAT.md §4：`journal/epoch` 指针文件的内容编码），这条校验此前缺失——
+    /// 而 fuzz target 的注释早已写明这是"客户端提供的不可信输入"，`epoch` 又会被
+    /// 直接拼进 `journal/<epoch>.jsonl` 这个磁盘路径片段（§7.2）：不校验编码，
+    /// 一个 `../../../../etc/passwd:0` 形态的游标就会变成路径穿越。
     pub fn parse(text: &str) -> Result<Self, FormatError> {
         let (epoch, seq) = text.split_once(':').ok_or_else(|| FormatError::Malformed {
             line: 0,
             reason: format!("游标 {text:?} 缺少 ':' 分隔符"),
         })?;
-        if epoch.is_empty() {
+        if !crate::model::is_hex32(epoch) {
             return Err(FormatError::Malformed {
                 line: 0,
-                reason: "游标 epoch 部分为空".to_string(),
+                reason: format!(
+                    "游标 epoch 部分 {epoch:?} 不是合法的 32 位小写十六进制（FORMAT.md §4）"
+                ),
             });
         }
         let seq: u64 = seq.parse().map_err(|_| FormatError::Malformed {
@@ -193,21 +227,44 @@ impl fmt::Display for Cursor {
 mod tests {
     use super::*;
 
+    /// 测试用固定 32 位小写十六进制 epoch（FORMAT.md §4）。
+    const 样例EPOCH: &str = "0123456789abcdef0123456789abcdef";
+
     #[test]
     fn 游标往返一致() {
         let cursor = Cursor {
-            epoch: "abc123".into(),
+            epoch: 样例EPOCH.into(),
             seq: 42,
         };
-        assert_eq!(cursor.to_string(), "abc123:42");
-        assert_eq!(Cursor::parse("abc123:42").unwrap(), cursor);
+        assert_eq!(cursor.to_string(), format!("{样例EPOCH}:42"));
+        assert_eq!(Cursor::parse(&format!("{样例EPOCH}:42")).unwrap(), cursor);
     }
 
     #[test]
     fn 拒绝畸形游标() {
         assert!(Cursor::parse("no-colon").is_err());
-        assert!(Cursor::parse("abc:notanumber").is_err());
+        assert!(Cursor::parse(&format!("{样例EPOCH}:notanumber")).is_err());
         assert!(Cursor::parse("").is_err());
+    }
+
+    #[test]
+    fn 拒绝不合法编码的_epoch() {
+        // 评审 Important #2：epoch 会被直接拼进 journal/<epoch>.jsonl 磁盘路径
+        // （FORMAT.md §7.2），不校验编码就是路径穿越的开口。
+        assert!(Cursor::parse("abc123:42").is_err(), "太短，不是 32 位");
+        assert!(
+            Cursor::parse(&format!("{}:42", "0".repeat(32))).is_ok(),
+            "合法的 32 位小写十六进制应放行"
+        );
+        assert!(
+            Cursor::parse(&format!("{}:42", "A".repeat(32))).is_err(),
+            "大写不接受"
+        );
+        assert!(
+            Cursor::parse("../../../../etc/passwd:0").is_err(),
+            "路径穿越形态的 epoch 必须拒绝"
+        );
+        assert!(Cursor::parse(":42").is_err(), "空 epoch 必须拒绝");
     }
 
     /// 测试用固定 version_id：三种 op 均必填（FORMAT.md §7.2 字段表），不存在为空的情形。
@@ -347,6 +404,72 @@ mod tests {
         let line = event.to_line().unwrap();
         let text = format!("{line}\n损坏的行\n{line}\n");
         assert!(parse_stream(&text).is_err(), "中间行损坏必须失败，不得跳过");
+    }
+
+    fn 带seq的样例事件(seq: u64) -> JournalEvent {
+        JournalEvent {
+            seq,
+            op: Op::Upsert,
+            item_id: crate::model::ItemId::parse("3f2a000000000000000000000000beef").unwrap(),
+            version_id: 样例version_id(),
+            path: "a.png".into(),
+            from: None,
+            actor: crate::model::Actor::default(),
+            at: "t".into(),
+        }
+    }
+
+    #[test]
+    fn seq连续时正常解析() {
+        let text = format!(
+            "{}\n{}\n{}\n",
+            带seq的样例事件(1).to_line().unwrap(),
+            带seq的样例事件(2).to_line().unwrap(),
+            带seq的样例事件(3).to_line().unwrap(),
+        );
+        let events = parse_stream(&text).unwrap();
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn seq不从1开始也可以只要连续() {
+        // 本函数不假设文件第一条事件的 seq 必然是 1（压缩/新 epoch 起点由更高层
+        // 决定），只校验相邻记录之间是否连续。
+        let text = format!(
+            "{}\n{}\n",
+            带seq的样例事件(41).to_line().unwrap(),
+            带seq的样例事件(42).to_line().unwrap(),
+        );
+        assert_eq!(parse_stream(&text).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn seq出现空洞则拒绝() {
+        // FORMAT.md §7.2：seq 在一个 epoch 内单调递增、无空洞；这是让「中间丢了
+        // 事件」可检测的机制本身，绝不能在解析层放行空洞。
+        let text = format!(
+            "{}\n{}\n",
+            带seq的样例事件(41).to_line().unwrap(),
+            带seq的样例事件(43).to_line().unwrap(),
+        );
+        let err = parse_stream(&text).expect_err("seq 41 -> 43 有空洞，必须拒绝");
+        match err {
+            FormatError::Malformed { line, .. } => assert_eq!(line, 2),
+            other => panic!("应报第 2 行 seq 空洞，实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seq倒退或重复则拒绝() {
+        let text = format!(
+            "{}\n{}\n",
+            带seq的样例事件(5).to_line().unwrap(),
+            带seq的样例事件(5).to_line().unwrap(),
+        );
+        assert!(
+            parse_stream(&text).is_err(),
+            "重复/倒退的 seq 必须拒绝，不是单调递增"
+        );
     }
 
     #[test]

@@ -50,6 +50,15 @@ impl ItemId {
     }
 }
 
+/// 校验是否为 32 位小写十六进制——`item_id` / `dataset_id` / journal `epoch`
+/// 共享的编码约定（FORMAT.md §1、§4）。与 [`ItemId::parse`] 的字符级校验逻辑
+/// 判断标准一致，供不需要保留为 `ItemId` 类型、只需要校验编码合法性的调用方复用
+/// （`dataset_id` 是纯粹的卷身份字符串，不像 `item_id` 那样被当作字节数组用于
+/// 磁盘路径分片；journal `epoch` 同理）。
+pub fn is_hex32(text: &str) -> bool {
+    text.len() == 32 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 fn lower_hex(byte: u8) -> Result<u8, FormatError> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
