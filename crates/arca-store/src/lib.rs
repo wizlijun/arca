@@ -17,8 +17,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod atomic;
 pub mod fsck;
 pub mod root;
 
-// TODO(M1)：pub mod atomic;   —— tmp → fsync → rename 原子提交
 // TODO(M2)：pub mod txn;      —— .txn 事务日志与前滚/回滚（继承 lazync §4）
