@@ -3,7 +3,7 @@
 //! 这些不是形式测试——把「根不存在」当成「库是空的」，同步引擎会认为远端删光了文件，
 //! 于是触发删除对账清掉用户本地数据。每一条都对应一种真实的挂载故障。
 
-use arca_store::root::{MountError, StorageRoot};
+use arca_store::root::{MountError, RootEscape, StorageRoot};
 use std::fs;
 use std::path::Path;
 
@@ -27,7 +27,7 @@ fn 健康的存储根可以打开() {
     造存储根(dir.path(), 样例_ID);
     let root = StorageRoot::open(dir.path(), Some(样例_ID)).unwrap();
     assert_eq!(root.dataset_id(), 样例_ID);
-    assert_eq!(root.join("files").file_name().unwrap(), "files");
+    assert_eq!(root.join("files").unwrap().file_name().unwrap(), "files");
 }
 
 #[test]
@@ -79,8 +79,26 @@ fn format_json_损坏时报_malformed_而不是_absent() {
     fs::create_dir_all(dir.path().join(".arca")).unwrap();
     fs::write(dir.path().join(".arca/format.json"), "{ 这不是 JSON").unwrap();
     match StorageRoot::open(dir.path(), Some(样例_ID)) {
-        Err(MountError::Malformed(_)) => {}
+        Err(MountError::Malformed { path, .. }) => {
+            assert!(
+                path.ends_with(".arca/format.json"),
+                "Malformed 必须点名具体路径，供扫多个挂载点的 fsck 定位，实得 {path:?}"
+            );
+        }
         other => panic!("必须报 Malformed，实得 {other:?}"),
+    }
+}
+
+#[test]
+fn 期望身份格式非法时报_bad_expected_id_而不是_identity_mismatch() {
+    // 调用方参数错误与卷身份不符是两类不同的失败（不是「卷」的问题）
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), 样例_ID);
+    match StorageRoot::open(dir.path(), Some("大写不合法ID")) {
+        Err(MountError::BadExpectedId { value }) => {
+            assert_eq!(value, "大写不合法ID");
+        }
+        other => panic!("必须报 BadExpectedId，实得 {other:?}"),
     }
 }
 
@@ -93,4 +111,45 @@ fn 打开是只读的绝不创建任何东西() {
     let _ = StorageRoot::open(&空, Some(样例_ID));
     let 条目数 = fs::read_dir(&空).unwrap().count();
     assert_eq!(条目数, 0, "打开失败的探测不得创建任何文件或目录");
+}
+
+#[test]
+fn join_拒绝绝对路径逃逸() {
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), 样例_ID);
+    let root = StorageRoot::open(dir.path(), Some(样例_ID)).unwrap();
+    match root.join("/etc/passwd") {
+        Err(RootEscape { .. }) => {}
+        other => panic!("绝对路径必须被拒绝，实得 {other:?}"),
+    }
+}
+
+#[test]
+fn join_拒绝父目录引用逃逸() {
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), 样例_ID);
+    let root = StorageRoot::open(dir.path(), Some(样例_ID)).unwrap();
+    match root.join("../../逃逸") {
+        Err(RootEscape { .. }) => {}
+        other => panic!("`..` 父目录引用必须被拒绝，实得 {other:?}"),
+    }
+}
+
+#[test]
+fn join_放行存储根内的正常相对路径() {
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), 样例_ID);
+    let root = StorageRoot::open(dir.path(), Some(样例_ID)).unwrap();
+    let joined = root.join("files/正常路径").unwrap();
+    assert_eq!(joined, dir.path().join("files/正常路径"));
+}
+
+#[test]
+fn join_不误伤名字里含两个点但不是父引用的路径() {
+    // `a..b` 是合法文件名，不能被 `..` 的字符串匹配误伤（须按路径分量判断）
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), 样例_ID);
+    let root = StorageRoot::open(dir.path(), Some(样例_ID)).unwrap();
+    let joined = root.join("a..b/文件").unwrap();
+    assert_eq!(joined, dir.path().join("a..b/文件"));
 }
