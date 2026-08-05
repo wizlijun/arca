@@ -1,0 +1,2 @@
+{"v":1,"seq":42,"op":"upsert","item_id":"3f2a000000000000000000000000beef","version_id":"20260804T102302Z-0123456789abcdef0123456789abcdef","path":"京都/鸭川.png","actor":{"account":"bruce","device":"mac-studio","session":"s1"},"at":"2026-08-04T10:23:05Z"}
+{"v":1,"seq":43,"op":"tombstone","item_id":"3f2a000000000000000000000000beef","version_id":"20260804T102302Z-0123456789abcdef0123456789abcdef","path":"京都/鸭川.png","actor":{"account":"bruce","device":"mac-studio","session":"s1"},"at":"2026-08-04T11:00:00Z"}
