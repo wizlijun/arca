@@ -54,14 +54,15 @@ arca/
 | | 交付 |
 | --- | --- |
 | **M0 ✅** | 格式与核心：FORMAT.md v1 · arca-format · arca-chunk · arca-store fsck · trace schema · fuzz 与 CI |
-| M1 | 单机纳管 + file:// 同步：CLI 基线闭环（无任何 daemon） |
+| M1 | 单机纳管 + file:// 同步：CLI 基线闭环（无任何 daemon）。**M1a 存储根 IO 地基 ✅**，M1b/M1c/M1d 待做 |
 | M2 | arcad 与手动同步：CAS · tombstone · journal · 多 hub 独立故障域 |
 | M3 | agentd + Windows 占位符（★ 核心演示） |
 | M4 | macOS 占位符 |
 | M5 | 生态与迁移：catalog · Git LFS 桥 · 发布映射 · Obsidian 插件 |
 | M6 | agent 接口：arca-mcp · agent 令牌 · checkpoint |
 
-验收标准见 spec §12.3。
+验收标准见 spec §12.3。已完成阶段的总结（交付内容、偏离原规格的决定及理由、
+评审抓到的问题、留给后续的）归档在 [docs/milestones/](docs/milestones/)。
 
 ## 许可证
 
