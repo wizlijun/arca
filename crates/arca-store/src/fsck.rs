@@ -8,7 +8,8 @@
 
 use arca_chunk::hash::ContentHash;
 use arca_format::hub_layout::{layout, FormatJson};
-use arca_format::{items, path_rules};
+use arca_format::items;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -36,6 +37,12 @@ pub enum Problem {
     },
     /// item 没有任何 index 记录指向它——悬空引用。
     OrphanIndex { key: String },
+    /// 一条 index 记录本身无法读取或解析（文件损坏、权限问题、内容不是合法
+    /// `IndexRecord`）。与 [`Problem::OrphanIndex`] 是两种不同性质的故障，绝不能
+    /// 折叠成同一个诊断：`OrphanIndex` 说的是"确实没有这条记录"，`CorruptIndex`
+    /// 说的是"记录存在但读不出来"——后者继续静默跳过会让 fsck 对它本该指向的那个
+    /// 文件的位腐烂视而不见，同时报出误导性的原因（评审 Important #4）。
+    CorruptIndex { path: String, reason: String },
     /// `items/<xx>/<item_id>.jsonl` 无法解析为合法版本链。
     BrokenChain { item: String, reason: String },
     /// `chunks/<xx>/<hash>.zst` 读出来了，但解压失败或解压后哈希与文件名不一致——
@@ -79,7 +86,14 @@ pub fn check_root(root: &Path) -> FsckReport {
         }
     }
 
-    // 2. 逐条 item：当前版本必须在 files/ 存在，且哈希与大小一致
+    // 2. 逐条 item：当前版本必须在 files/ 存在，且哈希与大小一致。
+    //    index/ 只需扫描一遍：build_index 把「记录存在但损坏」（CorruptIndex）
+    //    与「压根没有这条记录」（OrphanIndex，在下面按 item_id 查 index_map 时判定）
+    //    分开报告，不静默吞掉前者（评审 Important #4）。`corrupt_index_items` 记录
+    //    了损坏记录里仍能提取出的 item_id：这类 item 已经在 index_map 之外单独报过
+    //    CorruptIndex，不应再额外报一条误导性的 OrphanIndex（"压根没有记录"其实
+    //    不成立，只是这条记录读不出可用的路径）。
+    let (index_map, corrupt_index_items) = build_index(root, &mut report);
     let items_dir = root.join(layout::ITEMS_DIR);
     for shard in read_dir_sorted(&items_dir) {
         for item_file in read_dir_sorted(&shard) {
@@ -106,10 +120,12 @@ pub fn check_root(root: &Path) -> FsckReport {
             let Some(current) = chain.last() else {
                 continue;
             };
-            let Some(logical) = lookup_path(root, &current.item_id.to_hex()) else {
-                report.problems.push(Problem::OrphanIndex {
-                    key: current.item_id.to_hex(),
-                });
+            let Some(logical) = index_map.get(&current.item_id.to_hex()).cloned() else {
+                if !corrupt_index_items.contains(&current.item_id.to_hex()) {
+                    report.problems.push(Problem::OrphanIndex {
+                        key: current.item_id.to_hex(),
+                    });
+                }
                 continue;
             };
             let physical = root.join(layout::FILES_DIR).join(&logical);
@@ -174,26 +190,57 @@ pub fn check_root(root: &Path) -> FsckReport {
     report
 }
 
-/// 反查 item_id 对应的逻辑路径：遍历 index/ 记录。
+/// 单次扫描 `index/` 目录，建立 `item_id → 路径` 映射。
 ///
-/// M0 用线性扫描（O(n²)：每个 item 都要重新遍历一遍整个 index 目录），
-/// 存储根规模有限，可接受；M2 换成内存索引（哈希表）后应替换本函数。
-fn lookup_path(root: &Path, item_id_hex: &str) -> Option<String> {
+/// 之前的实现（`lookup_path`）按 item 反复重新遍历整个 index 目录（O(n²)），
+/// 且用 `let Ok(..) = .. else { continue }` 把「读取失败」「JSON 解析失败」
+/// 两种损坏与「这条记录不是我要找的那条」这种正常情形折叠成同一种
+/// `continue`——于是一条损坏的 index 记录会被当成"不匹配"悄悄跳过，最终让
+/// fsck 对着它本该指向的 item 报 `OrphanIndex`（"没有索引记录"），这是另一个
+/// 且错误的诊断，同时完全跳过了该 item 文件的哈希/大小校验（评审 Important #4）。
+///
+/// 改为单次扫描：既修掉了诊断错误（损坏记录单独计入 `CorruptIndex`，不影响
+/// 其余记录的可用性），也顺带把 O(n²) 降到 O(n)——存储根规模有限时前者不是
+/// 性能问题，但既然要重写就没有理由保留它。
+///
+/// 返回值第二项是从损坏记录里仍能宽松提取出 item_id 的集合（见
+/// [`arca_format::index::extract_item_id_lenient`]）：`path` 不合规不代表
+/// item_id 本身也不可信，调用方用它来避免对"记录存在但坏了"的 item 额外报出
+/// 误导性的 `OrphanIndex`（"压根没有记录"）。
+fn build_index(root: &Path, report: &mut FsckReport) -> (HashMap<String, String>, HashSet<String>) {
+    let mut by_item = HashMap::new();
+    let mut corrupt_items: HashSet<String> = HashSet::new();
     for shard in read_dir_sorted(&root.join(layout::INDEX_DIR)) {
         for record in read_dir_sorted(&shard) {
-            let Ok(text) = fs::read_to_string(&record) else {
-                continue;
+            let text = match fs::read_to_string(&record) {
+                Ok(t) => t,
+                Err(e) => {
+                    report.problems.push(Problem::CorruptIndex {
+                        path: record.display().to_string(),
+                        reason: format!("读取失败：{e}"),
+                    });
+                    continue;
+                }
             };
-            let Ok(parsed) = arca_format::index::IndexRecord::parse(&text) else {
-                continue;
-            };
-            if parsed.item_id.to_hex() == item_id_hex {
-                // 路径必须合规，否则视为损坏记录而非可用映射
-                return path_rules::check(&parsed.path).ok();
+            match arca_format::index::IndexRecord::parse(&text) {
+                Ok(parsed) => {
+                    // IndexRecord::parse 内部已经过 path_rules::check，能解析
+                    // 出来的 path 必然合规，这里不需要再次校验。
+                    by_item.insert(parsed.item_id.to_hex(), parsed.path);
+                }
+                Err(e) => {
+                    report.problems.push(Problem::CorruptIndex {
+                        path: record.display().to_string(),
+                        reason: format!("解析失败：{e}"),
+                    });
+                    if let Some(item_id) = arca_format::index::extract_item_id_lenient(&text) {
+                        corrupt_items.insert(item_id.to_hex());
+                    }
+                }
             }
         }
     }
-    None
+    (by_item, corrupt_items)
 }
 
 /// 排序读目录：使 fsck 的输出确定（同一状态必产生同一报告）。文件系统的

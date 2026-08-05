@@ -190,6 +190,125 @@ fn 检出块文件权限错误而不是内容损坏() {
     );
 }
 
+/// 找到「造一个健康的存储根」生成的唯一 index 记录文件路径。
+fn 唯一的index记录路径(root: &Path) -> std::path::PathBuf {
+    let index_dir = root.join(".arca/index");
+    let shard = fs::read_dir(&index_dir)
+        .unwrap()
+        .find_map(|e| e.ok().map(|e| e.path()))
+        .expect("应有且只有一个分片目录");
+    fs::read_dir(&shard)
+        .unwrap()
+        .find_map(|e| e.ok().map(|e| e.path()))
+        .expect("应有且只有一条 index 记录")
+}
+
+/// 评审 Important #4：某个 item 自己的 index 记录里 `item_id` 仍可读出、但
+/// `path` 不合规（因而整条记录被 `IndexRecord::parse` 拒绝）时，fsck 必须报
+/// `CorruptIndex`（"记录存在但读不出可用路径"），而不是 `OrphanIndex`（"压根
+/// 没有这条记录"）——旧实现会把解析失败静默 `continue`，最终对着这个 item
+/// 报出误导性的 `OrphanIndex`。
+#[test]
+fn item自身的index记录路径不合规时报corrupt而不是orphan() {
+    let dir = tempfile::tempdir().unwrap();
+    造一个健康的存储根(dir.path());
+
+    let record = 唯一的index记录路径(dir.path());
+    fs::write(
+        &record,
+        r#"{"v":1,"item_id":"3f2a000000000000000000000000beef","path":"../逃逸.png"}"#,
+    )
+    .unwrap();
+
+    let report = check_root(dir.path());
+
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::CorruptIndex { .. })),
+        "应报 CorruptIndex，实得 {:?}",
+        report.problems
+    );
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::OrphanIndex { .. })),
+        "item_id 仍可读出，不应额外报出误导性的 OrphanIndex，实得 {:?}",
+        report.problems
+    );
+}
+
+/// 与上一条相对：index 记录整体不是合法 JSON（`item_id` 也读不出来）时，
+/// 没有办法把这条损坏记录归因到具体某个 item——`CorruptIndex` 仍必须出现
+/// （损坏本身不能被静默吞掉），但对应 item 这时确实符合"没有可用记录"，
+/// `OrphanIndex` 会照常出现，两条问题同时存在，如实反映"库里有一条无法
+/// 归因的损坏记录，且这个 item 目前没有可用的路径映射"这两个独立事实。
+#[test]
+fn index记录完全非json时item_id不可归因故corrupt与orphan并存() {
+    let dir = tempfile::tempdir().unwrap();
+    造一个健康的存储根(dir.path());
+
+    let record = 唯一的index记录路径(dir.path());
+    fs::write(&record, "不是合法的 json").unwrap();
+
+    let report = check_root(dir.path());
+
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::CorruptIndex { .. })),
+        "损坏本身必须被报出，实得 {:?}",
+        report.problems
+    );
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::OrphanIndex { .. })),
+        "item_id 不可归因时，该 item 确实没有可用记录，OrphanIndex 应照常出现，实得 {:?}",
+        report.problems
+    );
+}
+
+/// 索引目录里存在一条与当前查找目标无关的损坏记录时，不应影响其它 item
+/// 的正常校验——损坏是逐条记录的，不能因为目录里有一条坏记录就让整体巡检
+/// 退化。
+#[test]
+fn 无关的损坏index记录不影响其他item的正常校验() {
+    let dir = tempfile::tempdir().unwrap();
+    造一个健康的存储根(dir.path());
+
+    // 额外塞一条与任何 item 都无关的损坏 index 记录。
+    let stray_shard = dir.path().join(".arca/index/ff");
+    fs::create_dir_all(&stray_shard).unwrap();
+    fs::write(stray_shard.join("deadbeef.json"), "不是合法的 json").unwrap();
+
+    let report = check_root(dir.path());
+
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::CorruptIndex { .. })),
+        "无关的损坏记录本身仍应被报告，实得 {:?}",
+        report.problems
+    );
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::OrphanIndex { .. })
+                || matches!(p, Problem::HashMismatch { .. })
+                || matches!(p, Problem::MissingFile { .. })),
+        "健康 item 的校验不应被无关的损坏记录波及，实得 {:?}",
+        report.problems
+    );
+    assert_eq!(report.checked_files, 1, "健康 item 仍应正常被校验");
+}
+
 #[test]
 fn fsck_绝不修改任何文件() {
     let dir = tempfile::tempdir().unwrap();

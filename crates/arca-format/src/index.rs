@@ -67,6 +67,25 @@ impl IndexRecord {
     }
 }
 
+/// 宽松提取 `item_id`，**不**要求 `path` 合规——诊断专用。
+///
+/// 唯一已知调用方是 `arca-store` 的 fsck：当一条 index 记录整体解析失败
+/// （[`IndexRecord::parse`] 返回 `Err`）时，fsck 需要判断这条损坏记录到底是不是
+/// 当前正在核对的那个 item 的记录，才能报出正确的诊断——`CorruptIndex`（"记录
+/// 存在但读不出来"）而不是 `OrphanIndex`（"压根没有这条记录"，二者是不同性质
+/// 的故障，绝不可折叠，评审 Important #4）。`item_id` 字段仍然经过完整的编码
+/// 校验（复用 [`ItemId::parse`]），只是不再要求 `path` 也合规——因此本函数的
+/// 返回值只能用于把问题归因到正确的 item，**绝不能**把它当作可信的路径映射
+/// 来源去定位磁盘上的文件（那正是 `IndexRecord::parse` 拒绝的东西）。
+pub fn extract_item_id_lenient(text: &str) -> Option<ItemId> {
+    #[derive(Deserialize)]
+    struct Lenient {
+        item_id: Option<String>,
+    }
+    let raw: Lenient = serde_json::from_str(text).ok()?;
+    ItemId::parse(&raw.item_id?).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +124,24 @@ mod tests {
             IndexRecord::parse(text).is_err(),
             "高于已知版本必须拒绝（I10）"
         );
+    }
+
+    #[test]
+    fn 宽松提取在path不合规时仍能拿到item_id() {
+        let text = r#"{"v":1,"item_id":"3f2a000000000000000000000000beef","path":"../逃逸.png"}"#;
+        assert!(IndexRecord::parse(text).is_err(), "严格解析必须拒绝");
+        assert_eq!(
+            extract_item_id_lenient(text).map(|id| id.to_hex()),
+            Some("3f2a000000000000000000000000beef".to_string()),
+            "宽松提取不应因 path 不合规而放弃 item_id"
+        );
+    }
+
+    #[test]
+    fn 宽松提取对完全非法_json_或非法_item_id_返回_none() {
+        assert!(extract_item_id_lenient("不是json").is_none());
+        assert!(extract_item_id_lenient(r#"{"v":1,"path":"a.png"}"#).is_none());
+        assert!(extract_item_id_lenient(r#"{"v":1,"item_id":"zz","path":"a.png"}"#).is_none());
     }
 
     #[test]
