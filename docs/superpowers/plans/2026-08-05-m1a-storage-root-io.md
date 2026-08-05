@@ -91,7 +91,14 @@ VecSink::new() / .records() / .kinds()      // 测试里断言决策序列
     `Io { path: String, reason: String }`。实现 `Display`（中文）+ `std::error::Error`。
   - `arca_store::root::StorageRoot`：`open(root: &Path, expected_dataset_id: Option<&str>) -> Result<StorageRoot, MountError>`；
     `path(&self) -> &Path`；`format(&self) -> &FormatJson`；`dataset_id(&self) -> &str`；
-    `join(&self, relative: &str) -> PathBuf`。
+    `join(&self, relative: &str) -> Result<PathBuf, RootEscape>`。
+
+> **`join` 为什么返回 `Result`**（评审后修订）：`Path::join` 遇到绝对路径会把根整个丢掉——
+> `root.join("/etc/passwd")` 返回的就是 `/etc/passwd`。`StorageRoot` 存在的意义正是
+> 「持有它就不必在每个调用点重新推导根的安全性」，所以拒绝绝对路径、`..` 组件与盘符前缀
+> 是这个类型的职责，不是调用方的。Task 3 的写入路径建在它之上。
+>
+> `MountError` 相应新增 `BadExpectedId`，`Malformed` 改为 `{ path, source }` 带上路径。
 - Task 2、3、4 依赖 `StorageRoot::open` 与 `join`。
 
 - [ ] **Step 1: 写失败的测试**
