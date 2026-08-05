@@ -4,9 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目状态
 
-**骨架阶段**：12 个 crate 的目录与模块划分已就位，但**没有任何实现代码**——
-每个模块只有 doc comment（说明职责、对应 spec 章节、所属里程碑），以 `TODO(Mn)` 标记待实现处。
-外部依赖一律未引入，各 `Cargo.toml` 以注释记录实现时的计划依赖（blake3 / axum / rusqlite 等）。
+**M0 已完成**（格式与核心，43 个提交）。已实现：
+
+- `arca-format` —— 路径规则、身份/版本/actor 类型、行式 manifest、`.gitarca`/`dataset.toml`、
+  hub 侧 JSON Lines（format.json / index / items / journal）、trace 事件 schema 与 sink
+- `arca-chunk` —— BLAKE3 哈希、FastCDC 切块、zstd 压缩（带解压尺寸上限）、块存储路径
+- `arca-store` —— fsck 存储根巡检（只读）
+- `arca-cli` —— `arca fsck` 薄壳命令
+- `FORMAT.md` —— 字节级格式契约定稿；golden vectors 覆盖六种格式
+- 11 个 fuzz target、GitHub Actions CI（含每晚逃生舱恢复演示与 ASAN fuzz）
+
+**M1 尚未开始**。`arca-core` / `arca-git` / `arcad` / `arca-agentd` / `arca-publish` /
+`arca-catalog` / `arca-mcp` / `arca-winfs` 仍是骨架，只有 doc comment 与 `TODO(Mn)` 标记。
+`arca-store` 只有 fsck——`atomic`（tmp→fsync→rename）与存储根身份校验（I11）都还没实现。
 
 ## 常用命令
 
@@ -16,7 +26,10 @@ cargo build --workspace
 cargo test --workspace
 cargo test -p arca-core <测试名>     # 跑单个测试
 cargo clippy --workspace --all-targets
-cargo fmt                            # 需先 rustup component add rustfmt（当前未安装）
+cargo fmt --all -- --check           # CI 会卡这一条
+cargo +1.85 check --workspace --locked --all-targets   # MSRV 门禁（1.75/1.85 工具链均已装）
+cargo check --manifest-path fuzz/Cargo.toml            # fuzz crate 不在 workspace 内，需单独 check
+cargo +nightly-2025-12-04 fuzz run <target> -- -max_total_time=60   # 本机 ASAN 挂起，CI 在 Linux 上跑
 ```
 
 MSRV 1.85，edition 2021。`arca-macfs` 是 Swift 工程，不在 cargo workspace 内，
