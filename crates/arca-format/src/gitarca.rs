@@ -99,8 +99,15 @@ impl Registry {
     /// 下游某一层兜底。因此用 `path_rules::check()`（而不是只做规范化的
     /// `normalize()`）：它在返回规范化路径的同时，也拒绝绝对路径、`..` 父引用等
     /// `path_rules::check` 覆盖到的所有非法形态。
+    ///
+    /// 相等性与嵌套前缀判断都按 [`crate::path_rules::casefold`]（ASCII-only 大小写
+    /// 折叠，FORMAT.md §2）比较，而不是原始字符串——macOS / Windows 的文件系统默认
+    /// 大小写不敏感，`path = "Assets"` 与 `path = "assets"` 若只比较原始字符串会双双
+    /// 通过校验，随后解析到磁盘上同一个目录：两个数据集、两个 hub、一棵树
+    /// （评审 Important #11）。错误信息仍然展示用户写的原始大小写（`normalized`），
+    /// 只有比较这一步用折叠后的形式。
     pub fn validate(&self) -> Result<(), FormatError> {
-        let mut seen: Vec<String> = Vec::new();
+        let mut seen: Vec<(String, String)> = Vec::new();
         for entry in &self.dataset {
             if !self.hub.contains_key(&entry.hub) {
                 return Err(FormatError::Malformed {
@@ -111,25 +118,31 @@ impl Registry {
             let normalized =
                 crate::path_rules::check(&entry.path).map_err(|status| FormatError::Malformed {
                     line: 0,
-                    reason: format!("数据集路径 {:?} 不合规：{status:?}", entry.path),
+                    reason: format!("数据集路径 {:?} 不合规：{}", entry.path, status.as_str()),
                 })?;
-            for existing in &seen {
-                if existing.as_str() == normalized {
+            let folded = crate::path_rules::casefold(&normalized);
+            for (existing_display, existing_folded) in &seen {
+                if existing_folded == &folded {
                     return Err(FormatError::Malformed {
                         line: 0,
-                        reason: format!("路径 {normalized:?} 被登记了两次"),
+                        reason: format!(
+                            "路径 {normalized:?} 与 {existing_display:?} 只是大小写不同，\
+                             在大小写不敏感的文件系统上会碰撞，视为同一路径被登记了两次"
+                        ),
                     });
                 }
-                if normalized.starts_with(&format!("{existing}/"))
-                    || existing.starts_with(&format!("{normalized}/"))
+                if folded.starts_with(&format!("{existing_folded}/"))
+                    || existing_folded.starts_with(&format!("{folded}/"))
                 {
                     return Err(FormatError::Malformed {
                         line: 0,
-                        reason: format!("数据集 {normalized:?} 与 {existing:?} 嵌套；归属必须唯一"),
+                        reason: format!(
+                            "数据集 {normalized:?} 与 {existing_display:?} 嵌套；归属必须唯一"
+                        ),
                     });
                 }
             }
-            seen.push(normalized);
+            seen.push((normalized, folded));
         }
         Ok(())
     }
@@ -212,6 +225,32 @@ hub  = "home"
         assert!(
             reg.validate().is_ok(),
             "assets 与 assets2 只是前缀相同，不是嵌套"
+        );
+    }
+
+    #[test]
+    fn 拒绝仅大小写不同的重复路径() {
+        // 评审 Important #11：macOS / Windows 默认大小写不敏感文件系统上
+        // "Assets" 与 "assets" 会解析到同一个目录。
+        let text = "schema = 1\n[hub.h]\ninstance_id = \"a\"\nurl = \"u\"\n\
+                    [[dataset]]\npath = \"Assets\"\nhub = \"h\"\n\
+                    [[dataset]]\npath = \"assets\"\nhub = \"h\"\n";
+        let reg = Registry::parse(text).unwrap();
+        assert!(
+            reg.validate().is_err(),
+            "大小写不同但折叠后相同的路径必须拒绝"
+        );
+    }
+
+    #[test]
+    fn 拒绝大小写不同的嵌套数据集() {
+        let text = "schema = 1\n[hub.h]\ninstance_id = \"a\"\nurl = \"u\"\n\
+                    [[dataset]]\npath = \"Assets\"\nhub = \"h\"\n\
+                    [[dataset]]\npath = \"assets/inner\"\nhub = \"h\"\n";
+        let reg = Registry::parse(text).unwrap();
+        assert!(
+            reg.validate().is_err(),
+            "大小写不同的嵌套同样必须拒绝，归属必须唯一"
         );
     }
 

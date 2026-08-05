@@ -144,7 +144,10 @@ fn parse_entry(line: &str, line_no: usize) -> Result<ManifestEntry, FormatError>
     }
     let path = path_rules::check(fields[0]).map_err(|status| FormatError::Malformed {
         line: line_no,
-        reason: format!("路径不合规：{status:?}"),
+        // `as_str()`（不是 `Debug`）：这是稳定的短标识，受兼容性承诺约束
+        // （PathStatus 文档、FORMAT.md §10.3），agent 与 --json 层按它分支
+        // （评审 Important #5：同一种拒绝不能从不同解析器吐出不同拼写）。
+        reason: format!("路径不合规：{}", status.as_str()),
     })?;
     let hash = ContentHash::parse(fields[1]).map_err(|e| FormatError::Malformed {
         line: line_no,
