@@ -11,7 +11,7 @@
 use arca_format::error::FormatError;
 use arca_format::hub_layout::{layout, FormatJson};
 use arca_format::model::is_hex32;
-use arca_format::trace::{EventKind, TraceRecord, TraceSink};
+use arca_format::trace::{ErrorClass, EventKind, TraceRecord, TraceSink};
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -142,6 +142,16 @@ impl StorageRoot {
         if let Some(expected) = expected_dataset_id {
             if !is_hex32(expected) {
                 emit_mount_check(sink, t_abs_us, false, Some(expected), "");
+                emit_error(
+                    sink,
+                    t_abs_us,
+                    "mount.bad_expected_id",
+                    ErrorClass::Bug,
+                    "",
+                    format!(
+                        "调用方传入的期望 dataset_id {expected:?} 不是合法的 32 位小写十六进制"
+                    ),
+                );
                 return Err(MountError::BadExpectedId {
                     value: expected.to_string(),
                 });
@@ -153,12 +163,31 @@ impl StorageRoot {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 emit_mount_check(sink, t_abs_us, false, expected_dataset_id, "");
+                emit_error(
+                    sink,
+                    t_abs_us,
+                    "mount.absent",
+                    ErrorClass::NeedsHuman,
+                    &root.display().to_string(),
+                    format!("存储根缺少 {}——卷未挂载或路径错误", layout::FORMAT_JSON),
+                );
                 return Err(MountError::Absent {
                     path: root.display().to_string(),
                 });
             }
             Err(e) => {
                 emit_mount_check(sink, t_abs_us, false, expected_dataset_id, "");
+                // 权限、挂载点损坏等——同属「停下报告给人」，不归 retryable：
+                // NFS 抖动那类值得重试的场景由上层策略判断，不是这里的职责
+                // （§此文件顶部关于三态区分的说明）。
+                emit_error(
+                    sink,
+                    t_abs_us,
+                    "mount.io_error",
+                    ErrorClass::NeedsHuman,
+                    &format_path.display().to_string(),
+                    e.to_string(),
+                );
                 return Err(MountError::Io {
                     path: format_path.display().to_string(),
                     reason: e.to_string(),
@@ -170,6 +199,14 @@ impl StorageRoot {
             Ok(format) => format,
             Err(source) => {
                 emit_mount_check(sink, t_abs_us, false, expected_dataset_id, "");
+                emit_error(
+                    sink,
+                    t_abs_us,
+                    "format.malformed",
+                    ErrorClass::NeedsHuman,
+                    &format_path.display().to_string(),
+                    source.to_string(),
+                );
                 return Err(MountError::Malformed {
                     path: format_path.display().to_string(),
                     source,
@@ -180,6 +217,14 @@ impl StorageRoot {
         if let Some(expected) = expected_dataset_id {
             if expected != format.dataset_id {
                 emit_mount_check(sink, t_abs_us, false, Some(expected), &format.dataset_id);
+                emit_error(
+                    sink,
+                    t_abs_us,
+                    "mount.identity_mismatch",
+                    ErrorClass::NeedsHuman,
+                    &root.display().to_string(),
+                    format!("期望 dataset_id {expected}，实际是 {}", format.dataset_id),
+                );
                 return Err(MountError::IdentityMismatch {
                     expected: expected.to_string(),
                     found: format.dataset_id.clone(),
@@ -214,9 +259,19 @@ impl StorageRoot {
 
     /// 拼接存储根内的相对路径。传 `layout::` 里的常量，不要手写字面量。
     ///
-    /// 拒绝三种会逃出存储根的输入：绝对路径、含 `..` 父目录引用的路径、
-    /// 含 Windows 盘符前缀（如 `C:`）的路径。`a..b` 这样文件名里含两个点
-    /// 但不构成父目录引用的路径会被放行。
+    /// 拒绝四种会逃出存储根、或指向存储根本身/其上级的输入：绝对路径、
+    /// 含 `..` 父目录引用的路径、含 Windows 盘符前缀（如 `C:`）的路径、
+    /// 以及不含任何正常分量的路径（空串 `""` 或仅 `.`）。`a..b` 这样文件名
+    /// 里含两个点但不构成父目录引用的路径会被放行。
+    ///
+    /// 最后一种拒绝理由不那么显眼，但同样是逃逸：`""` 与 `"."` 都不含
+    /// `ParentDir`、不含 `Prefix`、也不是绝对路径，字面上会放行，拼接后
+    /// `target` 等于存储根本身，`target.parent()` 就成了存储根的**上一级**——
+    /// 调用方（如 `atomic::write`）据此对父目录 `create_dir_all` /
+    /// `sync_dir`，作用范围就悄悄溢出到根之外了。写入本身会因
+    /// `rename(文件, 目录)` 失败而落不了地，不构成数据损坏，但这道校验的
+    /// 职责就是「不必在每个调用点重新推导根的安全性」，放过这种输入等于
+    /// 没做到。
     pub fn join(&self, relative: &str) -> Result<PathBuf, RootEscape> {
         let rel_path = Path::new(relative);
 
@@ -227,6 +282,7 @@ impl StorageRoot {
             });
         }
 
+        let mut has_normal_component = false;
         for component in rel_path.components() {
             match component {
                 Component::ParentDir => {
@@ -241,8 +297,16 @@ impl StorageRoot {
                         reason: "含盘符前缀，逃出存储根",
                     });
                 }
-                _ => {}
+                Component::Normal(_) => has_normal_component = true,
+                Component::CurDir | Component::RootDir => {}
             }
+        }
+
+        if !has_normal_component {
+            return Err(RootEscape {
+                relative: relative.to_string(),
+                reason: "不含任何正常路径分量（空串或仅 `.`），拼接后等于存储根本身或其上级",
+            });
         }
 
         Ok(self.path.join(rel_path))
@@ -268,5 +332,33 @@ fn emit_mount_check(
     if let Some(expect) = expect {
         record = record.with("expect", expect.to_string());
     }
+    sink.record(record);
+}
+
+/// 配合失败路径的 `mount.check` 额外发一条 `error` 事件
+/// （FORMAT.md §10.4、PROTOCOL.md §7）。
+///
+/// **为什么需要这一条，`mount.check` 不够**：`mount.check` 的载荷被
+/// FORMAT.md §10.3 钉死为 `dataset_id`/`expect`/`found`/`ok` 四个字段——
+/// `Absent`、`Io`、`Malformed` 三种失败 `found` 都是空字符串、`ok` 都是
+/// `false`、`dataset_id` 都取同一个 `expect`，产出的载荷逐字节相同，agent
+/// 看 `mount.check` 本身无法回答「是没挂载、挂着但读不了、还是身份读不出
+/// 来」。改 `mount.check` 的字段集需要改 FORMAT.md 规范；`error` 事件的
+/// schema 本就是为承载 `code`/`class` 设计的，不需要碰规范就能补上这条
+/// 区分度。
+fn emit_error(
+    sink: &mut dyn TraceSink,
+    t_abs_us: u64,
+    code: &'static str,
+    class: ErrorClass,
+    path: &str,
+    detail: String,
+) {
+    let record = TraceRecord::new(EventKind::Error, t_abs_us)
+        .with("code", code)
+        .with("class", class)
+        .with("retryable", class.is_retryable())
+        .with("path", path.to_string())
+        .with("detail", detail);
     sink.record(record);
 }

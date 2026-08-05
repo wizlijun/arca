@@ -3,7 +3,7 @@
 //! 这些不是形式测试——把「根不存在」当成「库是空的」，同步引擎会认为远端删光了文件，
 //! 于是触发删除对账清掉用户本地数据。每一条都对应一种真实的挂载故障。
 
-use arca_format::trace::{EventKind, FieldValue, NullSink, VecSink};
+use arca_format::trace::{ErrorClass, EventKind, FieldValue, NullSink, VecSink};
 use arca_store::root::{MountError, RootEscape, StorageRoot};
 use std::fs;
 use std::path::Path;
@@ -146,6 +146,25 @@ fn join_放行存储根内的正常相对路径() {
 }
 
 #[test]
+fn join_拒绝空串或仅点号() {
+    // 评审 Important #5：""、"." 都不含 ParentDir、不含 Prefix、也不是
+    // 绝对路径，字面上会被放行，拼接后 target 等于存储根本身，
+    // target.parent() 就成了存储根的上一级——调用方据此对父目录做
+    // create_dir_all / sync_dir，作用范围就溢出到根之外了。
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), 样例_ID);
+    let root = StorageRoot::open(dir.path(), Some(样例_ID)).unwrap();
+    match root.join("") {
+        Err(RootEscape { .. }) => {}
+        other => panic!("空串必须被拒绝，实得 {other:?}"),
+    }
+    match root.join(".") {
+        Err(RootEscape { .. }) => {}
+        other => panic!("仅 `.` 必须被拒绝，实得 {other:?}"),
+    }
+}
+
+#[test]
 fn join_不误伤名字里含两个点但不是父引用的路径() {
     // `a..b` 是合法文件名，不能被 `..` 的字符串匹配误伤（须按路径分量判断）
     let dir = tempfile::tempdir().unwrap();
@@ -252,6 +271,161 @@ fn 身份不符时_dataset_id_取_expect_而不是_found() {
         记录[0].field("dataset_id"),
         Some(&FieldValue::from(样例_ID.to_string())),
         "dataset_id 应取 expect（调用方意图操作的数据集），不是 found（磁盘上实际读到的）"
+    );
+}
+
+// --- 评审 Important #3：Absent / Io / Malformed 的 mount.check 载荷逐字节
+// 相同（ok=false、found=""、同一个 dataset_id），agent 单看 mount.check
+// 分不清三者。修法是在失败路径上额外发一条 error 事件，带上彼此不同的
+// code。下面三个测试各自断言：恰好发出 mount.check + error 两条事件，
+// error 带着预期的 code/class，且三条路径的 code 互不相同。 ---
+
+#[test]
+fn 根缺失时额外发一条_error_事件_code_为_mount_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sink = VecSink::new();
+    let _ = StorageRoot::open_traced(&dir.path().join("从未挂载"), Some(样例_ID), 0, &mut sink);
+
+    let 记录 = sink.records();
+    assert_eq!(记录.len(), 2, "应恰好发 mount.check + error 两条事件");
+    assert_eq!(记录[0].event, EventKind::MountCheck);
+    assert_eq!(记录[1].event, EventKind::Error);
+    assert_eq!(
+        记录[1].field("code"),
+        Some(&FieldValue::from("mount.absent".to_string()))
+    );
+    assert_eq!(
+        记录[1].field("class"),
+        Some(&FieldValue::from(ErrorClass::NeedsHuman))
+    );
+}
+
+#[test]
+fn format_json_损坏时额外发一条_error_事件_code_为_format_malformed() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".arca")).unwrap();
+    fs::write(dir.path().join(".arca/format.json"), "{ 这不是 JSON").unwrap();
+    let mut sink = VecSink::new();
+    let _ = StorageRoot::open_traced(dir.path(), Some(样例_ID), 0, &mut sink);
+
+    let 记录 = sink.records();
+    assert_eq!(记录.len(), 2);
+    assert_eq!(记录[1].event, EventKind::Error);
+    assert_eq!(
+        记录[1].field("code"),
+        Some(&FieldValue::from("format.malformed".to_string()))
+    );
+    assert_eq!(
+        记录[1].field("class"),
+        Some(&FieldValue::from(ErrorClass::NeedsHuman))
+    );
+}
+
+#[test]
+fn io_错误时额外发一条_error_事件_code_为_mount_io_error_而不是_absent或malformed() {
+    // 「.arca 是文件而非目录」触发 ENOTDIR，落在 Io，不是 NotFound（Absent）
+    // ——这正是 root.rs 模块文档里点名的场景，用它来构造真正的 Io 分支，
+    // 不需要 root 权限或特殊挂载点。
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join(".arca"), "不是目录".as_bytes()).unwrap();
+    let mut sink = VecSink::new();
+    let 结果 = StorageRoot::open_traced(dir.path(), Some(样例_ID), 0, &mut sink);
+    assert!(
+        matches!(结果, Err(MountError::Io { .. })),
+        "必须落在 Io 分支，实得 {结果:?}"
+    );
+
+    let 记录 = sink.records();
+    assert_eq!(记录.len(), 2);
+    assert_eq!(记录[1].event, EventKind::Error);
+    assert_eq!(
+        记录[1].field("code"),
+        Some(&FieldValue::from("mount.io_error".to_string()))
+    );
+    assert_eq!(
+        记录[1].field("class"),
+        Some(&FieldValue::from(ErrorClass::NeedsHuman))
+    );
+}
+
+#[test]
+fn absent_io_malformed_三条失败路径的_error_code_互不相同() {
+    let 取_code = |sink: &VecSink| -> String {
+        match sink.records()[1].field("code") {
+            Some(FieldValue::Str(s)) => s.to_string(),
+            other => panic!("error 事件应带字符串 code 字段，实得 {other:?}"),
+        }
+    };
+
+    let absent_code = {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = VecSink::new();
+        let _ = StorageRoot::open_traced(&dir.path().join("从未挂载"), Some(样例_ID), 0, &mut sink);
+        取_code(&sink)
+    };
+    let io_code = {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".arca"), "不是目录".as_bytes()).unwrap();
+        let mut sink = VecSink::new();
+        let _ = StorageRoot::open_traced(dir.path(), Some(样例_ID), 0, &mut sink);
+        取_code(&sink)
+    };
+    let malformed_code = {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".arca")).unwrap();
+        fs::write(dir.path().join(".arca/format.json"), "{ 这不是 JSON").unwrap();
+        let mut sink = VecSink::new();
+        let _ = StorageRoot::open_traced(dir.path(), Some(样例_ID), 0, &mut sink);
+        取_code(&sink)
+    };
+
+    let codes: std::collections::HashSet<String> =
+        [absent_code, io_code, malformed_code].into_iter().collect();
+    assert_eq!(
+        codes.len(),
+        3,
+        "三条失败路径的 error code 必须互不相同，实得 {codes:?}"
+    );
+}
+
+#[test]
+fn bad_expected_id_也发_error_事件_class_为_bug() {
+    // 调用方参数错误，不是卷的问题——class 必须是 bug，不是 needs_human。
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), 样例_ID);
+    let mut sink = VecSink::new();
+    let _ = StorageRoot::open_traced(dir.path(), Some("大写不合法ID"), 0, &mut sink);
+
+    let 记录 = sink.records();
+    assert_eq!(记录.len(), 2);
+    assert_eq!(记录[1].event, EventKind::Error);
+    assert_eq!(
+        记录[1].field("code"),
+        Some(&FieldValue::from("mount.bad_expected_id".to_string()))
+    );
+    assert_eq!(
+        记录[1].field("class"),
+        Some(&FieldValue::from(ErrorClass::Bug))
+    );
+}
+
+#[test]
+fn identity_mismatch_也发_error_事件_code_为_mount_identity_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), "1111111111111111111111111111aaaa");
+    let mut sink = VecSink::new();
+    let _ = StorageRoot::open_traced(dir.path(), Some(样例_ID), 0, &mut sink);
+
+    let 记录 = sink.records();
+    assert_eq!(记录.len(), 2);
+    assert_eq!(记录[1].event, EventKind::Error);
+    assert_eq!(
+        记录[1].field("code"),
+        Some(&FieldValue::from("mount.identity_mismatch".to_string()))
+    );
+    assert_eq!(
+        记录[1].field("class"),
+        Some(&FieldValue::from(ErrorClass::NeedsHuman))
     );
 }
 

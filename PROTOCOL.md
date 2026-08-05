@@ -98,6 +98,8 @@
 | --- | --- | --- |
 | `mount.identity_mismatch` | `needs_human` | `format.json` 的 `dataset_id` 与绑定不符（I11） |
 | `mount.absent` | `needs_human` | 存储根未挂载——数据集离线，绝不呈现为空库（I11） |
+| `mount.io_error` | `needs_human` | 读取存储根身份标记时遇到非「不存在」的 IO 故障（权限、挂载点损坏等）；NFS 抖动一类值得重试的场景属于上层策略，不在这里判定为 `retryable` |
+| `mount.bad_expected_id` | `bug` | 调用方传入的期望 `dataset_id` 不是合法的 32 位小写十六进制——调用方参数错误，不是卷的问题 |
 | `path.rejected` | `needs_human` | 路径不合规，细类见 `FORMAT.md` §2 |
 | `format.unsupported_version` | `needs_human` | 格式版本高于本实现（`FORMAT.md` §0） |
 | `format.malformed` | `needs_human` | 结构损坏，绝不尽力解析（I5） |
