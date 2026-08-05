@@ -135,11 +135,26 @@ fn is_reserved(segment: &str) -> bool {
     WINDOWS_RESERVED.contains(&base.as_str())
 }
 
-/// 索引键：小写规范化路径的 BLAKE3。
-/// 大小写不同但小写后相同的路径会得到同一个键——调用方据此检出冲突并拒绝，
+/// index key 的大小写折叠规则：**仅 ASCII** 小写化（FORMAT.md §2）。
+///
+/// 刻意不用 `str::to_lowercase()`（Unicode 默认大小写转换）：其映射表随 Unicode
+/// 版本演进，两个不同时期构建的 arca 二进制会对同一个含罕见字符的路径算出不同的
+/// index key，产生同一文件的两条索引记录——而"大小写冲突拒绝、绝不静默合并"这条
+/// 规则恰恰因为两者根本不碰撞而静默失效（评审 Important #10）。ASCII-only 与
+/// FORMAT.md §2 已声明的"不做 NFC/NFD 转换"是同一立场：v1 路径按字节原样比较，
+/// 只在最省事、最不可能随工具链漂移的 ASCII 范围内做大小写折叠。
+///
+/// 供需要做前缀/嵌套比较（而不只是相等性判断）的调用方复用——BLAKE3 摘要本身
+/// 不可逆，无法从 [`index_key`] 的输出反推出可比较前缀的字符串。
+pub fn casefold(raw: &str) -> String {
+    normalize(raw).to_ascii_lowercase()
+}
+
+/// 索引键：ASCII 小写折叠后的规范化路径的 BLAKE3（见 [`casefold`]）。
+/// 大小写不同但折叠后相同的路径会得到同一个键——调用方据此检出冲突并拒绝，
 /// 绝不静默合并（继承 lazync STORAGE.md §File Identity Index）。
 pub fn index_key(raw: &str) -> ContentHash {
-    ContentHash::from_bytes(normalize(raw).to_lowercase().as_bytes())
+    ContentHash::from_bytes(casefold(raw).as_bytes())
 }
 
 #[cfg(test)]
@@ -215,6 +230,17 @@ mod tests {
         assert_eq!(index_key("A/B.png"), index_key("a/b.png"));
         assert_ne!(index_key("a/b.png"), index_key("a/c.png"));
         assert_eq!(check("A/B.png").unwrap(), "A/B.png");
+    }
+
+    #[test]
+    fn 索引键仅做_ascii_小写折叠不随_unicode_大小写表变化() {
+        // 评审 Important #10：西里尔字母 "А"（U+0410，大写）与 "а"（U+0430，小写）
+        // 在 Unicode 默认大小写折叠下相等，但都不是 ASCII 字符——ASCII-only 折叠下
+        // 二者必须是不同的 index key，否则就是在用会随 Unicode 版本演进的映射表
+        // 决定磁盘文件名。
+        assert_ne!(index_key("А.png"), index_key("а.png"));
+        // ASCII 范围内的大小写折叠仍然正常工作。
+        assert_eq!(casefold("A/B.png"), casefold("a/b.png"));
     }
 
     use proptest::prelude::*;
