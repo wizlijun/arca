@@ -68,6 +68,29 @@ fn 自动创建目标的父目录() {
 }
 
 #[test]
+fn 多层新建目录写入后整条目录链都存在() {
+    // create_dir_all 可能一次性新建好几层（评审 Important #2）：只 fsync
+    // 最深一层不够，`files` 下指向 `一/二/三` 各层的目录项也必须落盘，
+    // 否则崩溃后可能出现「write() 报告成功，但中间某层目录其实不存在，
+    // 文件不可达」。这里测的是功能性完整（目录结构齐全），fsync 是否真
+    // 落盘无法在单元测试里直接观测，但结构完整是它的前提。
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path());
+    let root = StorageRoot::open(dir.path(), None).unwrap();
+
+    let 内容 = "深层内容".as_bytes();
+    atomic::write(&root, "files/一/二/三/四.txt", 内容).unwrap();
+
+    assert!(dir.path().join("files/一").is_dir());
+    assert!(dir.path().join("files/一/二").is_dir());
+    assert!(dir.path().join("files/一/二/三").is_dir());
+    assert_eq!(
+        fs::read(dir.path().join("files/一/二/三/四.txt")).unwrap(),
+        内容
+    );
+}
+
+#[test]
 fn 空内容也能写() {
     let dir = tempfile::tempdir().unwrap();
     造存储根(dir.path());
@@ -155,6 +178,42 @@ fn tmp_下出现符号链接时拒绝() {
     assert_eq!(报告.removed, 0);
     assert_eq!(报告.refused.len(), 1);
     assert!(目标.exists(), "符号链接指向的文件必须完好");
+}
+
+#[cfg(unix)]
+#[test]
+fn tmp_本身是符号链接时拒绝清理而不是跟随链接删除别处的文件() {
+    // I3 与 I5 的交叉：`.arca/tmp` 若被换成指向别的真实数据目录的符号
+    // 链接（管理员用 ln -s 把 tmp 挪到别的卷、或同步工具带进来的链接），
+    // `read_dir` 会跟随链接——条目级别再严格的 symlink_metadata 判断也
+    // 救不回一个整体建在别处的目录。必须整体拒绝，绝不删除任何东西。
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path());
+    fs::remove_dir(dir.path().join(".arca/tmp")).unwrap();
+
+    let 别处 = tempfile::tempdir().unwrap();
+    fs::write(
+        别处.path().join("重要数据.txt"),
+        "绝不能被当成孤儿临时文件删掉".as_bytes(),
+    )
+    .unwrap();
+    fs::write(别处.path().join("另一份数据.bin"), "也不能被删".as_bytes()).unwrap();
+    std::os::unix::fs::symlink(别处.path(), dir.path().join(".arca/tmp")).unwrap();
+
+    let root = StorageRoot::open(dir.path(), None).unwrap();
+    let 结果 = atomic::sweep_tmp(&root);
+    assert!(
+        结果.is_err(),
+        "tmp 本身是符号链接时必须拒绝并停下，不能跟随链接清理，实得 {结果:?}"
+    );
+    assert!(
+        别处.path().join("重要数据.txt").exists(),
+        "链接目标目录里的文件必须完好"
+    );
+    assert!(
+        别处.path().join("另一份数据.bin").exists(),
+        "链接目标目录里的文件必须完好"
+    );
 }
 
 #[test]

@@ -12,7 +12,7 @@ use crate::root::{RootEscape, StorageRoot};
 use arca_format::hub_layout::layout;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::Path;
@@ -35,6 +35,29 @@ pub enum AtomicError {
     /// 配置错误，不是可重试的 IO 抖动，需要人工介入修正挂载布局
     /// （needs_human），不应自动重试。
     CrossDevice { tmp: String, target: String },
+    /// `rename` **已经成功**——目标路径已经是这次写入的新内容——但随后确认
+    /// 落盘的 fsync（目标所在目录及其祖先，见 `sync_dir_chain_to_root`）失败。
+    ///
+    /// 与 [`AtomicError::Io`] 是完全不同性质的状态，绝不能塞进同一个变体：
+    /// `Io` 意味着目标完全没动（例如 `write_all` 阶段磁盘满，tmp 文件都没写完）；
+    /// 这个变体意味着目标**已经**是新内容，只是「这次替换已经发生」这件事本身
+    /// 是否已经落盘还不确定——崩溃后最坏情况是目录项回退到 rename 之前的状态，
+    /// 新内容变得暂时不可达，但绝不会出现半截内容（本模块的头号承诺仍成立）。
+    ///
+    /// **调用方不应该重试整个 `atomic::write`**：重试会把内容再写一遍、再
+    /// `rename` 一遍，重复了已经成功的工作，而新内容其实已经在目标位置；
+    /// 真正需要重试的只是「确认这次提交已经落盘」这一步（重新 fsync 目标
+    /// 所在的目录链），不是从头开始的写入。M1b 的调和状态机与 M1d 的提交
+    /// 路径靠这个变体区分「该重试 fsync／该回滚／该写 journal」——嗅探
+    /// `path` 字段猜测状态是本代码库明确反对的做法。
+    CommittedUnsynced { target: String, reason: String },
+    /// `.arca/tmp` 本身不是一个真实目录（是符号链接，或路径类型不对，如
+    /// 被换成了普通文件）——`sweep_tmp` 的整套安全性都建立在「`tmp_dir`
+    /// 本身是真实目录」这个前提上：`fs::read_dir` 会跟随符号链接，若
+    /// `tmp_dir` 是指向别处的链接，条目级别再严格的 `symlink_metadata`
+    /// 判类型也没用，删的其实是链接目标目录里的文件——那可能是任何数据。
+    /// 前提不成立时必须停下诊断（I5），绝不做任何删除（I3）。
+    UnexpectedTmpState { path: String, reason: &'static str },
 }
 
 impl fmt::Display for AtomicError {
@@ -47,6 +70,16 @@ impl fmt::Display for AtomicError {
                 "临时文件 {tmp} 与目标 {target} 不在同一文件系统，rename 不是原子的——\
                  这是存储根的配置错误（违反 FORMAT.md §4），需要人工修正挂载布局，不应重试"
             ),
+            AtomicError::CommittedUnsynced { target, reason } => write!(
+                f,
+                "{target} 已经写入并 rename 成功，但确认落盘的 fsync 失败：{reason}——\
+                 目标路径已经是新内容，不应重试整个写入，只需重试落盘确认这一步"
+            ),
+            AtomicError::UnexpectedTmpState { path, reason } => write!(
+                f,
+                "{path} 不是真实目录（{reason}），拒绝清理——\
+                 read_dir 会跟随符号链接，继续下去可能删掉的是链接目标目录里的数据"
+            ),
         }
     }
 }
@@ -55,7 +88,10 @@ impl std::error::Error for AtomicError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             AtomicError::InvalidPath(e) => Some(e),
-            AtomicError::Io { .. } | AtomicError::CrossDevice { .. } => None,
+            AtomicError::Io { .. }
+            | AtomicError::CrossDevice { .. }
+            | AtomicError::CommittedUnsynced { .. }
+            | AtomicError::UnexpectedTmpState { .. } => None,
         }
     }
 }
@@ -102,14 +138,39 @@ fn tmp_file_name(relative_target: &str) -> String {
 }
 
 /// 把 `bytes` 写进 `tmp_path` 并 fsync 文件本身（约束 2 的前两步）。
+///
+/// 用 `OpenOptions::create_new(true)` 而不是 `File::create`：后者会跟随
+/// 符号链接、并静默截断任何已存在的同名文件——`tmp_file_name` 里的 pid
+/// 段在操作系统回收 pid 后可能与更早一次崩溃残留的文件重名，`File::create`
+/// 会悄悄覆盖掉那次残留（可能还没被 `sweep_tmp` 处理），`create_new` 遇到
+/// 同名文件则诚实地报 `EEXIST`，绝不跟随链接、绝不静默覆盖。
+///
+/// 命中 `EEXIST`（或任何 `open` 失败）时**不清理** `tmp_path`：这种情况下
+/// 我们从未创建过它，它要么是别的调用正在使用的文件、要么是尚待人工/
+/// `sweep_tmp` 处理的残留，删掉它不属于「本次调用清理自己创建的临时文件」
+/// （见 [`cleanup_tmp`] 的注释），只有在我们确实创建成功、随后写入/同步
+/// 失败时才需要清理。
 fn write_and_sync(tmp_path: &Path, bytes: &[u8]) -> Result<(), AtomicError> {
-    let mut file = File::create(tmp_path).map_err(|e| io_error(tmp_path, &e))?;
-    file.write_all(bytes).map_err(|e| io_error(tmp_path, &e))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp_path)
+        .map_err(|e| io_error(tmp_path, &e))?;
+
+    if let Err(e) = file.write_all(bytes) {
+        drop(file);
+        cleanup_tmp(tmp_path);
+        return Err(io_error(tmp_path, &e));
+    }
     // fsync：把内容从页缓存刷到磁盘介质。没有这一步，接下来的 rename 只是
     // 让目录项指向这个 inode，inode 里的数据仍可能只停留在缓存中——崩溃后
     // 目标文件存在、大小可能都对，内容却不完整（半截），正是本模块要杜绝
     // 的失败形态。
-    file.sync_all().map_err(|e| io_error(tmp_path, &e))?;
+    if let Err(e) = file.sync_all() {
+        drop(file);
+        cleanup_tmp(tmp_path);
+        return Err(io_error(tmp_path, &e));
+    }
     // 显式关闭文件句柄再返回：rename 前不留着打开的句柄，是跨平台的稳妥
     // 做法（Windows 下尤其要求源文件已关闭；虽然目前只在 Unix 上跑，提前
     // 关闭没有坏处，见 sync_dir 处关于 Windows 的说明）。
@@ -139,12 +200,17 @@ fn cleanup_tmp(tmp_path: &Path) {
 /// 3. `fs::rename` 把临时文件换到目标路径——同一文件系统内单个目录项的
 ///    替换是原子的，这一步之前无论进行到哪里崩溃，目标路径看到的都还是
 ///    旧内容（或压根不存在）；
-/// 4. fsync 目标所在的父目录——`rename` 只保证目录项在页缓存里立刻可见，
+/// 4. fsync 目标所在的父目录、以及 `create_dir_all` 可能新建的每一层祖先
+///    目录，一路向上到存储根——`rename` 只保证目录项在页缓存里立刻可见，
 ///    目录项本身何时落盘是另一回事：崩溃可能让这次目录项变化「消失」，
 ///    回退到 rename 之前的状态（这是 Unix 文件系统的已知行为，也是本函数
-///    要覆盖的最后一段崩溃窗口）。不做这一步，写入在「rename 已完成、
-///    宿主机没崩」的世界里看起来完全正确，只有真的断电才会暴露漏洞——
-///    这正是本模块存在的意义。
+///    要覆盖的最后一段崩溃窗口）。同一条论证对 `create_dir_all` 新建的
+///    上层目录同样成立——`files/京都/鸭川.png` 若是 `京都` 这一层第一次
+///    出现，`files` 目录里指向 `京都` 的那条目录项也可能只停留在缓存里；
+///    只 fsync 最深一层（`京都`）不够，`files` 不 fsync，`京都` 存在这件事
+///    本身在崩溃后可能消失，`write()` 报告已提交的文件反而不可达。不做
+///    这一步，写入在「rename/mkdir 已完成、宿主机没崩」的世界里看起来
+///    完全正确，只有真的断电才会暴露漏洞——这正是本模块存在的意义。
 ///
 /// 临时文件必须与目标同一文件系统（因此建在 `<root>/.arca/tmp/` 而不是
 /// `std::env::temp_dir()`），否则第 3 步的 `rename` 会退化成「跨设备复制 +
@@ -170,10 +236,11 @@ pub fn write(root: &StorageRoot, relative_target: &str, bytes: &[u8]) -> Result<
     let tmp_dir = root.path().join(layout::TMP_DIR);
     let tmp_path = tmp_dir.join(tmp_file_name(relative_target));
 
-    if let Err(e) = write_and_sync(&tmp_path, bytes) {
-        cleanup_tmp(&tmp_path);
-        return Err(e);
-    }
+    // `write_and_sync` 自己负责清理它自己创建成功的临时文件；命中
+    // `create_new` 的 `EEXIST` 时它不会创建任何东西，也不会清理——那种
+    // 情况下 tmp_path 不是我们的文件，删它就不再是「只删自己创建的孤儿
+    // 文件」（I3）。
+    write_and_sync(&tmp_path, bytes)?;
 
     if let Err(e) = fs::rename(&tmp_path, &target) {
         let mapped = if e.kind() == io::ErrorKind::CrossesDevices {
@@ -193,8 +260,39 @@ pub fn write(root: &StorageRoot, relative_target: &str, bytes: &[u8]) -> Result<
 
     // rename 成功：tmp_path 这个名字已经不存在了（它被换成了目标名），
     // 没有自己的临时文件需要清理。剩下要做的是让「这次 rename 发生过」
-    // 这件事本身落盘——即约束 2 的第四步。
-    sync_dir(target_parent)
+    // 以及「create_dir_all 新建的每一层目录都存在」这两件事本身落盘——
+    // 即约束 2 的第四步。从这里往后任何失败都意味着目标已经是新内容、
+    // 只是持久性未确认，必须报 `CommittedUnsynced` 而不是普通 `Io`——
+    // 调用方绝不能因此重试整个写入（见该变体的文档）。
+    sync_dir_chain_to_root(root.path(), target_parent).map_err(|e| AtomicError::CommittedUnsynced {
+        target: target.display().to_string(),
+        reason: e.to_string(),
+    })
+}
+
+/// fsync `from` 及其在 `root` 内的每一层祖先目录，一路向上到 `root` 本身
+/// （含 `root`）。
+///
+/// 不去精确记录 `create_dir_all` 到底新建了哪几层——那需要在调用前后各扫
+/// 一遍目录树才能确定，多出的复杂度不值得：`relative_target` 的路径深度
+/// 通常只有几层，逐层向上 fsync 到 `root` 顶多多付出几次系统调用，但绝不
+/// 会漏掉真正新建的那一层。`root` 本身早已存在（`StorageRoot::open` 已经
+/// 验证过），fsync 它是多余但无害的一次调用。
+fn sync_dir_chain_to_root(root: &Path, from: &Path) -> Result<(), AtomicError> {
+    let mut current = from;
+    loop {
+        sync_dir(current)?;
+        if current == root {
+            return Ok(());
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            // 理论上不会发生：`from` 由 `root.join(..)` 派生而来，沿着
+            // `parent()` 向上走必然先遇到 `root` 才会耗尽路径分量。防御性
+            // 兜底而不是 panic（I5）。
+            None => return Ok(()),
+        }
+    }
 }
 
 /// fsync 一个目录，让目录项的变化（如本模块里的 `rename`）本身落盘。
@@ -241,9 +339,36 @@ pub struct SweepReport {
 ///
 /// `tmp/` 目录本身不存在时视为无操作（不是错误）：还没写过任何东西的
 /// 全新存储根，或调用方尚未完成挂载流程创建它，都不构成需要清理的状态。
+///
+/// `tmp_dir` **本身**先经 [`fs::symlink_metadata`] 校验是真实目录才会
+/// `read_dir`——`read_dir` 会跟随符号链接，条目级别再严格的类型判断也救
+/// 不回一个整体就建在别处的目录：`<root>/.arca/tmp` 若被换成指向别的真实
+/// 数据目录的符号链接（管理员用 `ln -s` 把 tmp 挪到别的卷、或 rsync/网盘
+/// 同步带进来的符号链接），链接目标目录里的每个普通文件都会被当成孤儿
+/// 临时文件删掉——那正是本函数存在的意义要防止的事（I3）。这是「状态超出
+/// 预期」，按 I5 直接停下报告 [`AtomicError::UnexpectedTmpState`]，不做任何
+/// 删除，也不静默降级成「本次没什么可清理的」。
 pub fn sweep_tmp(root: &StorageRoot) -> Result<SweepReport, AtomicError> {
     let tmp_dir = root.path().join(layout::TMP_DIR);
     let mut report = SweepReport::default();
+
+    let tmp_meta = match fs::symlink_metadata(&tmp_dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(report),
+        Err(e) => return Err(io_error(&tmp_dir, &e)),
+    };
+    if tmp_meta.is_symlink() {
+        return Err(AtomicError::UnexpectedTmpState {
+            path: tmp_dir.display().to_string(),
+            reason: "是符号链接而不是真实目录",
+        });
+    }
+    if !tmp_meta.is_dir() {
+        return Err(AtomicError::UnexpectedTmpState {
+            path: tmp_dir.display().to_string(),
+            reason: "不是目录",
+        });
+    }
 
     let entries = match fs::read_dir(&tmp_dir) {
         Ok(entries) => entries,
@@ -267,4 +392,48 @@ pub fn sweep_tmp(root: &StorageRoot) -> Result<SweepReport, AtomicError> {
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 命中 `create_new` 的 `EEXIST` 时，`write_and_sync` 不清理已存在的
+    /// 文件——那不是本次调用创建的，可能是另一次写入正在使用的文件（评审
+    /// Important #6：pid 回收后重名，`File::create` 会静默截断它，
+    /// `create_new` 必须诚实报错且不动它分毫）。
+    #[test]
+    fn write_and_sync_遇到已存在文件时报错且既不覆盖也不删除它() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.tmp");
+        let 既有内容 = "别的调用正在使用的内容，不能被删或覆盖".as_bytes();
+        fs::write(&path, 既有内容).unwrap();
+
+        let err = write_and_sync(&path, b"new content").unwrap_err();
+        assert!(
+            matches!(err, AtomicError::Io { .. }),
+            "应报 Io（EEXIST），实得 {err:?}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            既有内容,
+            "既有文件必须原样保留：不覆盖、不删除"
+        );
+    }
+
+    /// `CommittedUnsynced` 的错误消息必须清楚说明「目标已经是新内容，
+    /// 不应重试整个写入」——调用方（M1b 调和状态机、M1d 提交路径）靠这条
+    /// 语义决定下一步，不能只靠类型名猜（评审 Important #4）。
+    #[test]
+    fn committed_unsynced_消息说明目标已提交且不应重试整个写入() {
+        let err = AtomicError::CommittedUnsynced {
+            target: "files/note.txt".to_string(),
+            reason: "模拟的 fsync 失败".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("已经写入并 rename 成功"));
+        assert!(msg.contains("不应重试整个写入"));
+        // 与 Io 是不同变体，调用方可以按类型区分，不必嗅探字符串。
+        assert!(!matches!(err, AtomicError::Io { .. }));
+    }
 }
