@@ -291,7 +291,8 @@ catalog 的格式由独立工具 `arca-catalog` 定义（spec §4.4）；`client
 
 ## 10. trace 事件格式
 
-诊断轨迹。设计论证见 `docs/superpowers/specs/2026-08-05-trace-design.md`；
+诊断轨迹。设计依据 spec §3.3（可诊断性），设计过程记录见
+`docs/superpowers/specs/2026-08-05-trace-design.md`；
 命名与结构对齐 git 的 `trace2`（`GIT_TRACE2_EVENT`）。
 
 **定位：trace 是可丢弃的诊断产物，不是真相。**真相在 journal（§7.2）与 `.txn`。

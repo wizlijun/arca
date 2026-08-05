@@ -37,7 +37,7 @@ MSRV 1.85，edition 2021。`arca-macfs` 是 Swift 工程，不在 cargo workspac
 
 ## 唯一真相源：spec
 
-`docs/2026-08-03-arca-spec.md`（v1.1 定稿，中文）是本项目的设计规格。
+`docs/2026-08-03-arca-spec.md`（v1.2 定稿，中文）是本项目的设计规格。
 **每个模块的 doc comment 都标注了它对应的 spec 章节号**——动任何模块前先读该章节。
 本仓库的文档与注释以中文书写，保持一致。
 

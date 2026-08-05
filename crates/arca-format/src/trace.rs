@@ -1,7 +1,8 @@
-//! trace 事件格式（FORMAT.md §10）：诊断轨迹的 schema 与 sink 抽象。
+//! trace 事件格式：诊断轨迹的 schema 与 sink 抽象。
 //!
-//! 命名与结构对齐 git 的 `trace2`（`GIT_TRACE2_EVENT`）。设计论证见
-//! `docs/superpowers/specs/2026-08-05-trace-design.md`。
+//! 设计依据 spec §3.3（可诊断性），字节契约 FORMAT.md §10，
+//! 命令与错误码契约 PROTOCOL.md §5.1/§7。
+//! 命名与结构对齐 git 的 `trace2`（`GIT_TRACE2_EVENT`）。
 //!
 //! **trace 是可丢弃的诊断产物，不是真相**——真相在 journal（§7.2）与 `.txn`。
 //! 由此推出本模块两条与其余格式相反的纪律：
