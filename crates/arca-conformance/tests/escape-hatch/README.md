@@ -7,10 +7,12 @@ I1「逃生舱」的承诺：hub 上的库是一棵普通文件树（`files/`）
 
 ## 文件
 
-- `recover.sh <dataset_root> <dest>` —— 恢复演示本体：把 `files/` 整体拷到 `dest`，
-  再用 `.arca/items/` 里每个 item 的**当前版本**记录逐个校验大小与 BLAKE3 哈希，
-  路径从 `.arca/index/` 反查（items 记录里只有 `item_id`，没有路径）。
-  任何不一致都打印到 stderr 并以非零退出码结束；成功时打印一行统计到 stdout。
+- `recover.sh <dataset_root> <dest>` —— 恢复演示本体：先校验 `.arca/format.json`
+  存在且带合法 `dataset_id`（卷身份标记，见下方「卷身份校验」一节），再把 `files/`
+  整体拷到 `dest`，然后用 `.arca/items/` 里每个 item 的**当前版本**记录逐个校验
+  大小与 BLAKE3 哈希，路径从 `.arca/index/` 反查（items 记录里只有 `item_id`，
+  没有路径）。任何不一致都打印到 stderr 并以非零退出码结束；成功时打印一行统计
+  到 stdout。
 - `make-fixture.sh <dest>` —— 造一个最小但合法的存储根：一个文件 + `format.json` +
   一条 items 记录 + 一条 index 记录，布局与字段取值与
   `crates/arca-store/tests/fsck.rs` 里的 `造一个健康的存储根` 同构，便于交叉核对
@@ -59,6 +61,17 @@ crates/arca-conformance/tests/escape-hatch/recover.sh /tmp/arca-fixture /tmp/arc
 # 预期：退出码非 0，stderr 打印「问题: 哈希不符: note.txt」或「大小不符」
 ```
 
+再跑一遍「只有一个空 `files/` 目录」——这不是篡改，是完全没有 `.arca/` 元数据的目录，
+必须被当成"身份不明"而非"空库"拒绝（I11，评审 Important #1）：
+
+```bash
+mkdir -p /tmp/arca-empty/files
+crates/arca-conformance/tests/escape-hatch/recover.sh /tmp/arca-empty /tmp/arca-recovered3
+# 预期：退出码 2，stderr 打印「缺少 …/.arca/format.json——存储根身份不明」
+# 反例：如果这里退出码是 0（"恢复并校验 0 个文件，0 个问题"），说明卷身份校验
+# 被绕过了——一个永远成功的校验脚本比没有脚本更糟。
+```
+
 ## items 版本链的损坏处置（为什么不只是 `grep '^{'`）
 
 `items/<xx>/<item_id>.jsonl` 是 append-only 的版本链（`FORMAT.md` §7.1），
@@ -105,6 +118,28 @@ crates/arca-conformance/tests/escape-hatch/recover.sh /tmp/arca-fixture /tmp/arc
 （`find "$root/files" -type f | wc -l`），与本次遍历到的 items 版本链数
 （`found_items`，循环每迭代一次就计数，不论该条记录最终校验成功与否）比对，
 不相等就报出差额并计入问题数，最终以非零退出码结束。
+
+**这条交叉检查本身有一个洞**：当 `files/` 与 `.arca/items/` 都为空（或
+`.arca/items/` 整个缺失）时，`total_files` 与 `found_items` 都是 0，
+「0 == 0」照样通过，同一句「恢复并校验 0 个文件，0 个问题」照样以退出码 0
+收场——这不是臆造场景：NAS 导出的挂载点下面恰好有个本地建的 `files/` 桩目录、
+autofs/NFS 掉线导致挂载点看起来是个空目录、或者路径打错但恰好命中一个含
+`files/` 的目录，都会命中这条路径。跑恢复的人看到「0 问题、退出 0」会认为
+恢复成功、库本来就是空的——这正是 I11 (`挂载缺失即离线`) 存在的理由。
+
+## 卷身份校验（为什么在最开始就要读 `format.json`）
+
+`format.json` 是唯一告诉我们「这是一个真实的 arca 存储根」而不是「一个碰巧存在
+的 `files/` 目录」的文件（FORMAT.md §5，I11）——`dataset_id` 是它存在的唯一理由。
+所以 `recover.sh` 现在在做任何事之前（甚至在第一步的 `cp -R` 之前）先确认：
+
+1. `$root/.arca/format.json` 存在；
+2. 其中含有形如 `"dataset_id":"<32 位小写十六进制>"` 的字段。
+
+任一条不满足都以退出码 2 拒绝，绝不继续往下走去猜「是不是本来就是空的」（I5）。
+这条检查补上了上面那条覆盖度交叉检查的洞：「只有一个空 `files/` 目录、没有
+`.arca/` 元数据」的存储根现在会在第一步就被拒绝，而不是走到主循环、觉得
+「没什么可查」然后报告成功。
 
 ## 在 CI 中调用
 

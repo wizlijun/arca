@@ -73,6 +73,20 @@ jobs:
             echo "篡改未被检出——逃生舱校验失效" >&2
             exit 1
           fi
+      - name: 断言只有空_files_目录会被拒绝而不是当成空库
+        # 评审 Important #1：此前脚本唯一的结构性检查是 `test -d files`、唯一的
+        # 覆盖度检查是 found_items != total_files——当 files/ 存在但为空、
+        # .arca/items/ 也为空或缺失时，两个计数都是 0，脚本会打印
+        # 「恢复并校验 0 个文件，0 个问题」并以退出码 0 收场，把「未挂载/身份
+        # 不明的卷」误判成「本来就是空库」（违反 I11）。现在 recover.sh 在开头
+        # 先校验 .arca/format.json 的存在与合法 dataset_id，这个场景必须以
+        # 非零退出，且不能被误判为"没有文件可查所以自然零问题"。
+        run: |
+          mkdir -p "$RUNNER_TEMP/arca-empty-root/files"
+          if crates/arca-conformance/tests/escape-hatch/recover.sh "$RUNNER_TEMP/arca-empty-root" "$RUNNER_TEMP/arca-recovered3"; then
+            echo "只有空 files/ 目录（无 .arca/ 元数据）未被拒绝——I11 校验失效" >&2
+            exit 1
+          fi
 
   fuzz:
     name: fuzz 回归（含 ASAN，每晚）／${{ matrix.target }}
