@@ -34,7 +34,16 @@ fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Fsck { root } => {
-            let report = arca_store::fsck::check_root(&root);
+            // 挂载失败（根不存在、身份读不出来等）与「巡检发现问题」是两种
+            // 不同性质的结果：前者连身份都不明，退出码 2；与逃生舱脚本的
+            // 约定一致（2 = 身份不明，1 = 有问题，0 = 干净）。
+            let report = match arca_store::fsck::check_path(&root) {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return std::process::ExitCode::from(2);
+                }
+            };
             // Rule of Silence（spec §3.2）：成功时安静，退出码 0 本身就是答案。
             // 摘要行是诊断，不是可脚本消费的数据，连同逐条问题一起走 stderr；
             // 干净时完全不打印任何东西。

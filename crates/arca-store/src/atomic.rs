@@ -218,3 +218,53 @@ pub fn sync_dir(dir: &Path) -> Result<(), AtomicError> {
 pub fn sync_dir(_dir: &Path) -> Result<(), AtomicError> {
     Ok(())
 }
+
+/// 清理 `.arca/tmp/` 下的崩溃残留报告。
+///
+/// `removed` 是被删掉的孤儿普通文件数；`refused` 逐条记录本次拒绝处理的
+/// 条目（相对路径），说明「为什么不删」——不是静默跳过。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    pub removed: usize,
+    pub refused: Vec<String>,
+}
+
+/// 清理 `root` 的 `.arca/tmp/` 目录：删掉里面的孤儿**普通文件**，
+/// 符号链接与目录一律拒绝并记入 `refused`，绝不递归删除（I3 与 I5 的交叉，
+/// 见本模块顶部注释与 `STORAGE.md` §Move And Delete Recovery）。
+///
+/// 判断条目类型必须用 [`fs::symlink_metadata`] 而不是 [`fs::metadata`]：
+/// 后者会跟随符号链接，于是一个指向目录的链接会被误判成目录（本该拒绝却
+/// 走了别的分支），一个指向普通文件的链接会被误判成普通文件从而被
+/// `remove_file` 删掉——那正是「顺着链接删」，可能删掉的是用户的真实数据，
+/// 是本函数存在的意义要防止的事。
+///
+/// `tmp/` 目录本身不存在时视为无操作（不是错误）：还没写过任何东西的
+/// 全新存储根，或调用方尚未完成挂载流程创建它，都不构成需要清理的状态。
+pub fn sweep_tmp(root: &StorageRoot) -> Result<SweepReport, AtomicError> {
+    let tmp_dir = root.path().join(layout::TMP_DIR);
+    let mut report = SweepReport::default();
+
+    let entries = match fs::read_dir(&tmp_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(report),
+        Err(e) => return Err(io_error(&tmp_dir, &e)),
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|e| io_error(&tmp_dir, &e))?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path).map_err(|e| io_error(&path, &e))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if meta.is_file() {
+            fs::remove_file(&path).map_err(|e| io_error(&path, &e))?;
+            report.removed += 1;
+        } else {
+            // 目录或符号链接：拒绝处理，绝不递归删除、绝不顺着链接删除。
+            report.refused.push(name);
+        }
+    }
+
+    Ok(report)
+}

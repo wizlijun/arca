@@ -6,8 +6,9 @@
 //! 消费者：`arca fsck`（CLI）与 M2 的 `arcad` / `arca gc`——
 //! gc 与 fsck 共享引用计数校验。
 
+use crate::root::{MountError, StorageRoot};
 use arca_chunk::hash::ContentHash;
-use arca_format::hub_layout::{layout, FormatJson};
+use arca_format::hub_layout::layout;
 use arca_format::items;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -17,10 +18,6 @@ use std::path::Path;
 /// 一条巡检发现的问题。变体覆盖 FORMAT.md §5–§8 定义的各类损坏形态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Problem {
-    /// `format.json` 缺失——存储根身份不明，见 [`check_root`] 顶部的立即返回。
-    MissingFormatJson,
-    /// `format.json` 存在但无法解析或版本不受支持。
-    BadFormatJson(String),
     /// 当前版本在 `files/` 下缺失（`ErrorKind::NotFound`）。
     MissingFile { path: String },
     /// `files/` 下的字节内容哈希与版本记录不一致。
@@ -64,29 +61,19 @@ pub struct FsckReport {
     pub checked_chunks: usize,
 }
 
-/// 巡检一个 hub 存储根的完整性。**只读**：不修改、不删除任何文件（I3）。
+/// 巡检一个已打开、身份已确认的存储根的完整性。**只读**：不修改、不删除
+/// 任何文件（I3）。
 ///
-/// `format.json` 缺失或不可解析时立即返回——存储根身份不明，绝不继续遍历
-/// items 去猜测里面有什么（I5：未挂载的卷绝不能被当成空库，I11）。
-pub fn check_root(root: &Path) -> FsckReport {
+/// 不做身份检查——调用方（[`check_path`]，或直接持有 `StorageRoot` 的
+/// 其它巡检入口）在拿到 `StorageRoot` 时已经做过（I11）。「这不是一个存储
+/// 根」与「这个存储根里有问题」是两种不同的答案：前者在 `StorageRoot::open`
+/// 阶段就已经是 `Err(MountError)`，不会走到这里；本函数只处理后者，把
+/// 「有问题」如实累积进 [`FsckReport`]，绝不提前返回、绝不猜测（I5）。
+pub fn check_root(root: &StorageRoot) -> FsckReport {
+    let root = root.path();
     let mut report = FsckReport::default();
 
-    // 1. format.json 必须存在且可解析——这是卷身份标记（I11）
-    let format_path = root.join(layout::FORMAT_JSON);
-    match fs::read_to_string(&format_path) {
-        Err(_) => {
-            report.problems.push(Problem::MissingFormatJson);
-            return report; // 身份不明 → 停下，不做任何进一步推断（I5）
-        }
-        Ok(text) => {
-            if let Err(e) = FormatJson::parse(&text) {
-                report.problems.push(Problem::BadFormatJson(e.to_string()));
-                return report;
-            }
-        }
-    }
-
-    // 2. 逐条 item：当前版本必须在 files/ 存在，且哈希与大小一致。
+    // 1. 逐条 item：当前版本必须在 files/ 存在，且哈希与大小一致。
     //    index/ 只需扫描一遍：build_index 把「记录存在但损坏」（CorruptIndex）
     //    与「压根没有这条记录」（OrphanIndex，在下面按 item_id 查 index_map 时判定）
     //    分开报告，不静默吞掉前者（评审 Important #4）。`corrupt_index_items` 记录
@@ -159,7 +146,7 @@ pub fn check_root(root: &Path) -> FsckReport {
         }
     }
 
-    // 3. 块存储：每个块解压后哈希必须与文件名一致。读不到（IO 错误）与读到了但
+    // 2. 块存储：每个块解压后哈希必须与文件名一致。读不到（IO 错误）与读到了但
     //    内容不对（解压失败/哈希不符）是两种不同性质的故障，分别报告（I5）。
     for shard in read_dir_sorted(&root.join(layout::CHUNKS_DIR)) {
         for chunk_file in read_dir_sorted(&shard) {
@@ -188,6 +175,18 @@ pub fn check_root(root: &Path) -> FsckReport {
     }
 
     report
+}
+
+/// `check_root` 的便捷壳：先打开并校验存储根身份，再巡检。CLI 与其它
+/// 只有路径、没有现成 `StorageRoot` 的调用方用这个。
+///
+/// 挂载失败（根不存在、身份读不出来等）作为 `Err(MountError)` 返回，不
+/// 伪装成一条 `Problem`——「这不是一个存储根」和「这个存储根里有问题」是
+/// 两种不同的答案（I11）。不传 `expected_dataset_id`：fsck 是只读巡检，不
+/// 预设期望的身份，能打开、身份标记能解析出来即可。
+pub fn check_path(root: &Path) -> Result<FsckReport, MountError> {
+    let opened = StorageRoot::open(root, None)?;
+    Ok(check_root(&opened))
 }
 
 /// 单次扫描 `index/` 目录，建立 `item_id → 路径` 映射。

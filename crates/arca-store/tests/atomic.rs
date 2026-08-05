@@ -97,9 +97,78 @@ fn 并发写同一路径最终得到其中一个完整版本() {
         }
     });
 
+    let 候选集: std::collections::HashSet<String> =
+        (0..8).map(|i| format!("版本-{i:03}")).collect();
     let 最终 = fs::read_to_string(dir.path().join("files/race.txt")).unwrap();
     assert!(
-        最终.starts_with("版本-") && 最终.len() == "版本-000".len(),
-        "必须是某一次写入的完整内容，实得 {最终:?}"
+        候选集.contains(&最终),
+        "必须恰好等于 8 个候选值之一，实得 {最终:?}"
     );
+}
+
+#[test]
+fn 清理孤儿临时文件() {
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path());
+    fs::write(dir.path().join(".arca/tmp/orphan-1"), b"crash residue").unwrap();
+    fs::write(dir.path().join(".arca/tmp/orphan-2"), b"more residue").unwrap();
+
+    let root = StorageRoot::open(dir.path(), None).unwrap();
+    let 报告 = atomic::sweep_tmp(&root).unwrap();
+    assert_eq!(报告.removed, 2);
+    assert!(报告.refused.is_empty());
+    assert_eq!(
+        fs::read_dir(dir.path().join(".arca/tmp")).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn tmp_下出现目录时拒绝而不是递归删除() {
+    // I5：不理解的状态要停下报告，不能变成「我删掉了不理解的东西」（I3）
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path());
+    fs::create_dir(dir.path().join(".arca/tmp/意外目录")).unwrap();
+    fs::write(dir.path().join(".arca/tmp/意外目录/内含文件"), b"x").unwrap();
+
+    let root = StorageRoot::open(dir.path(), None).unwrap();
+    let 报告 = atomic::sweep_tmp(&root).unwrap();
+    assert_eq!(报告.removed, 0);
+    assert_eq!(报告.refused.len(), 1, "应报告拒绝处理的条目");
+    assert!(
+        dir.path().join(".arca/tmp/意外目录/内含文件").exists(),
+        "绝不递归删除"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tmp_下出现符号链接时拒绝() {
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path());
+    let 目标 = dir.path().join("files/重要文件");
+    fs::write(&目标, "绝不能被顺着链接删掉".as_bytes()).unwrap();
+    std::os::unix::fs::symlink(&目标, dir.path().join(".arca/tmp/link")).unwrap();
+
+    let root = StorageRoot::open(dir.path(), None).unwrap();
+    let 报告 = atomic::sweep_tmp(&root).unwrap();
+    assert_eq!(报告.removed, 0);
+    assert_eq!(报告.refused.len(), 1);
+    assert!(目标.exists(), "符号链接指向的文件必须完好");
+}
+
+#[test]
+fn tmp_目录不存在时清理是无操作() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".arca")).unwrap();
+    fs::write(
+        dir.path().join(".arca/format.json"),
+        format!(
+            r#"{{"v":1,"format":1,"dataset_id":"{样例_ID}","hash_algo":"blake3","created_at":"2026-08-05T10:00:00Z"}}"#
+        ),
+    )
+    .unwrap();
+    let root = StorageRoot::open(dir.path(), None).unwrap();
+    let 报告 = atomic::sweep_tmp(&root).unwrap();
+    assert_eq!(报告.removed, 0);
 }

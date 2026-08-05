@@ -1,7 +1,8 @@
 //! fsck 巡检的集成测试。构造真实的存储根目录，注入损坏，断言可诊断。
 
 use arca_chunk::hash::ContentHash;
-use arca_store::fsck::{check_root, Problem};
+use arca_store::fsck::{check_path, Problem};
+use arca_store::root::MountError;
 use std::fs;
 use std::path::Path;
 
@@ -48,7 +49,7 @@ fn 造一个健康的存储根(root: &Path) -> ContentHash {
 fn 健康的存储根零问题() {
     let dir = tempfile::tempdir().unwrap();
     造一个健康的存储根(dir.path());
-    let report = check_root(dir.path());
+    let report = check_path(dir.path()).unwrap();
     assert!(
         report.problems.is_empty(),
         "不应有问题，实得 {:?}",
@@ -63,7 +64,7 @@ fn 检出内容被篡改() {
     造一个健康的存储根(dir.path());
     fs::write(dir.path().join("files/note.txt"), b"tampered!!").unwrap();
 
-    let report = check_root(dir.path());
+    let report = check_path(dir.path()).unwrap();
     assert!(
         report
             .problems
@@ -80,21 +81,23 @@ fn 检出当前版本文件缺失() {
     造一个健康的存储根(dir.path());
     fs::remove_file(dir.path().join("files/note.txt")).unwrap();
 
-    let report = check_root(dir.path());
+    let report = check_path(dir.path()).unwrap();
     assert!(report
         .problems
         .iter()
         .any(|p| matches!(p, Problem::MissingFile { .. })));
 }
 
+/// 「这不是一个存储根」与「这个存储根里有问题」是两种不同的答案：前者是
+/// `Err`，不应伪装成 `FsckReport` 里的一条 `Problem`（I11：未挂载的卷绝不能
+/// 被当成空库处理，见 `check_path` 与 `MountError::Absent` 的文档）。
 #[test]
-fn 缺少_format_json_时报告而不是崩溃() {
+fn 缺少_format_json_时挂载失败而不是报出问题() {
     let dir = tempfile::tempdir().unwrap();
-    let report = check_root(dir.path());
-    assert!(report
-        .problems
-        .iter()
-        .any(|p| matches!(p, Problem::MissingFormatJson)));
+    match check_path(dir.path()) {
+        Err(MountError::Absent { .. }) => {}
+        other => panic!("应返回 MountError::Absent，实得 {other:?}"),
+    }
 }
 
 /// 权限错误与「文件不存在」是不同性质的故障，不可折叠成同一个诊断（I5）。
@@ -119,7 +122,7 @@ fn 检出文件读取权限错误而不是缺失() {
         return;
     }
 
-    let report = check_root(dir.path());
+    let report = check_path(dir.path()).unwrap();
     // 恢复权限，否则 tempdir 在 Drop 时清理不掉这个文件。
     fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
 
@@ -169,7 +172,7 @@ fn 检出块文件权限错误而不是内容损坏() {
         return;
     }
 
-    let report = check_root(dir.path());
+    let report = check_path(dir.path()).unwrap();
     fs::set_permissions(&chunk_path, fs::Permissions::from_mode(0o644)).unwrap();
 
     assert!(
@@ -220,7 +223,7 @@ fn item自身的index记录路径不合规时报corrupt而不是orphan() {
     )
     .unwrap();
 
-    let report = check_root(dir.path());
+    let report = check_path(dir.path()).unwrap();
 
     assert!(
         report
@@ -253,7 +256,7 @@ fn index记录完全非json时item_id不可归因故corrupt与orphan并存() {
     let record = 唯一的index记录路径(dir.path());
     fs::write(&record, "不是合法的 json").unwrap();
 
-    let report = check_root(dir.path());
+    let report = check_path(dir.path()).unwrap();
 
     assert!(
         report
@@ -286,7 +289,7 @@ fn 无关的损坏index记录不影响其他item的正常校验() {
     fs::create_dir_all(&stray_shard).unwrap();
     fs::write(stray_shard.join("deadbeef.json"), "不是合法的 json").unwrap();
 
-    let report = check_root(dir.path());
+    let report = check_path(dir.path()).unwrap();
 
     assert!(
         report
@@ -316,7 +319,7 @@ fn fsck_绝不修改任何文件() {
     fs::write(dir.path().join("files/note.txt"), b"tampered!!").unwrap();
 
     let 前 = fs::read(dir.path().join("files/note.txt")).unwrap();
-    let _ = check_root(dir.path());
+    let _ = check_path(dir.path());
     let 后 = fs::read(dir.path().join("files/note.txt")).unwrap();
     assert_eq!(前, 后, "fsck 是只读诊断，绝无销毁权（I3）");
 }
