@@ -3,6 +3,7 @@
 //! 这些不是形式测试——把「根不存在」当成「库是空的」，同步引擎会认为远端删光了文件，
 //! 于是触发删除对账清掉用户本地数据。每一条都对应一种真实的挂载故障。
 
+use arca_format::trace::{EventKind, FieldValue, VecSink};
 use arca_store::root::{MountError, RootEscape, StorageRoot};
 use std::fs;
 use std::path::Path;
@@ -152,4 +153,76 @@ fn join_不误伤名字里含两个点但不是父引用的路径() {
     let root = StorageRoot::open(dir.path(), Some(样例_ID)).unwrap();
     let joined = root.join("a..b/文件").unwrap();
     assert_eq!(joined, dir.path().join("a..b/文件"));
+}
+
+#[test]
+fn 成功打开会发一条_mount_check_且_ok_为真() {
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), 样例_ID);
+    let mut sink = VecSink::new();
+    StorageRoot::open_traced(dir.path(), Some(样例_ID), 1_000, &mut sink).unwrap();
+
+    let 记录 = sink.records();
+    assert_eq!(记录.len(), 1, "应恰好发一条事件");
+    assert_eq!(记录[0].event, EventKind::MountCheck);
+    assert_eq!(记录[0].field("ok"), Some(&FieldValue::from(true)));
+    assert_eq!(
+        记录[0].field("found"),
+        Some(&FieldValue::from(样例_ID.to_string()))
+    );
+}
+
+#[test]
+fn 身份不符也会发_mount_check_且带上两侧的值() {
+    // 失败路径的 trace 比成功路径更重要——它是事故现场的线索
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), "1111111111111111111111111111aaaa");
+    let mut sink = VecSink::new();
+    let 结果 = StorageRoot::open_traced(dir.path(), Some(样例_ID), 2_000, &mut sink);
+    assert!(结果.is_err());
+
+    let 记录 = sink.records();
+    assert_eq!(记录[0].event, EventKind::MountCheck);
+    assert_eq!(记录[0].field("ok"), Some(&FieldValue::from(false)));
+    assert_eq!(
+        记录[0].field("expect"),
+        Some(&FieldValue::from(样例_ID.to_string()))
+    );
+    assert_eq!(
+        记录[0].field("found"),
+        Some(&FieldValue::from(
+            "1111111111111111111111111111aaaa".to_string()
+        ))
+    );
+}
+
+#[test]
+fn 根缺失时的_mount_check_的_found_为空() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut sink = VecSink::new();
+    let _ = StorageRoot::open_traced(
+        &dir.path().join("从未挂载"),
+        Some(样例_ID),
+        3_000,
+        &mut sink,
+    );
+
+    let 记录 = sink.records();
+    assert_eq!(记录[0].event, EventKind::MountCheck);
+    assert_eq!(记录[0].field("ok"), Some(&FieldValue::from(false)));
+    assert_eq!(
+        记录[0].field("found"),
+        Some(&FieldValue::from(String::new())),
+        "根缺失时 found 必须是空字符串，而不是省略该字段"
+    );
+}
+
+#[test]
+fn open_不发任何事件() {
+    // Rule of Silence 的对应物：不注入 sink 就不该有开销
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), 样例_ID);
+    let sink = VecSink::new();
+    StorageRoot::open(dir.path(), Some(样例_ID)).unwrap();
+    assert!(sink.records().is_empty());
 }
