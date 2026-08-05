@@ -105,7 +105,8 @@ impl StorageRoot {
     /// **只读**：无论成功失败都不创建任何文件或目录。
     ///
     /// 不发任何 trace 事件——是 [`Self::open_traced`] 注入 `t_abs_us = 0` 与
-    /// `NullSink` 的薄壳（Rule of Silence：不接 sink 就没有诊断开销）。
+    /// `NullSink` 的薄壳（Rule of Silence：`TraceRecord` 仍会照常构造，
+    /// 只是 `NullSink` 落地即丢，不落盘、不外泄）。
     pub fn open(root: &Path, expected_dataset_id: Option<&str>) -> Result<Self, MountError> {
         let mut sink = arca_format::trace::NullSink;
         Self::open_traced(root, expected_dataset_id, 0, &mut sink)

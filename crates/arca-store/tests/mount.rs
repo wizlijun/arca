@@ -3,7 +3,7 @@
 //! 这些不是形式测试——把「根不存在」当成「库是空的」，同步引擎会认为远端删光了文件，
 //! 于是触发删除对账清掉用户本地数据。每一条都对应一种真实的挂载故障。
 
-use arca_format::trace::{EventKind, FieldValue, VecSink};
+use arca_format::trace::{EventKind, FieldValue, NullSink, VecSink};
 use arca_store::root::{MountError, RootEscape, StorageRoot};
 use std::fs;
 use std::path::Path;
@@ -218,11 +218,62 @@ fn 根缺失时的_mount_check_的_found_为空() {
 }
 
 #[test]
-fn open_不发任何事件() {
-    // Rule of Silence 的对应物：不注入 sink 就不该有开销
+fn 不指定期望身份时_mount_check_不带_expect_字段() {
+    // 「缺失 ≠ 空值」的另一半：expected_dataset_id 为 None 时，expect
+    // 字段应整体不出现，而不是被写成空字符串——否则未来有人「顺手」把
+    // 省略改成 expect: ""，现有测试矩阵也不会报警。found 那一半已由
+    // `根缺失时的_mount_check_的_found_为空` 钉住。
     let dir = tempfile::tempdir().unwrap();
     造存储根(dir.path(), 样例_ID);
-    let sink = VecSink::new();
-    StorageRoot::open(dir.path(), Some(样例_ID)).unwrap();
-    assert!(sink.records().is_empty());
+    let mut sink = VecSink::new();
+    StorageRoot::open_traced(dir.path(), None, 4_000, &mut sink).unwrap();
+
+    let 记录 = sink.records();
+    assert_eq!(
+        记录[0].field("expect"),
+        None,
+        "没有期望时 expect 字段应整体缺失，而不是 Some(\"\")"
+    );
+}
+
+#[test]
+fn 身份不符时_dataset_id_取_expect_而不是_found() {
+    // dataset_id 是「这条事件关于哪个数据集」的关联键，取「调用方意图操作
+    // 的那个数据集」：expect 优先于 found（FORMAT.md §10.3）。身份不符时
+    // 磁盘上实际读到的 id 与调用方期望的 id 不同，这个选择会产生可观察的
+    // 字节差异，钉在这里防止实现漂移。
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), "1111111111111111111111111111aaaa");
+    let mut sink = VecSink::new();
+    let _ = StorageRoot::open_traced(dir.path(), Some(样例_ID), 5_000, &mut sink);
+
+    let 记录 = sink.records();
+    assert_eq!(
+        记录[0].field("dataset_id"),
+        Some(&FieldValue::from(样例_ID.to_string())),
+        "dataset_id 应取 expect（调用方意图操作的数据集），不是 found（磁盘上实际读到的）"
+    );
+}
+
+#[test]
+fn open_与_open_traced_搭_nullsink_对同一输入返回相同结果() {
+    // `open` 是不是真的等价于 `open_traced(.., 0, &mut NullSink)`，
+    // 只有拿两者的返回值逐一比对才算数——喂一个从未被 `open` 接触过的
+    // `VecSink` 断言它是空的，不管 `open` 内部做什么都恒真，测不出任何东西。
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path(), 样例_ID);
+
+    // 成功路径：两者对同一输入给出相同的 dataset_id。
+    let via_open = StorageRoot::open(dir.path(), Some(样例_ID)).unwrap();
+    let mut sink = NullSink;
+    let via_traced = StorageRoot::open_traced(dir.path(), Some(样例_ID), 0, &mut sink).unwrap();
+    assert_eq!(via_open.dataset_id(), via_traced.dataset_id());
+
+    // 失败路径：两者对同一输入报同一个错误变体（含字段值）。
+    let mismatched = "1111111111111111111111111111aaaa";
+    let err_open = StorageRoot::open(dir.path(), Some(mismatched)).unwrap_err();
+    let mut sink = NullSink;
+    let err_traced =
+        StorageRoot::open_traced(dir.path(), Some(mismatched), 0, &mut sink).unwrap_err();
+    assert_eq!(format!("{err_open:?}"), format!("{err_traced:?}"));
 }
