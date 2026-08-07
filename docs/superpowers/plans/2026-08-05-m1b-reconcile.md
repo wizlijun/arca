@@ -95,7 +95,7 @@ arca_chunk::hash::ContentHash               // Copy + Eq + Ord + Hash；只有 D
 ```
 base   ∈ absent | present
 local  ∈ absent | unchanged | modified | added
-remote ∈ absent | unchanged | modified | tombstoned
+remote ∈ absent | present | unchanged | modified | tombstoned
 ```
 
 注意 `local` 与 `remote` 的取值是**相对基线**的判断，不是裸状态——
@@ -130,7 +130,7 @@ git commit -m "arca-core: 三态调和的输入词汇（取值受 I10 约束，�
 **Interfaces:**
 - Produces:
   - `Action`：`Noop` | `Upload { parent: Option<VersionId> }` | `Download { version_id: VersionId }` |
-    `AdoptBaseline { hash: ContentHash }` | `DeleteLocal { item_id: ItemId }` |
+    `AdoptBaseline { hash: ContentHash, version_id: VersionId }` | `DeleteLocal { item_id: ItemId }` |
     `TombstoneRemote { item_id: ItemId, parent: VersionId }` | `Conflict { .. }` | `NeedsHuman { .. }`
   - `Reason`：稳定的短标识（`&'static str`），受 I10 约束
   - `Decision { action: Action, reason: Reason }`
@@ -147,11 +147,11 @@ git commit -m "arca-core: 三态调和的输入词汇（取值受 I10 约束，�
 | absent | absent | present | `Download` | `remote_new` | 远端新增 → 下载 |
 | absent | added | present | 哈希相同 → `AdoptBaseline`；否则 `Conflict` | `converged_independently` / `both_new_divergent` | **零传输认领**：两端各自产生了同一内容（例如同一张照片从两台设备导入）。这是 §4.3 「内容一致的本地文件走认领」的落地处 |
 | present | unchanged | unchanged | `Noop` | `all_in_sync` | |
-| present | modified | unchanged | `Upload{parent:Some(base.version)}` | `local_modified` | CAS 带父版本（I4） |
-| present | unchanged | modified | `Download` | `remote_modified` | |
-| present | modified | modified | 哈希相同 → `AdoptBaseline`；否则 `Conflict` | `converged_independently` / `three_way_divergent` | `three_way_divergent` 这个取值已被 `FORMAT.md` §10.1 的示例钉死，**逐字使用** |
-| present | absent | unchanged | `TombstoneRemote` | `local_deleted` | 本地删除 → 传播为 tombstone（**不是**物理销毁，I3） |
-| present | absent | modified | `Download` | `delete_vs_modify` | **本地删除撞上远端修改**：按 I3，删除绝不能赢——重新下载远端版本并报告。用户想删就再删一次，那是一次新的、明确的意图 |
+| present | modified | unchanged | `Upload{parent:Some(remote.version_id)}` | `local_modified` | CAS 的 If-Match 要匹配 hub 上**当前**是什么，所以 parent 取远端当前版本而非基线版本。此格二者相等，但表述必须按远端来——否则「同内容重新上传」会造成 412 死循环（评审发现） |
+| present | unchanged | modified | 哈希与基线相同 → `AdoptBaseline`；否则 `Download` | `remote_version_advanced` / `remote_modified` | 版本推进不等于内容改变。哈希没变说明只是重新版本化，零传输对齐基线即可——**这一格是 CAS 死循环的出口** |
+| present | modified | modified | **三分支，顺序不可换**：先看 `remote_hash == base_hash` → `Upload{parent:Some(remote.version_id)}`；再看 `local_hash == remote_hash` → `AdoptBaseline`；否则 `Conflict` | `local_modified` / `converged_independently` / `three_way_divergent` | 先问「远端到底变没变内容」再问「两端是否撞成一样」。反过来会把「远端没变、本地变了」误判进冲突。`three_way_divergent` 已被 `FORMAT.md` §10.1 示例钉死，**逐字使用** |
+| present | absent | unchanged | `TombstoneRemote{parent:remote.version_id}` | `local_deleted` | 本地删除 → 传播为 tombstone（**不是**物理销毁，I3）。parent 同样取远端当前版本 |
+| present | absent | modified | 哈希与基线相同 → `TombstoneRemote{parent:remote.version_id}`；否则 `Download` | `local_deleted` / `delete_vs_modify` | 远端只是版本推进、内容没变时，本地删除的意图照常传播；远端内容真的变了才是 **删除撞上修改**——按 I3 删除绝不能赢，重新下载远端版本并报告。用户想删就再删一次，那是一次新的、明确的意图 |
 | present | unchanged | tombstoned | `DeleteLocal` | `remote_tombstoned` | 远端删除且本地无改动 → 移除本地副本（四道闸门在 M1d 的执行侧，此处只出决策） |
 | present | modified | tombstoned | `Conflict` | `modify_vs_delete` | 本地有未同步修改 → **绝不删**，升级为冲突副本（spec §5.3） |
 | present | absent | tombstoned | `Noop` | `both_deleted` | 两端都删了，清基线即可 |
@@ -160,6 +160,13 @@ git commit -m "arca-core: 三态调和的输入词汇（取值受 I10 约束，�
 | absent | added | tombstoned | `Upload{parent:None}` | `local_new_over_tombstone` | 删除后重建 = **新身份**（spec §4.1），所以按新增上传 |
 | present | modified | absent | `NeedsHuman` | `remote_vanished_without_tombstone` | 同上，且本地还有未同步的修改，更不能猜 |
 | present | unchanged | absent | `NeedsHuman` | `remote_vanished_without_tombstone` | 同上 |
+
+**分类按什么**（评审后修订，代码为准）：`RemoteClass` 按 **version_id** 分类
+（`Unchanged` = 与基线同版本），`LocalClass` 按**哈希**分类（本地文件系统没有版本号）。
+这个不对称是有意的：版本号是 CAS 的权威标识，用哈希分类远端会导致「同内容重新上传」
+被误判成没变，进而反复提交过期的 parent，形成 412 死循环。
+
+新增 reason `remote_version_advanced` 已同步进 `FORMAT.md` §10.3。
 
 **两条贯穿全表的纪律**，在 doc comment 里写明：
 
@@ -240,7 +247,7 @@ spec §11.2 要求的「收敛性属性测试：任意操作交错 + 任意崩�
   这需要一个「应用决策到三态」的模型函数（纯函数，测试内定义即可）——
   它本身也是对决策表语义的第二次表述，两者不一致就说明表有问题。
 - [ ] **性质 4（收敛）**：从任意初始三态出发，反复「decide → 应用」，
-  必须在有限步内到达 `Noop`（不震荡）。给一个明确的步数上限（例如 8），
+  必须在有限步内到达 `Noop` **或一个正当终态**（`Conflict` / `NeedsHuman` 按 I5 就该停在那里，不震荡）。给一个明确的步数上限（例如 8），
   超过就是 bug。
 
 **这四条性质里，2 和 4 是本切片最有价值的产出**——它们把 spec 里的两句承诺
