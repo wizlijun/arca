@@ -35,7 +35,9 @@
 //! | present | modified | unchanged | `Upload{parent:Some(remote.version_id)}` | `local_modified` | CAS 带父版本（I4），取远端当前版本，不是基线版本 |
 //! | present | unchanged | modified，哈希不同 | `Download` | `remote_modified` | |
 //! | present | unchanged | modified，哈希相同 | `AdoptBaseline` | `remote_version_advanced` | **死循环出口**：内容没变，只是远端版本推进了（例如同内容重新上传），零传输对齐基线 |
-//! | present | modified | modified | 哈希相同 → `AdoptBaseline`；否则 `Conflict` | `converged_independently` / `three_way_divergent` | `three_way_divergent` 已被 `FORMAT.md` §10.1 示例钉死，逐字使用 |
+//! | present | modified | modified，远端哈希与基线相同 | `Upload{parent:Some(remote.version_id)}` | `local_modified` | 远端只是版本推进、内容没真变；与 `present|modified|unchanged` 同构，本地修改照常上传 |
+//! | present | modified | modified，远端哈希与基线不同、且与本地哈希相同 | `AdoptBaseline` | `converged_independently` | 远端内容真的变了，但恰好与本地的修改撞成同一份内容 |
+//! | present | modified | modified，远端哈希与基线不同、且与本地哈希也不同 | `Conflict` | `three_way_divergent` | `three_way_divergent` 已被 `FORMAT.md` §10.1 示例钉死，逐字使用 |
 //! | present | absent | unchanged | `TombstoneRemote{parent:remote.version_id}` | `local_deleted` | 本地删除 → 传播为 tombstone（不是物理销毁，I3） |
 //! | present | absent | modified，哈希相同 | `TombstoneRemote{parent:remote.version_id}` | `local_deleted` | 远端只是版本推进、内容没变，删除意图照常传播 |
 //! | present | absent | modified，哈希不同 | `Download` | `delete_vs_modify` | **本地删除撞上远端修改**：按 I3，删除绝不能赢——重新下载远端版本并报告 |
@@ -347,7 +349,23 @@ fn decide_base_present(
                     }
                 }
                 (false, false) => {
-                    if local_hash == remote_hash {
+                    // 先问「远端到底变没变内容」，再问「两端是否撞成一样」——
+                    // 顺序不能反：先比 local 与 remote 会把「远端版本推进但
+                    // 内容没变、本地真的改了」误判进冲突，而这种情形其实与
+                    // `local_modified`（remote 未变）同构，可以无损自动收敛，
+                    // 不该送进 M2 的结构化冲突流程。
+                    if remote_hash == base_hash {
+                        // 远端内容没真变，只是版本推进：本地的修改照常上传，
+                        // CAS parent 用远端当前版本（同 `local_modified` 分支）。
+                        Decision::new(
+                            Action::Upload {
+                                parent: Some(remote_version.clone()),
+                            },
+                            "local_modified",
+                        )
+                    } else if local_hash == remote_hash {
+                        // 远端内容真的变了，且恰好与本地的修改撞成同一份内容
+                        // （例如两端各自把同一处改成了一样的结果）。
                         Decision::new(
                             Action::AdoptBaseline {
                                 hash: *local_hash,

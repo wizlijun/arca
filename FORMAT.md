@@ -431,8 +431,10 @@ arca 领域事件：
   `remote_vanished_without_tombstone` · `tombstone_for_unknown_item` ·
   `local_new_over_tombstone`。
   `remote_vanished_without_tombstone`（I5：模糊必停，绝不推断成远端删除）、
-  `converged_independently`（零传输认领，spec §4.3）与 `local_deleted`
-  （删除意图的传播，不论远端版本是否已推进）各自被多格决策共用。
+  `converged_independently`（零传输认领，spec §4.3）、`local_deleted`
+  （删除意图的传播，不论远端版本是否已推进）与 `local_modified`
+  （本地修改照常上传，不论远端版本是否推进——只要远端**内容**没变）各自被
+  多格决策共用。
   `remote_version_advanced`：远端版本号推进了但内容哈希与基线一致（例如同一份
   内容被重新上传），零传输把基线对齐到新版本——这是避免死循环的关键分支，
   没有它，`remote` 按版本号判断为 `modified` 但内容其实没变的这一格无处可去。

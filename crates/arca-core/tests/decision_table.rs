@@ -1,9 +1,12 @@
 //! 三态调和决策表：穷举 18 格 + I3 可执行断言（无任何路径销毁数据）。
 //!
-//! 数据驱动：每一条 [`Case`] 对应 `reconcile` 模块 doc comment 里表格的一行
-//! （四行——`absent|added|present`、`present|unchanged|modified`、
-//! `present|modified|modified`、`present|absent|modified`——因为哈希相同/不同
-//! 两种子结果各自拆成两条 `Case`，所以下面共 22 条，覆盖全部 18 格）。
+//! 数据驱动：每一条 [`Case`] 对应 `reconcile` 模块 doc comment 里表格的一行。
+//! 四行会按哈希再细分：`absent|added|present`、`present|unchanged|modified`、
+//! `present|absent|modified` 各拆成两条 `Case`；`present|modified|modified`
+//! 拆成三条（远端哈希与基线相同/不同两层判断，再嵌套本地与远端是否撞成同一
+//! 内容——这一层三分支正是曾经漏掉 `remote_hash == base_hash` 检查、把
+//! 「远端只是版本推进」误判进冲突的地方，回归测试见下方对应 `Case` 的注释）。
+//! 所以下面共 23 条，覆盖全部 18 格。
 //!
 //! **每条 `Case` 断言的是完整的 `Action` 值（含 `parent`/`version_id`/`hash` 等
 //! 携带字段），不是只看判别式**：`Action` 派生了 `PartialEq`，`assert_eq!` 直接
@@ -181,7 +184,22 @@ fn cases() -> Vec<Case> {
             expected_reason: "remote_version_advanced",
         },
         Case {
-            label: "present|modified|modified（哈希相同→零传输认领）",
+            // 回归测试：远端只是版本推进、内容其实没变（`remote.hash ==
+            // base.hash`）——与 `present|modified|unchanged` 同构，本地的
+            // 修改照常上传，不该被误判进冲突。这条 Case 曾经被现有测试集
+            // 漏掉过（`present|modified|modified` 原来两条 Case 的 remote
+            // 哈希都与 base 不同，恰好绕开了这一分支）。
+            label: "present|modified|modified（远端哈希与基线相同→照常上传）",
+            base: base_present(),
+            local: local_present(hash("local")),
+            remote: remote_present(hash("base"), REMOTE_ADVANCED_VERSION),
+            expected_action: Action::Upload {
+                parent: Some(vid(REMOTE_ADVANCED_VERSION)),
+            },
+            expected_reason: "local_modified",
+        },
+        Case {
+            label: "present|modified|modified（远端哈希与基线不同、与本地相同→零传输认领）",
             base: base_present(),
             local: local_present(hash("converged")),
             remote: remote_present(hash("converged"), REMOTE_ADVANCED_VERSION),
@@ -192,7 +210,7 @@ fn cases() -> Vec<Case> {
             expected_reason: "converged_independently",
         },
         Case {
-            label: "present|modified|modified（哈希不同→三方冲突）",
+            label: "present|modified|modified（三方哈希互不相同→三方冲突）",
             base: base_present(),
             local: local_present(hash("local")),
             remote: remote_present(hash("remote"), REMOTE_ADVANCED_VERSION),
