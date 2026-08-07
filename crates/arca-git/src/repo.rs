@@ -9,6 +9,11 @@ use std::process::{Command, Output};
 /// git 相关操作的失败。彼此可区分（I5：如实报告失败的性质，不折叠成一种"出错了"）。
 #[derive(Debug)]
 pub enum GitError {
+    /// `Repo::open` 传入的路径本身不存在（`open` 会先检查这一点，不会让它
+    /// 走到 spawn `git` 子进程那一步）。与 `GitNotFound` 分开报告：两者都会让
+    /// `git rev-parse` 触发 `ENOENT`，但成因和修复方向完全不同——`PathNotFound`
+    /// 该去检查路径，`GitNotFound` 该去装 git（评审 Important #3，I5）。
+    PathNotFound { path: PathBuf },
     /// 目标路径不是一个 git 仓库（`git rev-parse --is-inside-work-tree` 失败）。
     NotARepo { path: PathBuf },
     /// 系统上找不到可执行的 `git`。
@@ -29,6 +34,9 @@ pub enum GitError {
 impl fmt::Display for GitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            GitError::PathNotFound { path } => {
+                write!(f, "{} 不存在", path.display())
+            }
             GitError::NotARepo { path } => {
                 write!(f, "{} 不是一个 git 仓库", path.display())
             }
@@ -63,7 +71,17 @@ pub struct Repo {
 impl Repo {
     /// 打开 `path`，校验它确实处在一个 git 工作树里
     /// （`git rev-parse --is-inside-work-tree`）。不创建、不初始化任何内容。
+    ///
+    /// 先检查 `path` 本身是否存在：`Command::current_dir` 触发的 `ENOENT`
+    /// 与"PATH 里找不到 git 可执行文件"触发的 `ENOENT` 在 `io::ErrorKind`
+    /// 层面无法区分，若不提前拦截，路径不存在会被误报成
+    /// [`GitError::GitNotFound`]，把用户指向错误的修复方向（评审 Important #3）。
     pub fn open(path: &Path) -> Result<Self, GitError> {
+        if std::fs::symlink_metadata(path).is_err() {
+            return Err(GitError::PathNotFound {
+                path: path.to_path_buf(),
+            });
+        }
         let output = run(Command::new("git")
             .args(["rev-parse", "--is-inside-work-tree"])
             .current_dir(path))?;
@@ -160,11 +178,23 @@ mod tests {
     // `tests/ignore_block.rs`——那才是本模块唯一有意义的验证方式，见其文件头注释。
 
     #[test]
-    fn 打开不存在的仓库返回错误() {
+    fn 打开不存在的路径返回_path_not_found_而不是_git_not_found() {
         let dir = std::env::temp_dir();
-        // 用一个几乎不可能是 git 仓库、也不可能存在的路径。
+        // 用一个几乎不可能存在的路径。
         let path = dir.join("arca-git-repo-open-test-definitely-not-a-repo-xyz123");
-        let result = Repo::open(&path);
-        assert!(result.is_err());
+        match Repo::open(&path) {
+            Err(GitError::PathNotFound { path: reported }) => assert_eq!(reported, path),
+            other => panic!("应返回 PathNotFound，实际是 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 打开存在但不是_git_仓库的路径返回_not_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        // 路径确实存在，但从未 `git init` 过。
+        match Repo::open(dir.path()) {
+            Err(GitError::NotARepo { path }) => assert_eq!(path, dir.path()),
+            other => panic!("应返回 NotARepo，实际是 {other:?}"),
+        }
     }
 }
