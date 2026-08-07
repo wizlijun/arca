@@ -8,6 +8,7 @@ rust-version.workspace = true
 homepage.workspace = true
 
 [dependencies]
+arca-chunk = { version = "0.0.1", path = "../arca-chunk" }
 arca-format = { path = "../arca-format" }
 # 纪律（spec §11.3）：core 无运行时依赖（无 tokio）、零重依赖、可嵌入
 

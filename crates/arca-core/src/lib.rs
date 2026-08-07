@@ -18,4 +18,5 @@ pub mod conflict;
 pub mod error;
 pub mod journal;
 pub mod reconcile;
+pub mod state;
 pub mod tombstone;

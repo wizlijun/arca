@@ -396,6 +396,37 @@ arca 领域事件：
 `txn.*` 事件是 `locks/<id>.txn`（§4）的**可丢镜像**：`.txn` 保持自己的格式与 fsync 保证、
 是崩溃恢复的权威依据；trace 里的副本只服务事后阅读。
 
+`reconcile.decide` 的七个字段（M1b，arca-core 三态调和决策表）：
+
+- `path`：本次决策所针对的路径（§2 path 规则下的合规路径）。
+- `item_id`：涉及的身份，32 位小写十六进制。取值优先级：`base` 存在则取 `base` 的，
+  否则取 `remote` 的（`present` 或 `tombstoned` 均可提供），两者都没有则为**空字符串
+  而非省略该字段**——与 `mount.check` 的 `found` 同一条纪律，agent 做精确匹配，
+  缺字段与空值是两个不同的信号。
+- `base` 取值：`absent` | `present`——客户端上一次对账记下的基线是否认识这个 item。
+- `local` 取值：`absent` | `unchanged` | `modified` | `added`——**相对基线**判断：
+  `absent` 本地没有；`added` 基线没有但本地有（含「删除后重建」，视为新身份，spec §4.1）；
+  `unchanged` 本地哈希与基线一致；`modified` 本地存在但哈希与基线不同。
+- `remote` 取值：`absent` | `present` | `unchanged` | `modified` | `tombstoned`——
+  同样相对基线判断，但**没有 `added`**：基线缺失时远端新增直接用 `present`
+  （没有基线可比，"存在" 本身就是全部信息，不必像本地那样另造 `added` 一词
+  去和 `modified` 区分）；基线存在时远端哈希与基线一致为 `unchanged`、不同为
+  `modified`；远端已记录删除为 `tombstoned`。
+- `action` 取值：`noop` | `upload` | `download` | `adopt_baseline` | `delete_local` |
+  `tombstone_remote` | `conflict` | `needs_human`——决策表选出的动作类别，
+  详细决策表见 `arca-core::reconcile` 模块 doc（18 格，覆盖全部合法
+  `base`×`local`×`remote` 组合）。**没有任何一个取值是物理销毁数据**：
+  `delete_local` 只移除本地副本，权威副本仍在 hub trash 保留期内；
+  `tombstone_remote` 记的是墓碑，不是销毁；物理销毁只经显式 `arca gc`（I3）。
+- `reason` 取值（稳定短标识，允许多行共用同一个 `reason`，含义见决策表）：
+  `nothing_anywhere` · `local_new` · `remote_new` · `converged_independently` ·
+  `both_new_divergent` · `all_in_sync` · `local_modified` · `remote_modified` ·
+  `three_way_divergent` · `local_deleted` · `delete_vs_modify` · `remote_tombstoned` ·
+  `modify_vs_delete` · `both_deleted` · `remote_vanished_without_tombstone` ·
+  `tombstone_for_unknown_item` · `local_new_over_tombstone`。
+  `remote_vanished_without_tombstone`（I5：模糊必停，绝不推断成远端删除）与
+  `converged_independently`（零传输认领，spec §4.3）各自被多格决策共用。
+
 ### 10.4 error 事件与处置类别
 
 ```json
