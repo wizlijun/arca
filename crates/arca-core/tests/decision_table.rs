@@ -5,9 +5,10 @@
 //! 相同/不同两种子结果，各自拆成两条 `Case`，所以下面共 20 条，覆盖全部 18 格）。
 
 use arca_chunk::hash::ContentHash;
-use arca_core::reconcile::{decide, Action, Reason};
+use arca_core::reconcile::{decide, decide_traced, Action, Reason};
 use arca_core::state::{BaseState, LocalState, RemoteState};
 use arca_format::model::{ItemId, VersionId};
+use arca_format::trace::{EventKind, FieldValue, NullSink, VecSink};
 
 fn iid(byte: u8) -> ItemId {
     ItemId::from_bytes([byte; 16])
@@ -357,4 +358,120 @@ fn format_md_示例场景逐字匹配() {
     let decision = decide(&base, &local, &remote);
     assert_eq!(decision.action.as_str(), "conflict");
     assert_eq!(decision.reason, "three_way_divergent");
+}
+
+// ---------------------------------------------------------------------------
+// decide_traced：trace 发射（`FORMAT.md` §10.3 `reconcile.decide` 的七个字段）
+// ---------------------------------------------------------------------------
+
+fn field_str(sink: &VecSink, key: &str) -> String {
+    match sink.records()[0].field(key) {
+        Some(FieldValue::Str(text)) => text.to_string(),
+        other => panic!("字段 {key} 不是字符串：{other:?}"),
+    }
+}
+
+/// 每种 `action` 至少一条：七个字段齐全、取值正确。
+#[test]
+fn decide_traced_七个字段齐全且取值正确() {
+    for case in cases() {
+        let mut sink = VecSink::new();
+        let decision = decide_traced(
+            &case.base,
+            &case.local,
+            &case.remote,
+            "京都/鸭.png",
+            42,
+            &mut sink,
+        );
+
+        assert_eq!(
+            sink.records().len(),
+            1,
+            "行 {} 应恰好发一条事件",
+            case.label
+        );
+        let record = &sink.records()[0];
+        assert_eq!(record.event, EventKind::ReconcileDecide);
+        assert_eq!(record.t_abs_us, 42);
+
+        assert_eq!(field_str(&sink, "path"), "京都/鸭.png", "行 {}", case.label);
+        assert_eq!(
+            field_str(&sink, "base"),
+            case.base.as_str(),
+            "行 {}",
+            case.label
+        );
+        assert_eq!(
+            field_str(&sink, "local"),
+            case.local.classify(&case.base).as_str(),
+            "行 {}",
+            case.label
+        );
+        assert_eq!(
+            field_str(&sink, "remote"),
+            case.remote.classify(&case.base).as_str(),
+            "行 {}",
+            case.label
+        );
+        assert_eq!(
+            field_str(&sink, "action"),
+            case.expect_action,
+            "行 {}",
+            case.label
+        );
+        assert_eq!(
+            field_str(&sink, "reason"),
+            case.expect_reason,
+            "行 {}",
+            case.label
+        );
+
+        let expected_item_id = case
+            .base
+            .item_id()
+            .or_else(|| case.remote.item_id())
+            .map(|id| id.to_hex())
+            .unwrap_or_default();
+        assert_eq!(
+            field_str(&sink, "item_id"),
+            expected_item_id,
+            "行 {}",
+            case.label
+        );
+
+        // decide_traced 与 decide 对同一输入必须返回相同结果——trace 只是旁路。
+        assert_eq!(decision, decide(&case.base, &case.local, &case.remote));
+    }
+}
+
+/// `item_id` 在 base 与 remote 都没有时是**空字符串**，不是省略该字段
+/// ——`Some("")` 与 `None` 是不同信号（M1a 已定的纪律，这里照办）。
+#[test]
+fn decide_traced_item_id_缺失时是空字符串而非省略字段() {
+    let mut sink = VecSink::new();
+    decide_traced(
+        &base_absent(),
+        &local_absent(),
+        &remote_absent(),
+        "x",
+        0,
+        &mut sink,
+    );
+    assert_eq!(
+        sink.records()[0].field("item_id"),
+        Some(&FieldValue::from(String::new()))
+    );
+}
+
+/// `decide` 是 `decide_traced(..., &mut NullSink)` 的薄壳：同一输入下两者
+/// 返回的 `Decision` 逐字段相同，且 `NullSink` 什么也不落。
+#[test]
+fn decide_是_decide_traced_加_null_sink_的薄壳() {
+    let mut null = NullSink;
+    for case in cases() {
+        let via_traced = decide_traced(&case.base, &case.local, &case.remote, "", 0, &mut null);
+        let via_plain = decide(&case.base, &case.local, &case.remote);
+        assert_eq!(via_traced, via_plain, "行 {}", case.label);
+    }
 }

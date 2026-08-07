@@ -57,6 +57,7 @@
 use crate::state::{BaseState, LocalState, RemoteState};
 use arca_chunk::hash::ContentHash;
 use arca_format::model::{ItemId, VersionId};
+use arca_format::trace::{EventKind, NullSink, TraceRecord, TraceSink};
 
 /// 稳定的短标识，受 I10 约束——同一取值必须逐字出现在 `FORMAT.md` §10.3。
 pub type Reason = &'static str;
@@ -122,12 +123,36 @@ impl Decision {
 
 /// 三态调和决策表——sans-io 纯函数，客户端与 hub 共用同一段代码。
 ///
-/// 完整表见模块顶部 doc comment。这里的匹配结构是：先按 `base` 分两支
+/// `decide_traced` 的薄壳：不发 trace（内部接 [`NullSink`]）。`path` 与 `t_abs_us`
+/// 只服务被丢弃的 trace 记录，取什么值不影响返回的 [`Decision`]。
+pub fn decide(base: &BaseState, local: &LocalState, remote: &RemoteState) -> Decision {
+    decide_traced(base, local, remote, "", 0, &mut NullSink)
+}
+
+/// 三态调和决策表，并发一条 `reconcile.decide` trace 事件（`FORMAT.md` §10.3）。
+///
+/// 完整表见模块顶部 doc comment。决策逻辑的匹配结构是：先按 `base` 分两支
 /// （`base` 只有两种原始形状），再按 `(local, remote)` 的原始形状二级匹配；
 /// 需要哈希比较来在「一致」与「不一致」之间选择时用内部 `if`，不引入额外分支——
 /// 于是 Rust 的穷尽性检查恰好覆盖全部合法组合，不需要 `unreachable!()`。
-pub fn decide(base: &BaseState, local: &LocalState, remote: &RemoteState) -> Decision {
-    match base {
+///
+/// **sans-io**：`t_abs_us` 由调用方注入，函数内绝不读系统时钟——确定性模拟测试
+/// 才能逐字节复现 trace（spec §11.2）。
+///
+/// 七个字段：`path` 原样透传；`base`/`local`/`remote` 取 `FORMAT.md` §10.3 定义的
+/// 分类词汇（`local`/`remote` 是相对 `base` 的分类，见 `crate::state`）；`action`/
+/// `reason` 取决策结果；`item_id` 优先取 `base` 的，其次取 `remote` 的（`present`
+/// 或 `tombstoned` 均可提供），两者都没有则是**空字符串而非省略该字段**——
+/// `Some("")` 与 `None` 是两个不同信号，与 `mount.check` 的 `found` 同一条纪律。
+pub fn decide_traced(
+    base: &BaseState,
+    local: &LocalState,
+    remote: &RemoteState,
+    path: &str,
+    t_abs_us: u64,
+    sink: &mut dyn TraceSink,
+) -> Decision {
+    let decision = match base {
         BaseState::Absent => decide_base_absent(local, remote),
         BaseState::Present {
             item_id,
@@ -135,7 +160,25 @@ pub fn decide(base: &BaseState, local: &LocalState, remote: &RemoteState) -> Dec
             hash: base_hash,
             ..
         } => decide_base_present(*item_id, base_version, base_hash, local, remote),
-    }
+    };
+
+    let item_id = base
+        .item_id()
+        .or_else(|| remote.item_id())
+        .map(|id| id.to_hex())
+        .unwrap_or_default();
+
+    let record = TraceRecord::new(EventKind::ReconcileDecide, t_abs_us)
+        .with("path", path.to_string())
+        .with("item_id", item_id)
+        .with("base", base.as_str())
+        .with("local", local.classify(base).as_str())
+        .with("remote", remote.classify(base).as_str())
+        .with("action", decision.action.as_str())
+        .with("reason", decision.reason);
+    sink.record(record);
+
+    decision
 }
 
 fn decide_base_absent(local: &LocalState, remote: &RemoteState) -> Decision {
