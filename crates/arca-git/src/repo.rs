@@ -21,7 +21,8 @@ pub enum GitError {
         code: Option<i32>,
         stderr: String,
     },
-    /// 子进程调度/管道读取本身失败（非"找不到 git"的其它 IO 错误）。
+    /// 子进程调度/管道读取本身失败，或钩子安装/卸载时的文件系统操作失败
+    /// （非"找不到 git"的其它 IO 错误——两类调用方都不需要比"IO 错误"更细的区分）。
     Io(String),
 }
 
@@ -122,6 +123,28 @@ impl Repo {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect())
+    }
+
+    /// 解析 `$GIT_DIR` 下的相对路径（`git rev-parse --git-path <rel>`），返回绝对路径。
+    ///
+    /// 这会考虑 `core.hooksPath` 一类的重定位——钩子安装/卸载（`hooks` 模块）据此定位
+    /// 真正生效的 hooks 目录，而不是想当然地拼 `.git/hooks`（那在 `core.hooksPath`
+    /// 被设置时就是错的）。
+    pub fn git_path(&self, rel: &str) -> Result<PathBuf, GitError> {
+        let output = run(Command::new("git")
+            .args(["rev-parse", "--git-path"])
+            .arg(rel)
+            .current_dir(&self.root))?;
+        if !output.status.success() {
+            return Err(GitError::CommandFailed {
+                cmd: format!("git rev-parse --git-path {rel}"),
+                code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let rel_path = text.trim_end_matches(['\n', '\r']);
+        Ok(self.root.join(rel_path))
     }
 }
 
