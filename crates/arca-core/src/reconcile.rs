@@ -63,6 +63,7 @@
 //! 2/3 种）二级匹配——需要哈希/版本比较来在子情形之间选择时用内部 `if`，不增加匹配
 //! 分支数，因此 Rust 的穷尽性检查恰好覆盖全部合法组合，不需要任何 `unreachable!()`。
 
+use crate::error::CoreError;
 use crate::state::{BaseState, LocalState, RemoteState};
 use arca_chunk::hash::ContentHash;
 use arca_format::model::{ItemId, VersionId};
@@ -134,6 +135,27 @@ pub struct Decision {
 impl Decision {
     fn new(action: Action, reason: Reason) -> Self {
         Decision { action, reason }
+    }
+
+    /// 把决策分流成「继续执行」与「错误」——`crate::error::CoreError` 对
+    /// [`Action`] 的映射唯一的生产入口（`crate::error` 模块顶部有说明）。
+    ///
+    /// 只有 [`Action::NeedsHuman`] 与 [`Action::Conflict`] 是终态错误：前者是
+    /// I5「模糊必停」，后者是走 M2 结构化冲突流程——都不该被调用方当成
+    /// 「可执行的 IO 步骤」去 `Upload`/`Download` 之类地处理。其余六种动作
+    /// 原样透传为 `Ok`。
+    pub fn into_result(self) -> Result<Action, CoreError> {
+        match self.action {
+            Action::NeedsHuman { item_id } => Err(CoreError::NeedsHuman {
+                item_id,
+                reason: self.reason,
+            }),
+            Action::Conflict { item_id } => Err(CoreError::Conflict {
+                item_id,
+                reason: self.reason,
+            }),
+            action => Ok(action),
+        }
     }
 }
 

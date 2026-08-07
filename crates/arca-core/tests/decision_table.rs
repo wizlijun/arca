@@ -14,10 +14,11 @@
 //! 当前版本）正是本文件要守住的最容易悄悄写错的地方。
 
 use arca_chunk::hash::ContentHash;
+use arca_core::error::CoreError;
 use arca_core::reconcile::{decide, decide_traced, Action, Reason};
 use arca_core::state::{BaseState, LocalClass, LocalState, RemoteClass, RemoteState};
 use arca_format::model::{ItemId, VersionId};
-use arca_format::trace::{EventKind, FieldValue, NullSink, VecSink};
+use arca_format::trace::{ErrorClass, EventKind, FieldValue, NullSink, VecSink};
 
 fn iid(byte: u8) -> ItemId {
     ItemId::from_bytes([byte; 16])
@@ -384,6 +385,52 @@ fn i3_决策表任何一行都不产出销毁语义的动作() {
             "行 {} 产出了不在非销毁白名单内的 action：{kind}",
             case.label
         );
+    }
+}
+
+/// `Decision::into_result`：`NeedsHuman`/`Conflict` 两格转成 `Err`，且 `class()`
+/// 与 brief 的要求逐字相符（`NeedsHuman` 决策 → `needs_human`，`Conflict` 决策 →
+/// `protocol`，不是 `needs_human`——冲突走既定流程，不需要人立刻介入）；
+/// 其余 16 格原样转成 `Ok`，携带与 `decide` 返回的同一个 `Action`。
+/// 这条测试跑在 18 格穷举表上，不是手造几个孤立样例——`CoreError` 的分类
+/// 对不对，靠决策表本身的真实产出验证。
+#[test]
+fn into_result_把决策表的两个终态转成错误_其余透传() {
+    for case in cases() {
+        let decision = decide(&case.base, &case.local, &case.remote);
+        let result = decision.clone().into_result();
+        match &decision.action {
+            Action::NeedsHuman { item_id } => {
+                let err = result.expect_err("行 {} 应转成 Err");
+                assert_eq!(
+                    err,
+                    CoreError::NeedsHuman {
+                        item_id: *item_id,
+                        reason: case.expected_reason,
+                    }
+                );
+                assert_eq!(err.class(), ErrorClass::NeedsHuman, "行 {}", case.label);
+            }
+            Action::Conflict { item_id } => {
+                let err = result.expect_err("行 {} 应转成 Err");
+                assert_eq!(
+                    err,
+                    CoreError::Conflict {
+                        item_id: *item_id,
+                        reason: case.expected_reason,
+                    }
+                );
+                assert_eq!(err.class(), ErrorClass::Protocol, "行 {}", case.label);
+            }
+            _ => {
+                assert_eq!(
+                    result.expect("行 {} 应透传为 Ok"),
+                    case.expected_action,
+                    "行 {}",
+                    case.label
+                );
+            }
+        }
     }
 }
 

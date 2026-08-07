@@ -106,6 +106,8 @@
 | `lock.busy` | `retryable` | `arca.lock` 被占用 |
 | `commit.stale_parent` | `protocol` | CAS 412，父版本过期（I4） |
 | `journal.reset_required` | `protocol` | 游标早于保留区间，走全量对账兜底 |
+| `reconcile.needs_human` | `needs_human` | 三态调和判定为模糊终态（`reason=remote_vanished_without_tombstone`）——基线说某个 item 存在过，远端却既无记录也无 tombstone，按 I5 停下，绝不推断成「远端删了」 |
+| `reconcile.conflict` | `protocol` | 三态调和判定为结构化冲突（`reason` 为 `both_new_divergent`/`three_way_divergent`/`modify_vs_delete` 之一）——走 M2 冲突落地流程，不作为错误处理 |
 | `internal.invariant_violated` | `bug` | 内部不变量被破坏 |
 
 TODO：退出码与 `code` 的映射表（M1）；HTTP 状态码与 `code` 的映射表（M2）。
