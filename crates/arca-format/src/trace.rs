@@ -953,16 +953,21 @@ mod tests {
 
     #[test]
     fn 信封在前载荷按键名字节序升序() {
+        // 七个字段齐全（`FORMAT.md` §10.1 的示例）——`item_id`/`base` 缺失会
+        // 让这条记录变成一条 `reconcile.decide` 永远发不出来的记录，两处必须
+        // 同步维护，参见 §10.3 的字段说明。
         let record = TraceRecord::new(EventKind::ReconcileDecide, 48211)
             .with("remote", "modified")
             .with("path", "京都/鸭川.png")
             .with("action", "conflict")
             .with("local", "modified")
+            .with("base", "present")
+            .with("item_id", "0123456789abcdef0123456789abcdef")
             .with("reason", "three_way_divergent");
         let line = TraceEvent::new(sid(), 17, record).to_json_line();
         assert_eq!(
             line,
-            r#"{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":17,"t_abs":48211,"event":"reconcile.decide","action":"conflict","local":"modified","path":"京都/鸭川.png","reason":"three_way_divergent","remote":"modified"}"#
+            r#"{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":17,"t_abs":48211,"event":"reconcile.decide","action":"conflict","base":"present","item_id":"0123456789abcdef0123456789abcdef","local":"modified","path":"京都/鸭川.png","reason":"three_way_divergent","remote":"modified"}"#
         );
     }
 
