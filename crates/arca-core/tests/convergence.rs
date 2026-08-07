@@ -5,6 +5,10 @@
 //! 本切片最有价值的两条产出——它们把 spec 里的两句承诺（「无任何路径销毁数据」
 //! 「最终收敛」）变成机器每次提交都会检查的断言，而不是文档里的一句话承诺。
 //!
+//! `World`/`apply_decision`/`is_terminal`/`NON_DESTRUCTIVE` 定义在
+//! `tests/common/mod.rs`，与 `tests/simulation.rs` 共用——两处都需要"决策应用到
+//! 现实世界会发生什么"这同一份推导，理由见该文件顶部 doc comment。
+//!
 //! ## 生成域为什么是一个小的符号宇宙，而不是"任意"字节
 //!
 //! `decide` 的分支绝大多数由**相等判断**触发（哈希是否等于基线、版本号是否
@@ -21,10 +25,12 @@
 //! 三个视角，三者的 item_id 理应一致——这个不变量由扫描/journal 层维持，
 //! 不由这三个类型自身保证，`tests/decision_table.rs` 的手写用例同样这么简化。
 
-use arca_chunk::hash::ContentHash;
-use arca_core::reconcile::{decide, Action, Decision};
+mod common;
+
+use arca_core::reconcile::{decide, Action};
 use arca_core::state::{BaseState, LocalState, RemoteState};
-use arca_format::model::{ItemId, VersionId};
+use arca_format::model::ItemId;
+use common::{apply_decision, hash_symbol, is_terminal, version_symbol, World, NON_DESTRUCTIVE};
 use proptest::prelude::*;
 
 const ITEM: u8 = 0xAB;
@@ -33,21 +39,11 @@ fn iid() -> ItemId {
     ItemId::from_bytes([ITEM; 16])
 }
 
-/// 符号哈希：0/1/2 三个符号，足够让 proptest 高概率覆盖"相等"与"不等"两侧。
-fn hash_symbol(n: u8) -> ContentHash {
-    ContentHash::from_bytes(format!("h{n}").as_bytes())
-}
-
-/// 符号版本号：与哈希符号相互独立的另一个小宇宙。
-fn version_symbol(n: u8) -> VersionId {
-    VersionId::new("20260805T093012Z", &format!("{:032x}", n as u128)).unwrap()
-}
-
-fn any_hash() -> impl Strategy<Value = ContentHash> {
+fn any_hash() -> impl Strategy<Value = arca_chunk::hash::ContentHash> {
     (0u8..3).prop_map(hash_symbol)
 }
 
-fn any_version() -> impl Strategy<Value = VersionId> {
+fn any_version() -> impl Strategy<Value = arca_format::model::VersionId> {
     (0u8..3).prop_map(version_symbol)
 }
 
@@ -86,172 +82,6 @@ fn any_remote() -> impl Strategy<Value = RemoteState> {
     ]
 }
 
-// ---------------------------------------------------------------------------
-// 应用模型：把一个决策"应用"到三态之后，现实世界会变成什么样
-// ---------------------------------------------------------------------------
-
-/// 三态世界的一份快照——[`apply_decision`] 的输入与输出，性质 3/4 的状态。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct World {
-    base: BaseState,
-    local: LocalState,
-    remote: RemoteState,
-}
-
-/// 版本号发生器：现实中 hub 每接受一次新提交（`Upload`/`TombstoneRemote`）都会
-/// 分配一个前所未见的版本号。测试用一个从生成域（0..3）之外取值的计数器模拟
-/// ——从 100 起跳，与 `any_version()` 的符号空间隔开，永不与生成的输入意外相等
-/// （一旦意外相等，会把"版本推进"误判成"版本没变"，污染下一轮 `decide` 的判断，
-/// 这正是 `crate::state` 顶部 doc comment 记录的那类死循环 bug 的测试版）。
-fn fresh_version(counter: &mut u8) -> VersionId {
-    *counter += 1;
-    version_symbol(100 + *counter)
-}
-
-/// 把一个决策应用到三态——**独立于 `decide` 的内部匹配结构重新推导**，
-/// 不是照抄 `decide` 再翻译一遍。推导方式是问「这个动作在现实中真的做了
-/// 什么，对本地文件、hub 存储、客户端基线各自留下什么后果」，而不是看
-/// `decide` 判定这一格时用了哪个分支、携带了哪些字段。两者若不一致，
-/// 要么是 `decide` 判错了，要么是这里对"落地后果"的常识判断错了——
-/// 无论哪种，都值得停下核对，这正是这个模型函数存在的意义（brief 语）。
-///
-/// 各分支的现实推导：
-/// - [`Action::Noop`]：无事发生，三态原样不变。
-/// - [`Action::Upload`]：本地内容被推给 hub，hub 接受后分配一个新版本号；
-///   本地内容本身不受影响；客户端基线现在应记录"双方都确认过的是这份内容、
-///   这个新版本号"——`base` 对齐到 `(新版本号, local.hash)`，`remote` 也
-///   对齐到同一份内容与版本号（hub 权威状态已更新）。
-/// - [`Action::Download`]：把 hub 上这个版本的内容拉下来覆盖本地；`base` 与
-///   `remote` 现在都指向这份内容——本地内容换成 `remote.hash`，`base` 对齐到
-///   `(remote.version_id, remote.hash)`。
-/// - [`Action::AdoptBaseline`]：**零传输**——本地文件和 hub 上的内容都不动
-///   一个字节，动的只是客户端自己的记账：`base` 直接对齐到 `Action` 携带的
-///   `(hash, version_id)`，`local`/`remote` 原样不变。
-/// - [`Action::DeleteLocal`]：本地副本被移除；hub 那边本来就已经是
-///   tombstone，本地跟上之后，这个 item 在客户端视角里已经没有"双方都确认过
-///   的版本"需要追踪——基线记录清空（`base` 归 `Absent`）。
-/// - [`Action::TombstoneRemote`]：本地的删除意图被提交为 hub 上一条新的
-///   tombstone 记录（新版本号）；本地早已是 `Absent`（这个动作只在本地已删除
-///   时触发，不是这里才让它变成 Absent）；基线同样清空，理由同 `DeleteLocal`。
-/// - [`Action::Conflict`] / [`Action::NeedsHuman`]：**停在这里，不推进**
-///   （I5：模糊必停；冲突走独立的落地流程，不在这个循环里自动前进）。
-///   三态原样不变——这不是"什么都没发生"（那是 `Noop` 的含义），而是
-///   "决策本身就是别再自动推进"。
-///
-/// 对不该出现的组合（例如 `decide` 产出 `Upload` 但 `local` 却是 `Absent`）
-/// 主动 `panic!`，而不是悄悄兜底——那种组合意味着 `decide` 与这个模型函数
-/// 里至少有一个错了，装作没看见只会把 bug 埋得更深。
-fn apply_decision(world: &World, decision: &Decision, next_version: &mut u8) -> World {
-    match &decision.action {
-        Action::Noop => world.clone(),
-
-        Action::Upload { .. } => {
-            let (hash, size) = match &world.local {
-                LocalState::Present { hash, size } => (*hash, *size),
-                LocalState::Absent => panic!(
-                    "模型契约被打破：decide 产出 Upload，但 local 是 Absent \
-                     ——Upload 只应在本地存在内容时触发"
-                ),
-            };
-            let version_id = fresh_version(next_version);
-            World {
-                base: BaseState::Present {
-                    item_id: iid(),
-                    version_id: version_id.clone(),
-                    hash,
-                    size,
-                },
-                local: world.local.clone(),
-                remote: RemoteState::Present {
-                    item_id: iid(),
-                    version_id,
-                    hash,
-                    size,
-                },
-            }
-        }
-
-        Action::Download { .. } => {
-            let (hash, size, version_id) = match &world.remote {
-                RemoteState::Present {
-                    hash,
-                    size,
-                    version_id,
-                    ..
-                } => (*hash, *size, version_id.clone()),
-                other => panic!(
-                    "模型契约被打破：decide 产出 Download，但 remote 不是 \
-                     Present（实际是 {other:?}）"
-                ),
-            };
-            World {
-                base: BaseState::Present {
-                    item_id: iid(),
-                    version_id,
-                    hash,
-                    size,
-                },
-                local: LocalState::Present { hash, size },
-                remote: world.remote.clone(),
-            }
-        }
-
-        Action::AdoptBaseline { hash, version_id } => World {
-            base: BaseState::Present {
-                item_id: iid(),
-                version_id: version_id.clone(),
-                hash: *hash,
-                size: 4,
-            },
-            local: world.local.clone(),
-            remote: world.remote.clone(),
-        },
-
-        Action::DeleteLocal { .. } => World {
-            base: BaseState::Absent,
-            local: LocalState::Absent,
-            remote: world.remote.clone(),
-        },
-
-        Action::TombstoneRemote { .. } => {
-            if world.local != LocalState::Absent {
-                panic!(
-                    "模型契约被打破：decide 产出 TombstoneRemote，但 local \
-                     不是 Absent（实际是 {:?}）",
-                    world.local
-                );
-            }
-            World {
-                base: BaseState::Absent,
-                local: LocalState::Absent,
-                remote: RemoteState::Tombstoned {
-                    item_id: iid(),
-                    version_id: fresh_version(next_version),
-                },
-            }
-        }
-
-        Action::Conflict { .. } | Action::NeedsHuman { .. } => world.clone(),
-    }
-}
-
-/// `Action` 是否是「停下等人 / 走独立流程」的终态——I5 意义上的正当终点，
-/// 不是需要继续推进的中间态。性质 4 用它判断循环该在哪一步停下。
-fn is_terminal(action: &Action) -> bool {
-    matches!(action, Action::Conflict { .. } | Action::NeedsHuman { .. })
-}
-
-const NON_DESTRUCTIVE: [&str; 8] = [
-    "noop",
-    "upload",
-    "download",
-    "adopt_baseline",
-    "delete_local",
-    "tombstone_remote",
-    "conflict",
-    "needs_human",
-];
-
 proptest! {
     // 性质 3 用 `prop_assume!` 收窄到非终态决策（约 3 成生成的三态会被判定为
     // 终态而跳过，见该测试的 doc comment）。默认的 `max_global_rejects`（1024）
@@ -283,14 +113,14 @@ proptest! {
     /// spec 的承诺是「同步路径无销毁权」：删除永远表现为 tombstone，物理销毁
     /// 只经显式 `arca gc`。这条测试不是对 `destroys_data()` 这种恒返回 `false`
     /// 的方法做自证式断言（那只是把承诺原样抄一遍，测不出任何东西）；而是维护
-    /// 一份需要人工审查、写明理由的「非销毁」判别式白名单（与
-    /// `tests/decision_table.rs` 同名断言共享同一份白名单与理由），逐条核对
-    /// **proptest 生成的、覆盖面远大于手写用例的输入**产出的 `Action` 都落在
-    /// 白名单内。手写的 18/23 格只覆盖了"典型"的每一行；这条测试用随机组合
-    /// 覆盖手写用例覆盖不到的角落，防止未来有人往 `decide` 里加一条只在某个
-    /// 冷门三态组合下才触发的销毁路径。必须是属性测试而不是几个例子的原因
-    /// 也在这——例子只能证明"这几个点没问题"，属性测试证明的是"这整片输入
-    /// 空间都没问题"。
+    /// 一份需要人工审查、写明理由的「非销毁」判别式白名单（`tests/common/mod.rs`
+    /// 的 `NON_DESTRUCTIVE`，与 `tests/decision_table.rs` 同名断言共享同一份
+    /// 理由），逐条核对**proptest 生成的、覆盖面远大于手写用例的输入**产出的
+    /// `Action` 都落在白名单内。手写的 18/23 格只覆盖了"典型"的每一行；这条
+    /// 测试用随机组合覆盖手写用例覆盖不到的角落，防止未来有人往 `decide` 里加
+    /// 一条只在某个冷门三态组合下才触发的销毁路径。必须是属性测试而不是几个
+    /// 例子的原因也在这——例子只能证明"这几个点没问题"，属性测试证明的是
+    /// "这整片输入空间都没问题"。
     #[test]
     fn 性质2_i3_任意输入的决策都不产出销毁语义的动作(
         base in any_base(), local in any_local(), remote in any_remote(),
@@ -307,7 +137,7 @@ proptest! {
     /// 必须得到 `Noop`。
     ///
     /// 只限定在非终态决策上——`Conflict`/`NeedsHuman` 是正当的终态（I5：
-    /// 模糊必停），[`apply_decision`] 对它们的模型是"原样不动"，再次 `decide`
+    /// 模糊必停），`apply_decision` 对它们的模型是"原样不动"，再次 `decide`
     /// 会得到*同一个终态决策*而不是 `Noop`（这本身也是一种幂等：多次调用
     /// 结果稳定不变，但不是"收敛到 Noop"意义上的幂等）。用 `prop_assume!`
     /// 收窄到非终态的输入域，不是回避问题——终态的"幂等"由性质 4 的循环
@@ -321,7 +151,7 @@ proptest! {
         prop_assume!(!is_terminal(&decision.action));
 
         let mut next_version = 0u8;
-        let next = apply_decision(&world, &decision, &mut next_version);
+        let next = apply_decision(&world, &decision, iid(), &mut next_version);
         let redecided = decide(&next.base, &next.local, &next.remote);
 
         prop_assert_eq!(
@@ -363,7 +193,7 @@ proptest! {
                 converged = true;
                 break;
             }
-            world = apply_decision(&world, &decision, &mut next_version);
+            world = apply_decision(&world, &decision, iid(), &mut next_version);
         }
 
         prop_assert!(
