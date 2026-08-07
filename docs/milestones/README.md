@@ -12,6 +12,7 @@
 | --- | --- | --- | --- |
 | [M0 格式与核心](M0-格式与核心.md) | FORMAT.md v1 · arca-format · arca-chunk · fsck · trace schema · fuzz 与 CI | 50 | ✅ |
 | [M1a 存储根 IO 地基](M1a-存储根IO地基.md) | StorageRoot 身份校验（I11）· 原子写入 · tmp 清理 | 10 | ✅ |
+| [M1b 调和状态机](M1b-调和状态机.md) | 18 格三态决策表 · reconcile.decide 发射 · proptest 收敛性 · 确定性模拟 | 14 | ✅ |
 
 后续切片见 [M1a 文档末尾的拆分表](M1a-存储根IO地基.md#m1-的其余切片)。
 
