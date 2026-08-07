@@ -125,6 +125,7 @@ name = "arca-git"
 version = "0.0.1"
 dependencies = [
  "arca-format",
+ "tempfile",
 ]
 
 [[package]]

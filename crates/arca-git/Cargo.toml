@@ -9,3 +9,6 @@ homepage.workspace = true
 
 [dependencies]
 arca-format = { path = "../arca-format" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

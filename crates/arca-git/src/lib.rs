@@ -10,4 +10,5 @@
 
 pub mod hooks;
 pub mod ignore_block;
+pub mod repo;
 pub mod tracking;
