@@ -40,6 +40,12 @@ pub enum Issue {
     /// 路径落在某个数据集目录内，却已经被 git 追踪——`.gitignore` 反选块
     /// 对已追踪文件无效，这份数据正被 git 与 arca 双重管理（§4.3.1）。
     AlreadyTracked { path: String },
+    /// 某一小项检查因为 IO / git 调用失败而没能跑起来——**不代表"检查了、
+    /// 没问题"**。`check_vault` 的调用方看到这个变体，就必须知道本次巡检
+    /// 不完整：不能把"结果里没有其它 Issue"当成"库是干净的"（I5；评审
+    /// Important #2）。`check` 是触发失败的检查项标识（如
+    /// `"already_tracked"`），`reason` 是失败原因的人类可读描述。
+    CheckIncomplete { check: &'static str, reason: String },
 }
 
 impl fmt::Display for Issue {
@@ -75,16 +81,22 @@ impl fmt::Display for Issue {
                 "{path:?} 已被 git 追踪，但落在一个数据集目录内——\
                  同一份数据正被 git 与 arca 双重管理"
             ),
+            Issue::CheckIncomplete { check, reason } => write!(
+                f,
+                "巡检未完成（{check}）：{reason}——本次结果不完整，\
+                 不能当作\"库是干净的\""
+            ),
         }
     }
 }
 
 /// 对 `repo` 与 `registry` 做一遍一致性巡检，返回发现的所有问题（可能为空）。
 ///
-/// **只报告不修复**（I5）。IO / git 调用本身失败时静默跳过对应的那一小项检查——
-/// `check_vault` 是诊断辅助，不是硬性网关；它没有 `Result` 签名，无法把这类失败
-/// 单独上报，调用方若需要区分"库是干净的"与"检查没跑起来"，应另行探测
-/// （例如先确认 `Repo::open` 与 `Registry::parse` 均成功）。
+/// **只报告不修复**（I5）。IO / git 调用本身失败时，对应的那一小项检查会被跳过，
+/// 但 `check_vault` **不会静默吞掉这个事实**：它会为每一处跳过 push 一条
+/// [`Issue::CheckIncomplete`]。调用方看到返回值里出现这个变体，就必须知道
+/// 本次巡检不完整，不能把"结果里没有其它 Issue"当成"库是干净的"——
+/// `Issue` 是可扩展枚举，新增变体不需要改 `check_vault` 的签名（评审 Important #2）。
 pub fn check_vault(repo: &Repo, registry: &Registry) -> Vec<Issue> {
     let mut issues = Vec::new();
     collect_duplicate_and_nested(registry, &mut issues);
@@ -131,12 +143,17 @@ fn collect_duplicate_and_nested(registry: &Registry, issues: &mut Vec<Issue>) {
 }
 
 /// 递归扫描 `root` 下含 `.arca/dataset.toml` 的目录，返回相对 `root`、
-/// 用 `/` 分隔的路径列表。命中一个数据集根后不再往它内部继续下钻——
-/// 数据集内容（可能是几十万个受管文件）不该被当成候选归属目录扫描，
-/// 也不跳进 `.git/`。
+/// 用 `/` 分隔的路径列表，按字节序排序。命中一个数据集根后不再往它内部
+/// 继续下钻——数据集内容（可能是几十万个受管文件）不该被当成候选归属目录
+/// 扫描，也不跳进 `.git/`。
+///
+/// 排序是必须的：`std::fs::read_dir` 的产出顺序不保证稳定，不排序会导致
+/// 同一磁盘状态两次调用产出不同顺序的 `Issue` 列表（评审 Minor #4，
+/// 与 `ignore_block::render` 显式排序的对称要求一致）。
 fn scan_dataset_roots(root: &Path) -> Vec<String> {
     let mut found = Vec::new();
     scan_dir(root, root, &mut found);
+    found.sort_unstable();
     found
 }
 
@@ -203,9 +220,19 @@ fn collect_orphan_and_missing(repo_root: &Path, registry: &Registry, issues: &mu
 /// 能读出来"的数据集做这两项检查（缺失的数据集已经被 `MissingDataset` 覆盖，
 /// 无需在这里重复报告）。
 fn collect_hub_mismatch_and_tracking(repo: &Repo, registry: &Registry, issues: &mut Vec<Issue>) {
-    // git 调用失败时静默按"没有已追踪文件"处理——见本模块顶部关于
-    // check_vault 没有 Result 签名的说明。
-    let tracked_files = repo.ls_files().unwrap_or_default();
+    // git 调用失败时按"没有已追踪文件"继续（下面 AlreadyTracked 检测因此
+    // 什么都查不出来），但必须如实报告这一项检查没跑成功——不能让调用方
+    // 把"没查出问题"误读成"查过了、没问题"（评审 Important #2）。
+    let tracked_files = match repo.ls_files() {
+        Ok(files) => files,
+        Err(e) => {
+            issues.push(Issue::CheckIncomplete {
+                check: "already_tracked",
+                reason: format!("git ls-files 失败：{e}"),
+            });
+            Vec::new()
+        }
+    };
 
     for entry in registry.datasets() {
         let dataset_toml_path = repo
@@ -213,11 +240,31 @@ fn collect_hub_mismatch_and_tracking(repo: &Repo, registry: &Registry, issues: &
             .join(&entry.path)
             .join(".arca")
             .join("dataset.toml");
-        let Ok(text) = std::fs::read_to_string(&dataset_toml_path) else {
-            continue;
+        let text = match std::fs::read_to_string(&dataset_toml_path) {
+            Ok(text) => text,
+            // 文件本就不存在：已经由 collect_orphan_and_missing 的
+            // MissingDataset 覆盖，不重复报告。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // 存在但读不出来（权限、IO 错误等）：这是真正的"检查没跑起来"，
+            // 且会连带跳过 HubIdMismatch——spec §11 的防误绑安全检查，
+            // 比少几条 AlreadyTracked 更值得警惕，必须显式报告。
+            Err(e) => {
+                issues.push(Issue::CheckIncomplete {
+                    check: "hub_id_mismatch/already_tracked",
+                    reason: format!("读取 {} 失败：{e}", dataset_toml_path.display()),
+                });
+                continue;
+            }
         };
-        let Ok(cfg) = DatasetConfig::parse(&text) else {
-            continue;
+        let cfg = match DatasetConfig::parse(&text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                issues.push(Issue::CheckIncomplete {
+                    check: "hub_id_mismatch/already_tracked",
+                    reason: format!("解析 {} 失败：{e}", dataset_toml_path.display()),
+                });
+                continue;
+            }
         };
 
         if let Some(hub) = registry.hub(&entry.hub) {
@@ -461,5 +508,91 @@ mod tests {
         assert!(!issues.contains(&Issue::AlreadyTracked {
             path: "assets/.arca/dataset.toml".to_string()
         }));
+    }
+
+    // --- 评审 Important #2：静默降级必须换成 Issue::CheckIncomplete ---
+
+    #[test]
+    fn git_命令失败时报告_check_incomplete_而不是当成没有已追踪文件() {
+        let dir = tempfile::tempdir().unwrap();
+        建仓库(dir.path());
+        写数据集(dir.path(), "assets", DS_ID, HUB_ID);
+        let repo = Repo::open(dir.path()).unwrap();
+
+        // 破坏仓库本身（删掉 .git），让后续 `git ls-files` 调用失败——
+        // 模拟"检查没跑起来"，必须与"检查了、确实没有已追踪文件"区分开。
+        std::fs::remove_dir_all(dir.path().join(".git")).unwrap();
+
+        let registry = 单_hub_注册表(
+            "home",
+            HUB_ID,
+            vec![DatasetEntry {
+                path: "assets".to_string(),
+                hub: "home".to_string(),
+            }],
+        );
+        let issues = check_vault(&repo, &registry);
+        assert!(
+            issues.iter().any(
+                |i| matches!(i, Issue::CheckIncomplete { check, .. } if *check == "already_tracked")
+            ),
+            "git ls-files 失败必须报告 CheckIncomplete，而不是静默按\"无已追踪文件\"处理：{issues:?}"
+        );
+    }
+
+    #[test]
+    fn dataset_toml_读取失败时报告_check_incomplete_不吞掉_hub_id_mismatch_检查() {
+        let dir = tempfile::tempdir().unwrap();
+        建仓库(dir.path());
+        // 注册表登记了 "assets"，但 `<path>/.arca/dataset.toml` 这个路径本身
+        // 被造成了一个目录——读取必然失败，且不是 NotFound（NotFound 那种
+        // 情形已经由 MissingDataset 覆盖，不该在这里重复报告）。
+        std::fs::create_dir_all(dir.path().join("assets/.arca/dataset.toml")).unwrap();
+
+        let registry = 单_hub_注册表(
+            "home",
+            HUB_ID,
+            vec![DatasetEntry {
+                path: "assets".to_string(),
+                hub: "home".to_string(),
+            }],
+        );
+        let repo = Repo::open(dir.path()).unwrap();
+        let issues = check_vault(&repo, &registry);
+        assert!(
+            issues.iter().any(|i| matches!(
+                i,
+                Issue::CheckIncomplete { check, .. } if check.contains("hub_id_mismatch")
+            )),
+            "dataset.toml 读取失败必须报告 CheckIncomplete——它连带跳过的 \
+             HubIdMismatch 是 spec §11 的防误绑安全检查，不能被静默吞掉：{issues:?}"
+        );
+    }
+
+    #[test]
+    fn dataset_toml_解析失败时报告_check_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        建仓库(dir.path());
+        let toml_dir = dir.path().join("assets/.arca");
+        std::fs::create_dir_all(&toml_dir).unwrap();
+        std::fs::write(toml_dir.join("dataset.toml"), "not valid toml {{{").unwrap();
+
+        let registry = 单_hub_注册表(
+            "home",
+            HUB_ID,
+            vec![DatasetEntry {
+                path: "assets".to_string(),
+                hub: "home".to_string(),
+            }],
+        );
+        let repo = Repo::open(dir.path()).unwrap();
+        let issues = check_vault(&repo, &registry);
+        assert!(
+            issues.iter().any(|i| matches!(
+                i,
+                Issue::CheckIncomplete { check, .. } if check.contains("hub_id_mismatch")
+            )),
+            "dataset.toml 解析失败必须报告 CheckIncomplete：{issues:?}"
+        );
     }
 }
