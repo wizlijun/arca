@@ -44,7 +44,7 @@ fn any_hash() -> impl Strategy<Value = arca_chunk::hash::ContentHash> {
 }
 
 fn any_version() -> impl Strategy<Value = arca_format::model::VersionId> {
-    (0u8..3).prop_map(version_symbol)
+    (0u8..3).prop_map(|n| version_symbol(n as u32))
 }
 
 fn any_base() -> impl Strategy<Value = BaseState> {
@@ -150,7 +150,7 @@ proptest! {
         let decision = decide(&world.base, &world.local, &world.remote);
         prop_assume!(!is_terminal(&decision.action));
 
-        let mut next_version = 0u8;
+        let mut next_version = 0u32;
         let next = apply_decision(&world, &decision, iid(), &mut next_version);
         let redecided = decide(&next.base, &next.local, &next.remote);
 
@@ -182,7 +182,7 @@ proptest! {
     ) {
         const MAX_STEPS: u32 = 8;
         let mut world = World { base, local, remote };
-        let mut next_version = 0u8;
+        let mut next_version = 0u32;
         let mut history = Vec::new();
 
         let mut converged = false;

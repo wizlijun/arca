@@ -24,7 +24,14 @@ pub fn hash_symbol(n: u8) -> ContentHash {
 }
 
 /// 符号版本号：与哈希符号相互独立的另一个小宇宙。
-pub fn version_symbol(n: u8) -> VersionId {
+///
+/// `n` 取 `u32`（不是 `u8`）：`fresh_version` 从 100 起跳累加，模拟里
+/// `simulate(seed, 80, 24, 3)` 的理论上界是 80 + 3×24 = 152，`100 + 152 = 252`
+/// 尚未溢出 `u8`，但压力跑（3000 种子）与后续调大步数的场景会真的顶到
+/// `u8::MAX`——debug 下 panic，**release 下静默回绕成一个已经用过的版本号**，
+/// 把"版本推进"误判成"版本没变"，这正是 `crate::state` 顶部记录的死循环
+/// 隐患的测试版。`u32` 把这条余量从个位数拉到 40 亿级，实践中不会再顶到。
+pub fn version_symbol(n: u32) -> VersionId {
     VersionId::new("20260805T093012Z", &format!("{:032x}", n as u128)).unwrap()
 }
 
@@ -106,12 +113,12 @@ pub fn apply_decision(
     world: &World,
     decision: &Decision,
     item_id: ItemId,
-    next_version: &mut u8,
+    next_version: &mut u32,
 ) -> World {
     match &decision.action {
         Action::Noop => world.clone(),
 
-        Action::Upload { .. } => {
+        Action::Upload { parent } => {
             let (hash, size) = match &world.local {
                 LocalState::Present { hash, size } => (*hash, *size),
                 LocalState::Absent => panic!(
@@ -119,6 +126,29 @@ pub fn apply_decision(
                      ——Upload 只应在本地存在内容时触发"
                 ),
             };
+            // 契约守卫（本切片的头号修复）：CAS 的 parent 必须取「远端当前
+            // 版本」，绝不能是基线版本——`parent == None` 当且仅当 remote
+            // 完全不认识这个 item（Absent 或 Tombstoned，仅创建没有父版本可
+            // 比对）；否则 `parent` 必须精确等于 `remote` 当前的 version_id。
+            // 这条断言就是「携带的版本号一律取远端当前版本、绝不取基线版本」
+            // 这句话的可执行形态——`reconcile.rs` 一旦把某个 `Some(remote_version)`
+            // 悄悄改回 `Some(base_version)`，这里必须炸。
+            match (&world.remote, parent) {
+                (RemoteState::Absent, None) | (RemoteState::Tombstoned { .. }, None) => {}
+                (
+                    RemoteState::Present {
+                        version_id: remote_version,
+                        ..
+                    },
+                    Some(p),
+                ) if p == remote_version => {}
+                _ => panic!(
+                    "模型契约被打破：Upload 的 parent 必须是 None（remote 为 \
+                     Absent/Tombstoned，仅创建）或 Some(remote 当前 version_id)\
+                     ——实际 parent={parent:?}，remote={:?}",
+                    world.remote
+                ),
+            }
             let version_id = fresh_version(next_version);
             World {
                 base: BaseState::Present {
@@ -137,8 +167,8 @@ pub fn apply_decision(
             }
         }
 
-        Action::Download { .. } => {
-            let (hash, size, version_id) = match &world.remote {
+        Action::Download { version_id } => {
+            let (hash, size, remote_version) = match &world.remote {
                 RemoteState::Present {
                     hash,
                     size,
@@ -150,6 +180,15 @@ pub fn apply_decision(
                      Present（实际是 {other:?}）"
                 ),
             };
+            // 契约守卫：Download 携带的 version_id 必须是 remote 当前版本
+            // ——下载的内容永远是"新鲜的远端状态"，不是基线或别的什么版本。
+            assert_eq!(
+                version_id, &remote_version,
+                "模型契约被打破：Download 的 version_id 必须等于 remote 当前 \
+                 版本——实际 action.version_id={version_id:?}，\
+                 remote.version_id={remote_version:?}"
+            );
+            let version_id = remote_version;
             World {
                 base: BaseState::Present {
                     item_id,
@@ -179,13 +218,28 @@ pub fn apply_decision(
             remote: world.remote.clone(),
         },
 
-        Action::TombstoneRemote { .. } => {
+        Action::TombstoneRemote { parent, .. } => {
             if world.local != LocalState::Absent {
                 panic!(
                     "模型契约被打破：decide 产出 TombstoneRemote，但 local \
                      不是 Absent（实际是 {:?}）",
                     world.local
                 );
+            }
+            // 契约守卫：同 Upload，parent 是 CAS 的 If-Match（I4），必须取
+            // 远端当前版本——决策表里 TombstoneRemote 只在 remote 为 Present
+            // 时产出（local_deleted），parent 必须精确等于它的 version_id。
+            match &world.remote {
+                RemoteState::Present {
+                    version_id: remote_version,
+                    ..
+                } if parent == remote_version => {}
+                _ => panic!(
+                    "模型契约被打破：TombstoneRemote 的 parent 必须等于 remote \
+                     当前 version_id（remote 应为 Present）——实际 parent={parent:?}，\
+                     remote={:?}",
+                    world.remote
+                ),
             }
             World {
                 base: BaseState::Absent,
@@ -207,7 +261,7 @@ pub fn apply_decision(
 /// 相等（一旦意外相等，会把"版本推进"误判成"版本没变"，污染下一轮 `decide`
 /// 的判断，这正是 `arca_core::state` 顶部 doc comment 记录的那类死循环 bug
 /// 的测试版）。
-pub fn fresh_version(counter: &mut u8) -> VersionId {
+pub fn fresh_version(counter: &mut u32) -> VersionId {
     *counter += 1;
     version_symbol(100 + *counter)
 }
