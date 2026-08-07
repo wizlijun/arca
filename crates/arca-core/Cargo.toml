@@ -13,4 +13,4 @@ arca-format = { path = "../arca-format" }
 # 纪律（spec §11.3）：core 无运行时依赖（无 tokio）、零重依赖、可嵌入
 
 [dev-dependencies]
-# 计划依赖：proptest（收敛性属性测试，§11.2）
+proptest = "1.8.0"
