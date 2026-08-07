@@ -18,6 +18,13 @@
 //! 词汇）。18 格，覆盖全部合法组合——非法组合（例如 `base=absent` 时 `local=unchanged`）
 //! 在类型层面就不可构造，见 `crate::state` 的分类逻辑。
 //!
+//! **`local` 按内容哈希判断「变没变」，`remote` 按 `version_id` 判断**（`crate::state`
+//! 顶部 doc comment 详述原因）：CAS 的 If-Match 认的是版本号，`Upload`/`TombstoneRemote`
+//! 的 `parent` 必须取「远端当前版本」而不是基线版本——调和的输入本来就是新鲜的远端状态，
+//! CAS 仍然保护「调和之后、提交之前」这段窗口，这正是 412 该管的事。凡是 `remote` 一栏
+//! 判定为「版本变了」的格子，版本变化不代表内容一定变了（例如同一份内容被重新上传，
+//! 产生了新 `version_id` 但哈希不变），所以这些格子在哈希层面再细分一次。
+//!
 //! | base | local | remote | action | reason | 理由 |
 //! | --- | --- | --- | --- | --- | --- |
 //! | absent | absent | absent | `Noop` | `nothing_anywhere` | 无事发生 |
@@ -25,11 +32,13 @@
 //! | absent | absent | present | `Download` | `remote_new` | 远端新增 → 下载 |
 //! | absent | added | present | 哈希相同 → `AdoptBaseline`；否则 `Conflict` | `converged_independently` / `both_new_divergent` | **零传输认领**：两端各自产生了同一内容（例如同一张照片从两台设备导入）。spec §4.3 |
 //! | present | unchanged | unchanged | `Noop` | `all_in_sync` | |
-//! | present | modified | unchanged | `Upload{parent:Some(base.version)}` | `local_modified` | CAS 带父版本（I4） |
-//! | present | unchanged | modified | `Download` | `remote_modified` | |
+//! | present | modified | unchanged | `Upload{parent:Some(remote.version_id)}` | `local_modified` | CAS 带父版本（I4），取远端当前版本，不是基线版本 |
+//! | present | unchanged | modified，哈希不同 | `Download` | `remote_modified` | |
+//! | present | unchanged | modified，哈希相同 | `AdoptBaseline` | `remote_version_advanced` | **死循环出口**：内容没变，只是远端版本推进了（例如同内容重新上传），零传输对齐基线 |
 //! | present | modified | modified | 哈希相同 → `AdoptBaseline`；否则 `Conflict` | `converged_independently` / `three_way_divergent` | `three_way_divergent` 已被 `FORMAT.md` §10.1 示例钉死，逐字使用 |
-//! | present | absent | unchanged | `TombstoneRemote` | `local_deleted` | 本地删除 → 传播为 tombstone（不是物理销毁，I3） |
-//! | present | absent | modified | `Download` | `delete_vs_modify` | **本地删除撞上远端修改**：按 I3，删除绝不能赢——重新下载远端版本并报告 |
+//! | present | absent | unchanged | `TombstoneRemote{parent:remote.version_id}` | `local_deleted` | 本地删除 → 传播为 tombstone（不是物理销毁，I3） |
+//! | present | absent | modified，哈希相同 | `TombstoneRemote{parent:remote.version_id}` | `local_deleted` | 远端只是版本推进、内容没变，删除意图照常传播 |
+//! | present | absent | modified，哈希不同 | `Download` | `delete_vs_modify` | **本地删除撞上远端修改**：按 I3，删除绝不能赢——重新下载远端版本并报告 |
 //! | present | unchanged | tombstoned | `DeleteLocal` | `remote_tombstoned` | 远端删除且本地无改动 → 移除本地副本 |
 //! | present | modified | tombstoned | `Conflict` | `modify_vs_delete` | 本地有未同步修改 → 绝不删，升级为冲突副本（spec §5.3） |
 //! | present | absent | tombstoned | `Noop` | `both_deleted` | 两端都删了，清基线即可 |
@@ -43,16 +52,14 @@
 //!
 //! 1. **没有任何一格的动作是「删除数据」**。[`Action::DeleteLocal`] 移除的是本地副本，
 //!    权威副本在 hub 的 trash 保留期内；[`Action::TombstoneRemote`] 记的是墓碑不是销毁。
-//!    物理销毁只经显式 `arca gc`。这就是 I3 在决策层的形态——
-//!    [`tests`] 里没有，穷举测试在 `tests/decision_table.rs`，断言 `Action` 的判别式集合
-//!    不含任何销毁语义的变体。
+//!    物理销毁只经显式 `arca gc`。这就是 I3 在决策层的形态——穷举测试在
+//!    `tests/decision_table.rs`，断言 `Action` 的判别式集合不含任何销毁语义的变体。
 //! 2. **模糊必停**：`remote_vanished_without_tombstone` 三格宁可停下要人介入，
 //!    也不推断成删除。这是 I5 最贵也最重要的一次应用。
 //!
 //! `decide` 本身按 `base` 先分两支、再按 `(local, remote)` 的原始形状（各自最多
-//! 2/3 种）二级匹配——18 格里两格（`absent|added|present`、`present|modified|modified`）
-//! 因为哈希相同/不同两种子结果，在代码里各自展开成一次 `if`，不增加匹配分支数，
-//! 因此 Rust 的穷尽性检查恰好覆盖全部 18 格，不需要任何 `unreachable!()`。
+//! 2/3 种）二级匹配——需要哈希/版本比较来在子情形之间选择时用内部 `if`，不增加匹配
+//! 分支数，因此 Rust 的穷尽性检查恰好覆盖全部合法组合，不需要任何 `unreachable!()`。
 
 use crate::state::{BaseState, LocalState, RemoteState};
 use arca_chunk::hash::ContentHash;
@@ -72,17 +79,24 @@ pub type Reason = &'static str;
 pub enum Action {
     /// 三方一致，无事可做。
     Noop,
-    /// 上传本地内容。`parent` 为 CAS 的 If-Match（I4）；`None` 表示仅创建
-    /// （基线不认识这个 item，没有父版本可比对）。
+    /// 上传本地内容。`parent` 为 CAS 的 If-Match（I4），取**远端当前版本**
+    /// （不是基线版本——调和的输入本来就是新鲜的远端状态；`None` 表示远端
+    /// 完全不认识这个 item，仅创建，没有父版本可比对）。
     Upload { parent: Option<VersionId> },
     /// 下载指定版本覆盖本地。
     Download { version_id: VersionId },
-    /// 零传输认领：本地内容与远端内容哈希相同，直接把基线对齐到这个哈希，
-    /// 不传输任何字节（spec §4.3）。
-    AdoptBaseline { hash: ContentHash },
+    /// 零传输认领：本地内容与远端内容哈希相同，直接把基线对齐到这个哈希与版本，
+    /// 不传输任何字节（spec §4.3）。`version_id` 是认领后基线应对齐到的远端版本——
+    /// 没有它，调用方拿到 `hash` 后还得回头翻 `RemoteState` 才能取到新版本号，
+    /// 与 [`Action::Download`] 的自洽度不一致。
+    AdoptBaseline {
+        hash: ContentHash,
+        version_id: VersionId,
+    },
     /// 移除本地副本（不是物理销毁——权威副本仍在 hub trash 保留期内）。
     DeleteLocal { item_id: ItemId },
-    /// 向 hub 提交 tombstone（不是物理销毁）。`parent` 为 CAS 的 If-Match（I4）。
+    /// 向 hub 提交 tombstone（不是物理销毁）。`parent` 为 CAS 的 If-Match（I4），
+    /// 同 [`Action::Upload`]，取远端当前版本。
     TombstoneRemote { item_id: ItemId, parent: VersionId },
     /// 结构化冲突：双方各自有独立、互不相同的修改。完整的冲突副本落地
     /// （命名、actor、时间戳）需要 sans-io 之外的上下文，属 M2 `conflict.rs`；
@@ -133,7 +147,7 @@ pub fn decide(base: &BaseState, local: &LocalState, remote: &RemoteState) -> Dec
 ///
 /// 完整表见模块顶部 doc comment。决策逻辑的匹配结构是：先按 `base` 分两支
 /// （`base` 只有两种原始形状），再按 `(local, remote)` 的原始形状二级匹配；
-/// 需要哈希比较来在「一致」与「不一致」之间选择时用内部 `if`，不引入额外分支——
+/// 需要哈希/版本比较来在子情形之间选择时用内部 `if`，不引入额外分支——
 /// 于是 Rust 的穷尽性检查恰好覆盖全部合法组合，不需要 `unreachable!()`。
 ///
 /// **sans-io**：`t_abs_us` 由调用方注入，函数内绝不读系统时钟——确定性模拟测试
@@ -205,13 +219,17 @@ fn decide_base_absent(local: &LocalState, remote: &RemoteState) -> Decision {
             },
             RemoteState::Present {
                 item_id,
+                version_id: remote_version,
                 hash: remote_hash,
                 ..
             },
         ) => {
             if local_hash == remote_hash {
                 Decision::new(
-                    Action::AdoptBaseline { hash: *local_hash },
+                    Action::AdoptBaseline {
+                        hash: *local_hash,
+                        version_id: remote_version.clone(),
+                    },
                     "converged_independently",
                 )
             } else {
@@ -250,7 +268,9 @@ fn decide_base_present(
             "remote_vanished_without_tombstone",
         ),
 
-        // 本地删除撞上远端状态。
+        // 本地删除撞上远端状态。行选择按 version_id 是否推进（remote 的分类
+        // 依据，与 `RemoteState::classify` 一致）；版本推进后还要看哈希——
+        // 内容没变（纯粹的版本推进）则删除意图照常传播，内容也变了则删除不赢。
         (
             LocalState::Absent,
             RemoteState::Present {
@@ -259,11 +279,12 @@ fn decide_base_present(
                 ..
             },
         ) => {
-            if remote_hash == base_hash {
+            let remote_version_unchanged = remote_version == base_version;
+            if remote_version_unchanged || remote_hash == base_hash {
                 Decision::new(
                     Action::TombstoneRemote {
                         item_id,
-                        parent: base_version.clone(),
+                        parent: remote_version.clone(),
                     },
                     "local_deleted",
                 )
@@ -282,7 +303,10 @@ fn decide_base_present(
             Decision::new(Action::Noop, "both_deleted")
         }
 
-        // 双方都还「在」：按各自与基线的哈希关系细分四种子情形。
+        // 双方都还「在」：local 按哈希判断「变没变」，remote 按 version_id
+        // 判断（`RemoteState::classify` 同一条依据，避免死循环——见模块与
+        // `crate::state` 顶部 doc comment）。remote 版本推进时哈希可能没变
+        // （纯粹的版本推进），需要再细分一次。
         (
             LocalState::Present {
                 hash: local_hash, ..
@@ -294,25 +318,41 @@ fn decide_base_present(
             },
         ) => {
             let local_unchanged = local_hash == base_hash;
-            let remote_unchanged = remote_hash == base_hash;
-            match (local_unchanged, remote_unchanged) {
+            let remote_version_unchanged = remote_version == base_version;
+            match (local_unchanged, remote_version_unchanged) {
                 (true, true) => Decision::new(Action::Noop, "all_in_sync"),
                 (false, true) => Decision::new(
                     Action::Upload {
-                        parent: Some(base_version.clone()),
+                        parent: Some(remote_version.clone()),
                     },
                     "local_modified",
                 ),
-                (true, false) => Decision::new(
-                    Action::Download {
-                        version_id: remote_version.clone(),
-                    },
-                    "remote_modified",
-                ),
+                (true, false) => {
+                    if remote_hash == base_hash {
+                        // 死循环出口：远端只是版本推进，内容没变，零传输对齐基线。
+                        Decision::new(
+                            Action::AdoptBaseline {
+                                hash: *remote_hash,
+                                version_id: remote_version.clone(),
+                            },
+                            "remote_version_advanced",
+                        )
+                    } else {
+                        Decision::new(
+                            Action::Download {
+                                version_id: remote_version.clone(),
+                            },
+                            "remote_modified",
+                        )
+                    }
+                }
                 (false, false) => {
                     if local_hash == remote_hash {
                         Decision::new(
-                            Action::AdoptBaseline { hash: *local_hash },
+                            Action::AdoptBaseline {
+                                hash: *local_hash,
+                                version_id: remote_version.clone(),
+                            },
                             "converged_independently",
                         )
                     } else {

@@ -304,7 +304,7 @@ catalog 的格式由独立工具 `arca-catalog` 定义（spec §4.4）；`client
 JSON Lines（§1），一行一个事件。每行固定携带四个信封字段，其后是该事件类型的载荷字段：
 
 ```json
-{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":17,"t_abs":48211,"event":"reconcile.decide","action":"conflict","local":"modified","path":"京都/鸭川.png","reason":"three_way_divergent","remote":"modified"}
+{"v":1,"sid":"20260805T093012Z-0123456789abcdef","seq":17,"t_abs":48211,"event":"reconcile.decide","action":"conflict","base":"present","item_id":"0123456789abcdef0123456789abcdef","local":"modified","path":"京都/鸭川.png","reason":"three_way_divergent","remote":"modified"}
 ```
 
 | 字段 | 说明 |
@@ -410,8 +410,13 @@ arca 领域事件：
 - `remote` 取值：`absent` | `present` | `unchanged` | `modified` | `tombstoned`——
   同样相对基线判断，但**没有 `added`**：基线缺失时远端新增直接用 `present`
   （没有基线可比，"存在" 本身就是全部信息，不必像本地那样另造 `added` 一词
-  去和 `modified` 区分）；基线存在时远端哈希与基线一致为 `unchanged`、不同为
-  `modified`；远端已记录删除为 `tombstoned`。
+  去和 `modified` 区分）；基线存在时**按 `version_id` 判断**（不是哈希）
+  与基线一致为 `unchanged`、不同为 `modified`；远端已记录删除为 `tombstoned`。
+  `remote` 按版本号而不按哈希判断，是因为 CAS 的 If-Match 认的就是版本号——
+  按哈希判断在「同一份内容被重新上传一次」时会把 `remote.version_id` 已经
+  变了的事实误判为 `unchanged`，调和层会拿着过期版本号反复提交、反复被拒，
+  死循环无出口（`version_id` 一旦提交即不可变，同一版本号必然对应同一哈希，
+  但反过来不成立）。
 - `action` 取值：`noop` | `upload` | `download` | `adopt_baseline` | `delete_local` |
   `tombstone_remote` | `conflict` | `needs_human`——决策表选出的动作类别，
   详细决策表见 `arca-core::reconcile` 模块 doc（18 格，覆盖全部合法
@@ -421,11 +426,16 @@ arca 领域事件：
 - `reason` 取值（稳定短标识，允许多行共用同一个 `reason`，含义见决策表）：
   `nothing_anywhere` · `local_new` · `remote_new` · `converged_independently` ·
   `both_new_divergent` · `all_in_sync` · `local_modified` · `remote_modified` ·
-  `three_way_divergent` · `local_deleted` · `delete_vs_modify` · `remote_tombstoned` ·
-  `modify_vs_delete` · `both_deleted` · `remote_vanished_without_tombstone` ·
-  `tombstone_for_unknown_item` · `local_new_over_tombstone`。
-  `remote_vanished_without_tombstone`（I5：模糊必停，绝不推断成远端删除）与
-  `converged_independently`（零传输认领，spec §4.3）各自被多格决策共用。
+  `remote_version_advanced` · `three_way_divergent` · `local_deleted` ·
+  `delete_vs_modify` · `remote_tombstoned` · `modify_vs_delete` · `both_deleted` ·
+  `remote_vanished_without_tombstone` · `tombstone_for_unknown_item` ·
+  `local_new_over_tombstone`。
+  `remote_vanished_without_tombstone`（I5：模糊必停，绝不推断成远端删除）、
+  `converged_independently`（零传输认领，spec §4.3）与 `local_deleted`
+  （删除意图的传播，不论远端版本是否已推进）各自被多格决策共用。
+  `remote_version_advanced`：远端版本号推进了但内容哈希与基线一致（例如同一份
+  内容被重新上传），零传输把基线对齐到新版本——这是避免死循环的关键分支，
+  没有它，`remote` 按版本号判断为 `modified` 但内容其实没变的这一格无处可去。
 
 ### 10.4 error 事件与处置类别
 

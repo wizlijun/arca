@@ -12,9 +12,19 @@
 //! - 分类词汇（[`LocalState::classify`] / [`RemoteState::classify`]，各自返回
 //!   [`LocalClass`] / [`RemoteClass`]）**相对基线**判断，是 `FORMAT.md` §10.3
 //!   `reconcile.decide` 事件里 `local` / `remote` 字段实际使用的取值，也是
-//!   决策表（[`crate::reconcile`]）人读版表格的行键。`unchanged` 意味着「与基线
-//!   记录的哈希一致」，`modified` 意味着「存在但哈希与基线不同」，`added` 意味着
-//!   「基线里没有但本地有」。
+//!   决策表（[`crate::reconcile`]）人读版表格的行键。
+//!
+//! **`local` 按内容哈希比较，`remote` 按版本号比较——这个不对称是有意的，
+//! 且是修过一次真实 bug 的地方**：本地扫描没有版本号，只有内容，所以
+//! `unchanged`/`modified` 只能靠哈希；但远端的权威标识是 `version_id`（CAS 的
+//! If-Match 对象），`unchanged`/`modified` 必须按它判断。如果按哈希判断远端，
+//! 「同一份内容被重新上传一次」会产生 `remote.hash == base.hash` 但
+//! `remote.version_id != base.version_id`——分类成 `unchanged`，`decide` 端
+//! 却拿着过期的 `base.version_id` 当 CAS parent 去提交，hub 以 412 拒绝，
+//! 重新拉取后分类**仍然**是 `unchanged`，死循环无出口。`version_id` 一旦提交
+//! 即不可变（I2：blob 不可变），同一个 `version_id` 必然对应同一个哈希，
+//! 所以「`version_id` 相同」蕴含「哈希相同」，但反过来不成立——这正是死循环
+//! 的根源，也是为什么只有 `version_id` 才是分类的权威依据。
 //!
 //! `base` 只有两种原始形状且分类词汇与原始形状重合（`absent` / `present`），
 //! 所以 [`BaseState`] 不需要单独的 `classify`。
@@ -34,7 +44,7 @@ use arca_format::model::{ItemId, VersionId};
 /// 基线：客户端上一次对账时记下的、双方都曾确认过的状态（可抛弃投影，I9）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BaseState {
-    /// 基线里没有这个 item——从未同步过，或已被双方共同确认删除并清basline。
+    /// 基线里没有这个 item——从未同步过，或已被双方共同确认删除并清空基线记录。
     Absent,
     Present {
         item_id: ItemId,
@@ -94,15 +104,13 @@ impl LocalClass {
 }
 
 impl LocalState {
-    /// 原始形状：`absent` | `present`。不看基线。
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            LocalState::Absent => "absent",
-            LocalState::Present { .. } => "present",
-        }
-    }
-
     /// 相对基线分类——`FORMAT.md` §10.3 `local` 字段与决策表行键用的就是这个。
+    ///
+    /// 没有独立的、不看基线的 `as_str()`：`LocalState` 只有 `Absent`/`Present`
+    /// 两种原始形状，若给它一个同名同签名的 `as_str()`，会吐出 `"present"`——
+    /// 而 `"present"` 不在 `FORMAT.md` §10.3 `local` 字段的合法取值
+    /// （`absent`/`unchanged`/`modified`/`added`）里，是一个悄悄摆在那里、
+    /// 一用就错的 API。分类词汇由 `classify` 独占。
     pub fn classify(&self, base: &BaseState) -> LocalClass {
         match (base, self) {
             (_, LocalState::Absent) => LocalClass::Absent,
@@ -150,9 +158,12 @@ pub enum RemoteClass {
     Absent,
     /// 基线缺失、远端有——远端新增，直接沿用原始形状的词面。
     Present,
-    /// 基线里有，远端也有，哈希与基线一致。
+    /// 基线里有，远端也有，`version_id` 与基线一致——**按版本号判断，不是哈希**
+    /// （见本模块顶部 doc comment：按哈希判断会在「同内容重新上传」时死循环）。
     Unchanged,
-    /// 基线里有，远端也有，哈希与基线不同。
+    /// 基线里有，远端也有，`version_id` 与基线不同。内容是否也变了要另外看
+    /// 哈希——版本号变了不代表哈希变了（例如纯粹的版本推进）；这个区分由
+    /// `crate::reconcile` 的决策表负责，`classify` 只按版本号判断「变没变」。
     Modified,
     Tombstoned,
 }
@@ -170,15 +181,12 @@ impl RemoteClass {
 }
 
 impl RemoteState {
-    /// 原始形状：`absent` | `present` | `tombstoned`。不看基线。
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RemoteState::Absent => "absent",
-            RemoteState::Present { .. } => "present",
-            RemoteState::Tombstoned { .. } => "tombstoned",
-        }
-    }
-
+    /// 没有独立的、不看基线的 `as_str()`：与 `LocalState` 同一条纪律
+    /// （见 [`LocalState::classify`] 的 doc comment）。`RemoteState` 这里更隐蔽——
+    /// 它的原始形状恰好也叫 `present`，与 `remote` 字段的合法取值撞在一起，
+    /// 一旦误用不会报错也不会看起来不对，只会悄悄传出一个语义错误的
+    /// `remote:"present"`（基线存在时本应是 `unchanged`/`modified`）。
+    /// 分类词汇由 `classify` 独占。
     pub fn item_id(&self) -> Option<ItemId> {
         match self {
             RemoteState::Absent => None,
@@ -188,6 +196,11 @@ impl RemoteState {
     }
 
     /// 相对基线分类——`FORMAT.md` §10.3 `remote` 字段与决策表行键用的就是这个。
+    ///
+    /// **按 `version_id` 判断，不是按哈希**（见本模块顶部 doc comment）：远端的
+    /// 权威标识是 CAS 用的 `version_id`，按哈希判断会在「同内容重新上传产生新
+    /// 版本」时误判为 `unchanged`，导致 `decide` 用过期 parent 提交、被 412
+    /// 拒绝、再拉取仍误判——死循环无出口。
     pub fn classify(&self, base: &BaseState) -> RemoteClass {
         match (base, self) {
             (_, RemoteState::Absent) => RemoteClass::Absent,
@@ -195,11 +208,12 @@ impl RemoteState {
             (BaseState::Absent, RemoteState::Present { .. }) => RemoteClass::Present,
             (
                 BaseState::Present {
-                    hash: base_hash, ..
+                    version_id: base_version,
+                    ..
                 },
-                RemoteState::Present { hash, .. },
+                RemoteState::Present { version_id, .. },
             ) => {
-                if hash == base_hash {
+                if version_id == base_version {
                     RemoteClass::Unchanged
                 } else {
                     RemoteClass::Modified
@@ -225,7 +239,9 @@ mod tests {
         ContentHash::from_bytes(data)
     }
 
-    // --- 原始形状 as_str ---------------------------------------------------
+    // --- 原始形状 as_str（只有 BaseState 有；LocalState/RemoteState 见其
+    // impl 块顶部 doc comment——同名同签名的 as_str 会吐出非法的 trace 取值，
+    // 已删除，分类词汇由 classify 独占）--------------------------------------
 
     #[test]
     fn base_state_原始形状取值() {
@@ -242,40 +258,28 @@ mod tests {
         );
     }
 
+    // --- 分类词汇：字面量核对 FORMAT.md §10.3 的取值（不用表达式算出来再比，
+    // 否则改了 as_str 实现本身，测试也跟着改，等于自证）---------------------
+
+    /// `LocalClass::as_str()` 的每个变体逐字对照 `FORMAT.md` §10.3 `local` 字段
+    /// 的合法取值。硬编码字符串——回归防线是防止有人把 `"added"` 悄悄改成
+    /// `"new"` 之类，而所有基于「表达式算出来再比」的测试都不会发现。
     #[test]
-    fn local_state_原始形状取值() {
-        assert_eq!(LocalState::Absent.as_str(), "absent");
-        assert_eq!(
-            LocalState::Present {
-                hash: hash(b"a"),
-                size: 1
-            }
-            .as_str(),
-            "present"
-        );
+    fn local_class_as_str_逐字匹配_format_md() {
+        assert_eq!(LocalClass::Absent.as_str(), "absent");
+        assert_eq!(LocalClass::Added.as_str(), "added");
+        assert_eq!(LocalClass::Unchanged.as_str(), "unchanged");
+        assert_eq!(LocalClass::Modified.as_str(), "modified");
     }
 
+    /// 同上，`RemoteClass`。
     #[test]
-    fn remote_state_原始形状取值() {
-        assert_eq!(RemoteState::Absent.as_str(), "absent");
-        assert_eq!(
-            RemoteState::Present {
-                item_id: item_id(1),
-                version_id: version_id(1),
-                hash: hash(b"a"),
-                size: 1,
-            }
-            .as_str(),
-            "present"
-        );
-        assert_eq!(
-            RemoteState::Tombstoned {
-                item_id: item_id(1),
-                version_id: version_id(1),
-            }
-            .as_str(),
-            "tombstoned"
-        );
+    fn remote_class_as_str_逐字匹配_format_md() {
+        assert_eq!(RemoteClass::Absent.as_str(), "absent");
+        assert_eq!(RemoteClass::Present.as_str(), "present");
+        assert_eq!(RemoteClass::Unchanged.as_str(), "unchanged");
+        assert_eq!(RemoteClass::Modified.as_str(), "modified");
+        assert_eq!(RemoteClass::Tombstoned.as_str(), "tombstoned");
     }
 
     // --- 分类词汇 ------------------------------------------------------------
@@ -346,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_classify_基线存在时按哈希比较() {
+    fn remote_classify_基线存在时按版本号比较_不是哈希() {
         let base = BaseState::Present {
             item_id: item_id(1),
             version_id: version_id(1),
@@ -354,22 +358,38 @@ mod tests {
             size: 4,
         };
         assert_eq!(RemoteState::Absent.classify(&base), RemoteClass::Absent);
+        // 版本号相同 → unchanged（哈希理应也相同，version_id 一旦提交即不可变）。
         assert_eq!(
             RemoteState::Present {
                 item_id: item_id(1),
-                version_id: version_id(2),
+                version_id: version_id(1),
                 hash: hash(b"base"),
                 size: 4,
             }
             .classify(&base),
             RemoteClass::Unchanged
         );
+        // 版本号不同、哈希也不同：正常的远端修改。
         assert_eq!(
             RemoteState::Present {
                 item_id: item_id(1),
                 version_id: version_id(2),
                 hash: hash(b"changed"),
                 size: 7,
+            }
+            .classify(&base),
+            RemoteClass::Modified
+        );
+        // 回归测试：死循环的根源——同一份内容被重新上传产生了新版本号，
+        // 哈希与基线一致，但 version_id 不同。按哈希判断会误判成 unchanged；
+        // 必须判定为 modified，才能让 decide 走到「版本推进但内容未变」的
+        // 零传输认领分支，而不是拿着过期 parent 反复提交被拒。
+        assert_eq!(
+            RemoteState::Present {
+                item_id: item_id(1),
+                version_id: version_id(2),
+                hash: hash(b"base"),
+                size: 4,
             }
             .classify(&base),
             RemoteClass::Modified
