@@ -14,8 +14,13 @@
 //! **本切片（M1b）只覆盖三态调和已经真实产出的终态**：[`crate::reconcile::Action::NeedsHuman`]
 //! 与 [`crate::reconcile::Action::Conflict`]。`commit`/`conflict` 落地/`journal` 游标各自的
 //! 错误随对应里程碑增补——不在这里预先造出当前没有任何生产代码会构造的变体（那类变体
-//! 只会是摆设，也没有真实用例能验证分类对不对）。[`crate::reconcile::Decision::into_result`]
+//! 只会是摆设，也没有真实用例能验证分类对不对）。[`crate::reconcile::Decision::into_outcome`]
 //! 是这层映射唯一的生产入口，`tests/decision_table.rs` 对 18 格逐一验证过。
+//! **`CoreError::Conflict` 不代表 `into_outcome` 会对它返回 `Err`**——按
+//! `PROTOCOL.md` §7，`class=protocol` 明确「不作为错误处理」，`into_outcome`
+//! 把它包进 `Ok(Outcome::Conflict(..))`；这里仍然保留 `CoreError::Conflict`
+//! 变体，是因为 `class()`/`code()`/`reason()` 这些访问器对冲突同样有用
+//! （trace、`--json` 输出都要用），只是它不经 `Result::Err` 这条通道传播。
 
 use arca_format::model::ItemId;
 use arca_format::trace::ErrorClass;

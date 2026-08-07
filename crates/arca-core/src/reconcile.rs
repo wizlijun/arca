@@ -140,23 +140,43 @@ impl Decision {
     /// 把决策分流成「继续执行」与「错误」——`crate::error::CoreError` 对
     /// [`Action`] 的映射唯一的生产入口（`crate::error` 模块顶部有说明）。
     ///
-    /// 只有 [`Action::NeedsHuman`] 与 [`Action::Conflict`] 是终态错误：前者是
-    /// I5「模糊必停」，后者是走 M2 结构化冲突流程——都不该被调用方当成
-    /// 「可执行的 IO 步骤」去 `Upload`/`Download` 之类地处理。其余六种动作
-    /// 原样透传为 `Ok`。
-    pub fn into_result(self) -> Result<Action, CoreError> {
+    /// **只有 [`Action::NeedsHuman`] 是 `Err`**（I5「模糊必停」）。
+    /// [`Action::Conflict`] **不是** `Err`——`PROTOCOL.md` §7 对 `class=protocol`
+    /// 的定义原文是「走结构化冲突流程，不作为错误处理」：冲突走 M2 既定的落地
+    /// 流程，不该中止调用方正在跑的整轮 sweep。返回类型选 `Result<Outcome,
+    /// CoreError>` 而不是给旧签名的 `Result<Action, CoreError>` 加一句
+    /// doc comment 警告「`?` 不得用于中止 sweep」，是刻意的：`Outcome::Conflict`
+    /// 必须被显式 `match` 出来才能拿到里面的 `Action`，调用方写
+    /// `decide(..).into_outcome()?` 时只会跳过 `NeedsHuman`，`Conflict` 会
+    /// 摆在 `Ok` 分支里等着被处理——形状本身引导正确用法，比警告注释可靠：
+    /// 注释可以被跳过不读，类型签名不允许被绕过。
+    pub fn into_outcome(self) -> Result<Outcome, CoreError> {
         match self.action {
             Action::NeedsHuman { item_id } => Err(CoreError::NeedsHuman {
                 item_id,
                 reason: self.reason,
             }),
-            Action::Conflict { item_id } => Err(CoreError::Conflict {
+            Action::Conflict { item_id } => Ok(Outcome::Conflict(CoreError::Conflict {
                 item_id,
                 reason: self.reason,
-            }),
-            action => Ok(action),
+            })),
+            action => Ok(Outcome::Proceed(action)),
         }
     }
+}
+
+/// [`Decision::into_outcome`] 分流后的结果——不是错误，是「调用方接下来该做
+/// 什么」的显式两分支。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// 继续执行 IO 的动作（`Noop`/`Upload`/`Download`/`AdoptBaseline`/
+    /// `DeleteLocal`/`TombstoneRemote` 之一——六种非终态动作原样透传）。
+    Proceed(Action),
+    /// 结构化冲突：走 M2 `conflict` 落地流程（命名、actor、时间戳等需要
+    /// sans-io 之外的上下文）。携带的 [`CoreError`] 只是复用它已有的
+    /// `item_id`/`reason`/`class`/`code` 访问器，不代表这是一次失败——
+    /// `class()` 仍然是 `protocol`，不是 `needs_human`。
+    Conflict(CoreError),
 }
 
 /// 三态调和决策表——sans-io 纯函数，客户端与 hub 共用同一段代码。

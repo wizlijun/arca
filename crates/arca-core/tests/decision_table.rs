@@ -15,7 +15,7 @@
 
 use arca_chunk::hash::ContentHash;
 use arca_core::error::CoreError;
-use arca_core::reconcile::{decide, decide_traced, Action, Reason};
+use arca_core::reconcile::{decide, decide_traced, Action, Outcome, Reason};
 use arca_core::state::{BaseState, LocalClass, LocalState, RemoteClass, RemoteState};
 use arca_format::model::{ItemId, VersionId};
 use arca_format::trace::{ErrorClass, EventKind, FieldValue, NullSink, VecSink};
@@ -388,17 +388,18 @@ fn i3_决策表任何一行都不产出销毁语义的动作() {
     }
 }
 
-/// `Decision::into_result`：`NeedsHuman`/`Conflict` 两格转成 `Err`，且 `class()`
-/// 与 brief 的要求逐字相符（`NeedsHuman` 决策 → `needs_human`，`Conflict` 决策 →
-/// `protocol`，不是 `needs_human`——冲突走既定流程，不需要人立刻介入）；
-/// 其余 16 格原样转成 `Ok`，携带与 `decide` 返回的同一个 `Action`。
-/// 这条测试跑在 18 格穷举表上，不是手造几个孤立样例——`CoreError` 的分类
-/// 对不对，靠决策表本身的真实产出验证。
+/// `Decision::into_outcome`：只有 `NeedsHuman` 转成 `Err`（I5：模糊必停）；
+/// `Conflict` 转成 `Ok(Outcome::Conflict(..))`——按 `PROTOCOL.md` §7，
+/// `class=protocol` 明确「不作为错误处理」，走既定流程，不该被 `?` 一带而过
+/// 中止整轮 sweep；`class()` 依旧是 `protocol` 而不是 `needs_human`。
+/// 其余 16 格原样转成 `Ok(Outcome::Proceed(..))`，携带与 `decide` 返回的同一个
+/// `Action`。这条测试跑在 18 格穷举表上，不是手造几个孤立样例——`CoreError`
+/// 的分类对不对，靠决策表本身的真实产出验证。
 #[test]
-fn into_result_把决策表的两个终态转成错误_其余透传() {
+fn into_outcome_只有_needs_human_转成错误_conflict_走显式出口_其余透传() {
     for case in cases() {
         let decision = decide(&case.base, &case.local, &case.remote);
-        let result = decision.clone().into_result();
+        let result = decision.clone().into_outcome();
         match &decision.action {
             Action::NeedsHuman { item_id } => {
                 let err = result.expect_err("行 {} 应转成 Err");
@@ -412,7 +413,10 @@ fn into_result_把决策表的两个终态转成错误_其余透传() {
                 assert_eq!(err.class(), ErrorClass::NeedsHuman, "行 {}", case.label);
             }
             Action::Conflict { item_id } => {
-                let err = result.expect_err("行 {} 应转成 Err");
+                let outcome = result.expect("行 {} 的 Conflict 不该转成 Err");
+                let Outcome::Conflict(err) = outcome else {
+                    panic!("行 {} 应产出 Outcome::Conflict", case.label);
+                };
                 assert_eq!(
                     err,
                     CoreError::Conflict {
@@ -423,9 +427,10 @@ fn into_result_把决策表的两个终态转成错误_其余透传() {
                 assert_eq!(err.class(), ErrorClass::Protocol, "行 {}", case.label);
             }
             _ => {
+                let outcome = result.expect("行 {} 应透传为 Ok");
                 assert_eq!(
-                    result.expect("行 {} 应透传为 Ok"),
-                    case.expected_action,
+                    outcome,
+                    Outcome::Proceed(case.expected_action.clone()),
                     "行 {}",
                     case.label
                 );
