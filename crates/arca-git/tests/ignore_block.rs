@@ -89,7 +89,7 @@ fn 块外用户内容不受影响() {
     std::fs::write(dir.path().join("target/build.o"), b"x").unwrap();
 
     let mut gitignore = "*.log\ntarget/\n".to_string();
-    gitignore = arca_git::ignore_block::upsert(&gitignore, &["assets"]);
+    gitignore = arca_git::ignore_block::upsert(&gitignore, &["assets"]).unwrap();
 
     std::fs::write(dir.path().join(".gitignore"), &gitignore).unwrap();
 
@@ -106,8 +106,8 @@ fn 块外用户内容不受影响() {
 
 #[test]
 fn upsert_幂等_对已有块字节不变() {
-    let once = arca_git::ignore_block::upsert("*.log\n", &["assets", "photo"]);
-    let twice = arca_git::ignore_block::upsert(&once, &["assets", "photo"]);
+    let once = arca_git::ignore_block::upsert("*.log\n", &["assets", "photo"]).unwrap();
+    let twice = arca_git::ignore_block::upsert(&once, &["assets", "photo"]).unwrap();
     assert_eq!(once, twice, "对已有块再跑一次必须产出完全相同的字节");
 }
 
@@ -118,8 +118,8 @@ fn remove_只删块_不影响_check_ignore_的其余判断() {
     std::fs::create_dir_all(dir.path().join("target")).unwrap();
     std::fs::write(dir.path().join("target/build.o"), b"x").unwrap();
 
-    let with_block = arca_git::ignore_block::upsert("target/\n", &["assets"]);
-    let removed = arca_git::ignore_block::remove(&with_block);
+    let with_block = arca_git::ignore_block::upsert("target/\n", &["assets"]).unwrap();
+    let removed = arca_git::ignore_block::remove(&with_block).unwrap();
     assert_eq!(removed, "target/\n", "remove 只删块，块外内容原样保留");
 
     std::fs::write(dir.path().join(".gitignore"), &removed).unwrap();
