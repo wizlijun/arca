@@ -148,6 +148,14 @@ fn checkout_切分支后受管二进制仍在原地() {
 /// 副本」的文件并显著告警，把"删了会丢数据"的窗口从"用户不知情"变成
 /// "用户被明确提示过"。
 ///
+/// 同一条命令顺带还会删掉 `assets/.arca/client/`——这**无害**：`client/` 是
+/// I9 定义的可抛弃投影（本地 SQLite/占位符层等），随时可从 hub 重建，删掉重建
+/// 是一等公民操作而非灾难恢复。真正的风险只在于受管二进制本身没有第二份副本。
+///
+/// `-Xdf`（大写 `X`，只清理被忽略、不清理未追踪的文件）与 `-xdf` 在这件事上
+/// **没有区别**：判据都是"被忽略"，受管二进制照样中招——`-X` 常被当成"只清理
+/// 构建产物"的安全肌肉记忆，这里恰恰是它不安全的一个例子。
+///
 /// 保留本测试（而非删除或弱化断言）作为该风险的可执行证据：一旦 git 未来的
 /// 行为变化，或我们找到别的缓解策略，重新放开即可复核。
 #[test]
@@ -170,8 +178,38 @@ fn git_clean_xdf_不删除受管二进制() {
     assert_eq!(std::fs::read(&bin_path).unwrap(), content);
 }
 
-/// `git stash` 不影响受管二进制（默认不带 `-u`/`-a` 时，stash 只处理已追踪文件的
-/// 改动，未追踪/被忽略的文件原样留在工作树里）。stash 与 pop 都要验证一遍。
+/// `git clean -Xdf`（大写 `X`：只清理**被忽略**的文件，不碰未追踪但未被忽略的
+/// 文件）同样不该删除受管二进制——但实测同样失败，见上面
+/// `git_clean_xdf_不删除受管二进制` 的 doc comment：`-X` 的判据仍然是"被忽略"，
+/// 而这恰恰是 `-X` 最常被当成"安全"（"只清理构建产物"）的场景，实际上并不安全。
+///
+/// 实测（2026-08-08，macOS 本机 git）：`git clean -Xdf` 把 `assets/京都/` 与
+/// `assets/.arca/client/` 一并删除，与 `-xdf` 结果相同（对本仓库布局而言，
+/// 唯一"未被忽略也未追踪"的候选文件不存在，所以 `-x`/`-X` 在这里没有差异）。
+#[test]
+#[ignore = "已知失败：git clean -Xdf 确实会删除受管二进制，判据同样是\"被忽略\"——\
+            见 git_clean_xdf_不删除受管二进制 的 doc comment 与本测试的实测记录。"]
+fn git_clean_大写_xdf_同样不删除受管二进制() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    建仓库(dir);
+    let (bin_path, content) = 布置受管仓库(dir);
+
+    跑(&["clean", "-Xdf"], dir);
+
+    assert!(
+        bin_path.is_file(),
+        "受管二进制不应被 git clean -Xdf 删除，但它已被删除：{}",
+        bin_path.display()
+    );
+    assert_eq!(std::fs::read(&bin_path).unwrap(), content);
+}
+
+/// `git stash` 不影响受管二进制：默认（无 `-u`/`-a`）与 `-u` 都只处理已追踪
+/// 文件的改动，受管二进制（被 `.gitignore` 忽略，不是仅未追踪）原样留在工作树里；
+/// 只有 `-a`（连被忽略的文件也一起 stash）会把它移走——可以 `pop` 找回，
+/// 但移走本身是真实发生的，见 [`stash_带_a_参数会移走受管二进制但_pop_能找回`]。
+/// stash 与 pop 都要验证一遍。
 #[test]
 fn stash_不影响受管二进制() {
     let tmp = tempfile::tempdir().unwrap();
@@ -204,4 +242,60 @@ fn stash_不影响受管二进制() {
         manifest_after_pop.contains("新增.jpg"),
         "stash pop 应当把改动还原回来"
     );
+}
+
+/// 订正此前的文档说法（曾经写作"不带 `-u`/`-a` 时安全"，暗示 `-u` 可能不安全）：
+/// 实测 `-u`（连未追踪文件一起 stash）**同样安全**——受管二进制是被
+/// `.gitignore` **忽略**，不是仅仅"未追踪"，而 `-u` 只额外处理未追踪文件，
+/// 不处理被忽略的文件，因此不会碰它。只有 `-a` 会移走被忽略的文件，见
+/// [`stash_带_a_参数会移走受管二进制但_pop_能找回`]。
+#[test]
+fn stash_带_u_参数时仍不影响受管二进制() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    建仓库(dir);
+    let (bin_path, content) = 布置受管仓库(dir);
+
+    // 额外制造一个真正未追踪（不在 .gitignore 里、也没被 add 过）的文件，
+    // 让 `-u` 有真实的"未追踪文件"可以处理，与"被忽略"的受管二进制形成对照。
+    std::fs::write(dir.join("untracked-note.txt"), b"scratch").unwrap();
+
+    跑(&["stash", "-u", "-q"], dir);
+    assert!(bin_path.is_file(), "git stash -u 后受管二进制必须仍在原地");
+    assert_eq!(std::fs::read(&bin_path).unwrap(), content);
+    // 对照组：真正未追踪的文件应当被 -u 收走。
+    assert!(
+        !dir.join("untracked-note.txt").exists(),
+        "-u 应当收走真正未追踪的文件，证明这条测试确实在跑 -u 语义"
+    );
+
+    跑(&["stash", "pop", "-q"], dir);
+    assert!(bin_path.is_file(), "git stash pop 后受管二进制必须仍在原地");
+    assert_eq!(std::fs::read(&bin_path).unwrap(), content);
+    assert!(
+        dir.join("untracked-note.txt").exists(),
+        "pop 应当把未追踪文件还回来"
+    );
+}
+
+/// `-a`（连被忽略的文件也一起 stash）**会**移走受管二进制——与 `-u` 不同，
+/// `-a` 明确把"被忽略"的文件也纳入 stash 范围。这不是 I3「同步路径无销毁权」
+/// 想挡住的那类事故：`pop` 能把文件原样找回，不是真删；但确认这一点仍然
+/// 值得留一条可执行证据，避免"`-a` 到底会不会动受管二进制"只停留在猜测。
+#[test]
+fn stash_带_a_参数会移走受管二进制但_pop_能找回() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    建仓库(dir);
+    let (bin_path, content) = 布置受管仓库(dir);
+
+    跑(&["stash", "-a", "-q"], dir);
+    assert!(
+        !bin_path.exists(),
+        "-a 会把被忽略的文件也一起移走，这里的 bin_path 理应不存在了"
+    );
+
+    跑(&["stash", "pop", "-q"], dir);
+    assert!(bin_path.is_file(), "git stash pop 必须把受管二进制原样找回");
+    assert_eq!(std::fs::read(&bin_path).unwrap(), content);
 }
