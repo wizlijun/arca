@@ -170,6 +170,15 @@ pub fn read_all(root: &StorageRoot) -> Result<(Option<Cursor>, Vec<JournalEvent>
     Ok((Some(Cursor { epoch, seq }), events))
 }
 
+/// 下一个应该使用的 `seq`——当前完整事件流的游标 + 1（没有任何历史事件时
+/// 为 1）。[`append`] 内部会做同样的推导并校验调用方传入的 `event.seq`
+/// 是否与之相符；这个函数供调用方（`sync.rs::execute_tombstone`、
+/// `trash.rs::restore`）提前算出正确值，不必各自重新实现"读游标再加一"。
+pub fn next_seq(root: &StorageRoot) -> Result<u64, JournalError> {
+    let (cursor, _events) = read_all(root)?;
+    Ok(cursor.map(|c| c.seq + 1).unwrap_or(1))
+}
+
 /// 追加一条 journal 事件：整行原子落盘，写完 fsync（经 [`arca_store::atomic::write`]
 /// 的完整持久化事务链）。
 ///
@@ -269,6 +278,19 @@ mod tests {
         let (cursor, events) = read_all(&root).unwrap();
         assert_eq!(cursor, None);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn next_seq在没有历史事件时为1_追加后依次递增() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+
+        assert_eq!(next_seq(&root).unwrap(), 1);
+        append(&root, &样例事件(1, "a.png")).unwrap();
+        assert_eq!(next_seq(&root).unwrap(), 2);
+        append(&root, &样例事件(2, "b.png")).unwrap();
+        assert_eq!(next_seq(&root).unwrap(), 3);
     }
 
     #[test]
