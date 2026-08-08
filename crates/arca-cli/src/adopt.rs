@@ -344,6 +344,7 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: Some(&format!("file://{}", root_path.display())),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap();
@@ -607,6 +608,7 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: Some(&format!("file://{}", root_path.display())),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap();
@@ -647,6 +649,7 @@ mod tests {
                 hub_instance_id: Some(&hub_instance_id),
                 hub_url: Some(&format!("file://{}", root_path.display())),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap();

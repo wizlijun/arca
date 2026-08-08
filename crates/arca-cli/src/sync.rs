@@ -51,7 +51,9 @@
 //! `RemoteState::Present`，`trash::move_to_trash` 因此总能找到源文件，这个
 //! 桶目前恒空，但类型上保留，供未来加发起侧闸门时使用）。
 
+use crate::transport::{CommitOutcome, CommitRequest, RenameRequest, TombstoneRequest, Transport};
 use crate::{baseline, clock, gates, hub, ids, journal, scan, trash, vault};
+use arca_chunk::hash::ContentHash;
 use arca_core::reconcile::{decide_traced, Action};
 use arca_core::state::{BaseState, LocalState, RemoteState};
 use arca_format::hub_layout::layout;
@@ -63,7 +65,7 @@ use arca_format::path_rules;
 use arca_format::trace::TraceSink;
 use arca_store::atomic::{self, AtomicError, Batch};
 use arca_store::root::StorageRoot;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -98,6 +100,11 @@ pub struct SyncReport {
     pub scan_rejected: Vec<(String, scan::RejectReason)>,
     /// 本次运行是否因为基线缺失/损坏而整体重置（触发了一次全量对账）。
     pub baseline_reset: bool,
+    /// 本轮检测并提交的改名（`(旧路径, 新路径)`）——**只有 [`sync_transport`]
+    /// 会填充这个字段**（M2c Task 5：`sync()`/`file://` 路径本切片不变，
+    /// 见 `sync_transport` 模块文档「与 `sync()` 的关系」）；`item_id` 原样
+    /// 延续（I7），不产生新版本。
+    pub renamed: Vec<(String, String)>,
 }
 
 impl SyncReport {
@@ -120,6 +127,7 @@ impl SyncReport {
             || !self.adopted.is_empty()
             || !self.deleted_local.is_empty()
             || !self.tombstone_submitted.is_empty()
+            || !self.renamed.is_empty()
     }
 }
 
@@ -140,6 +148,11 @@ pub enum SyncError {
         path: String,
         reason: String,
     },
+    /// **仅 [`sync_transport`]**（M2c Task 5）：`Transport` 操作失败——网络
+    /// 故障/协议错误/数据集离线，`class()` 已经把这三者分开
+    /// （`crate::transport::TransportError::class`），调用方（命令壳）据此
+    /// 决定重试/停下/报告 bug。
+    Transport(crate::transport::TransportError),
 }
 
 impl fmt::Display for SyncError {
@@ -153,6 +166,7 @@ impl fmt::Display for SyncError {
             SyncError::Trash(e) => write!(f, "{e}"),
             SyncError::Journal(e) => write!(f, "{e}"),
             SyncError::Io { path, reason } => write!(f, "{path}：{reason}"),
+            SyncError::Transport(e) => write!(f, "{e}"),
         }
     }
 }
@@ -683,6 +697,536 @@ fn rfc3339_from_systemtime(t: std::time::SystemTime) -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     clock::rfc3339_from_unix_secs(secs as i64)
+}
+
+// =============================================================================
+// sync_transport：`Transport` 泛化的同步引擎（M2c Task 5）
+// =============================================================================
+//
+// # 与 `sync()` 的关系
+//
+// `sync()`（本文件顶部）直接摸 `&StorageRoot`，走 `arca_store::atomic::Batch`/
+// `journal::AppendBatch` 把一整轮的存储根写入收口到一次 fsync——这是刻意的
+// 性能设计（M1d 批量归档），只有本地磁盘才谈得上"批量收口"这件事本身。
+// `arca adopt` 内部仍然调用 `sync()`（保持 `file://`-only，不变，见
+// `adopt.rs`）；本节新增的 [`sync_transport`] 是 `arca sync` 命令壳
+// （`commands/porcelain.rs::sync_cmd`）**面向未来全部 hub**的同步入口——
+// `file://` 经 `transport::local::LocalTransport`，`http://` 经
+// `transport::http::HttpTransport`，两者共享同一份决策/执行逻辑。
+//
+// 这不是简单的"把 `sync()` 泛化成 `<T: Transport>`"：`Transport::commit`
+// 每次调用各自加锁、各自一次 CAS 临界区（面向 HTTP 的一次 `PUT` 语义），
+// 不是 `sync()` 里"整轮收口成一次 fsync"那种批处理——`sync_transport` 因此
+// 没有 `Batch`/`AppendBatch`，每个 `Action` 对应一次独立的 `Transport` 调用，
+// 网络场景下这是正确的性能形状（HTTP 无法把"多次写入合并成一次系统调用"），
+// 本地场景下多付的是"每个文件一次 `arca.lock` 获取/释放"的开销，不是正确性
+// 代价（`LocalTransport::commit`/`tombstone`/`rename` 都各自持有跨进程锁）。
+//
+// # 改名检测：客户端启发式，不进 `arca-core` 决策表
+//
+// `arca_core::reconcile::decide` 是逐路径独立判断的三态调和表（spec 设计
+// 如此，`arca-core` 本切片未改一行——见 CLAUDE.md「架构约束」）：它不产生
+// "改名"这个动作，也不该产生——识别"路径 A 消失、路径 B 以相同内容出现"
+// 需要跨路径比较，不是任何单个路径的三态能表达的判断。改名的检测因此完全
+// 留在这里（[`detect_renames`]），检测到之后才调用
+// [`Transport::rename`]（见其文档「为什么需要这第三个写入原语」）；检测
+// 不到（没有消失的路径、消失的内容没有对应的新路径、匹配有歧义）时，
+// 两条路径各自照常走 `decide()` 的常规决策（旧路径 `TombstoneRemote`，
+// 新路径 `Upload{parent:None}`）——退化行为完全等同于"没有改名检测"这个
+// 功能不存在时的表现，不会因为检测失败就卡住整轮同步。
+pub fn sync_transport<T: Transport>(
+    dataset_root: &Path,
+    transport: &T,
+    actor: &SyncActor,
+    sink: &mut dyn TraceSink,
+) -> Result<SyncReport, SyncError> {
+    let scan_result = scan::scan_dataset(dataset_root, sink).map_err(SyncError::Scan)?;
+    let mut baseline = baseline::load(dataset_root).map_err(SyncError::Baseline)?;
+    let baseline_reset = baseline.was_reset();
+    let remote = transport.read_remote().map_err(SyncError::Transport)?;
+
+    let mut report = SyncReport {
+        scan_rejected: scan_result.rejected.clone(),
+        baseline_reset,
+        ..SyncReport::default()
+    };
+
+    // 闸门第 1 道（read_roots 范围）——与 `sync()` 同一条纪律，见其文档
+    // 同名注释。
+    let scanned_paths: BTreeSet<String> = scan_result.files.keys().cloned().collect();
+
+    // --- 改名：检测 + 提交（先于常规决策循环，见模块文档） -----------------
+    let renames = detect_renames(&scan_result, &baseline, &remote);
+    let mut handled: BTreeSet<String> = BTreeSet::new();
+    for (old_path, new_path) in renames {
+        let base = baseline.get(&old_path);
+        let BaseState::Present {
+            item_id,
+            version_id: parent,
+            ..
+        } = base
+        else {
+            // `detect_renames` 只会给出 baseline 里确实是 Present 的旧路径
+            // ——这个分支结构上不可达，写出来是防御性的（I5：绝不假装
+            // 一个不可能状态能被安全忽略），不静默跳过。
+            return Err(SyncError::Io {
+                path: old_path.clone(),
+                reason: "detect_renames 给出的旧路径在 baseline 里不是 Present（不可能状态）"
+                    .to_string(),
+            });
+        };
+        let at = clock::now_rfc3339();
+        let outcome = transport
+            .rename(&RenameRequest {
+                old_path: old_path.clone(),
+                new_path: new_path.clone(),
+                item_id,
+                parent: parent.clone(),
+                actor: actor.clone(),
+                at,
+            })
+            .map_err(SyncError::Transport)?;
+        match outcome {
+            CommitOutcome::Committed {
+                item_id,
+                version_id,
+            } => {
+                let hash = match baseline.get(&old_path) {
+                    BaseState::Present { hash, size, .. } => Some((hash, size)),
+                    BaseState::Absent => None,
+                };
+                let Some((hash, size)) = hash else {
+                    unreachable!("上面已经匹配过 Present，这里必然仍是 Present")
+                };
+                baseline.remove(&old_path);
+                baseline.set(
+                    new_path.clone(),
+                    BaseState::Present {
+                        item_id,
+                        version_id,
+                        hash,
+                        size,
+                    },
+                );
+                report.renamed.push((old_path.clone(), new_path.clone()));
+                handled.insert(old_path);
+                handled.insert(new_path);
+            }
+            // 改名这一步的 CAS/身份校验没过——多半是另一端已经先动过这两个
+            // 路径之一。不特殊处理、不当作错误：把这两个路径原样丢回常规
+            // 决策循环，`decide()` 会按它们各自此刻的三态给出恰当的
+            // Upload/TombstoneRemote/Conflict，安全但退化成"没有改名检测"
+            // 的行为（模块文档「改名检测」一节）。
+            CommitOutcome::Conflict { .. } | CommitOutcome::IdentityMismatch { .. } => {}
+        }
+    }
+
+    // --- 改名：接收端识别（对称的另一半，见 `detect_remote_renames` 文档） --
+    //
+    // 上面那段是"这台设备发起了改名，提交给 hub"；这里是"hub 上已经发生过
+    // 一次改名（另一台设备提交的），这台设备如何在本地体现它"。不做这一步
+    // 的后果：接收端会把旧路径读成 `RemoteState::Absent`（`hub::read_remote`
+    // 不从 `Op::Rename` 事件推导任何状态，只有 `Op::Tombstone` 才产出
+    // `Tombstoned`）——`decide()` 面对"基线说存在、本地也存在、远端却凭空
+    // 消失"只能给出 `reconcile.needs_human`（`remote_vanished_without_tombstone`，
+    // I5：不能把"消失"猜成"删除"），新路径则被当成普通新增走一次
+    // `Download`——功能上不算错（数据不会丢，item_id 仍然正确、可以从 hub
+    // 侧核对），但用户体验是"多了一个需要人工介入的告警 + 一次不必要的
+    // 下载"，不是「另一端 sync 后也改名」这个直觉结果。
+    // `handled` 传进去过滤——上面那段"本地发起"的改名已经就地更新了
+    // `baseline`（旧路径删、新路径加），但 `remote` 仍是本轮开头读到的
+    // 那份快照（还没反映刚提交的改名）；不排除 `handled` 里的路径的话，
+    // `detect_remote_renames` 会把"我们自己刚提交的改名"错误地在同一轮
+    // 里识别成"反向的远端改名"（用陈旧的 `remote` 快照与刚更新的
+    // `baseline` 互相印证，得到一个方向相反的假阳性）。
+    let remote_renames = detect_remote_renames(&scan_result, &baseline, &remote, &handled);
+    for (old_path, new_path) in remote_renames {
+        let old_local = dataset_root.join(to_native(&old_path));
+        let new_local = dataset_root.join(to_native(&new_path));
+        if let Some(parent) = new_local.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_err(&new_local, e))?;
+        }
+        match fs::rename(&old_local, &new_local) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // 本地旧文件在检测之后、改名之前的这一瞬间被外部动过——
+                // 极窄的竞态窗口，不构成数据风险：跳过这一对，留给下一轮
+                // `sync_transport` 重新判断（那时 `scan_dataset` 会看到
+                // 新的本地状态），不是本函数需要在这里补救的情形。
+                continue;
+            }
+            Err(e) => return Err(io_err(&new_local, e)),
+        }
+        let (item_id, version_id, hash, size) = match remote.get(&new_path) {
+            Some(RemoteState::Present {
+                item_id,
+                version_id,
+                hash,
+                size,
+            }) => (*item_id, version_id.clone(), *hash, *size),
+            other => unreachable!(
+                "detect_remote_renames 只会给出 remote 里确实是 Present 的新路径，实得 {other:?}"
+            ),
+        };
+        baseline.remove(&old_path);
+        baseline.set(
+            new_path.clone(),
+            BaseState::Present {
+                item_id,
+                version_id,
+                hash,
+                size,
+            },
+        );
+        report.renamed.push((old_path.clone(), new_path.clone()));
+        handled.insert(old_path);
+        handled.insert(new_path);
+    }
+
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    paths.extend(scan_result.files.keys().cloned());
+    paths.extend(baseline.iter().map(|(p, _)| p.clone()));
+    paths.extend(remote.keys().cloned());
+    paths.retain(|p| !handled.contains(p));
+
+    for (idx, path) in paths.iter().enumerate() {
+        let base = baseline.get(path);
+        let local = scan_result
+            .files
+            .get(path)
+            .cloned()
+            .unwrap_or(LocalState::Absent);
+        let remote_state = remote.get(path).cloned().unwrap_or(RemoteState::Absent);
+
+        let decision = decide_traced(&base, &local, &remote_state, path, idx as u64, sink);
+
+        match decision.action {
+            Action::Noop => {}
+
+            Action::Upload { parent } => {
+                let local_path = dataset_root.join(to_native(path));
+                let bytes = fs::read(&local_path).map_err(|e| io_err(&local_path, e))?;
+                let hash = ContentHash::from_bytes(&bytes);
+                let size = bytes.len() as u64;
+                let item_id = match &parent {
+                    None => ids::new_item_id(),
+                    Some(_) => base.item_id().or_else(|| remote_state.item_id()).expect(
+                        "Upload{parent:Some(_)} 意味着 base 或 remote 至少一方已知这个 item",
+                    ),
+                };
+                let version_id = ids::new_version_id();
+                let mtime = fs::metadata(&local_path)
+                    .and_then(|m| m.modified())
+                    .map(rfc3339_from_systemtime)
+                    .unwrap_or_else(|_| clock::now_rfc3339());
+                let outcome = transport
+                    .commit(&CommitRequest {
+                        path: path.clone(),
+                        item_id,
+                        version_id: version_id.clone(),
+                        parent,
+                        bytes,
+                        mtime,
+                        actor: actor.clone(),
+                    })
+                    .map_err(SyncError::Transport)?;
+                match outcome {
+                    CommitOutcome::Committed {
+                        item_id,
+                        version_id,
+                    } => {
+                        baseline.set(
+                            path.clone(),
+                            BaseState::Present {
+                                item_id,
+                                version_id,
+                                hash,
+                                size,
+                            },
+                        );
+                        report.uploaded.push(path.clone());
+                    }
+                    // 提交时刻才发现的 CAS 冲突——`decide()` 用的是循环开始
+                    // 时读到的那份 `remote` 快照，两机并发写同一路径时，
+                    // 对方可能恰好在这中间提交成功。**不更新基线**：下一轮
+                    // `decide()` 会用（仍然是旧的）基线 + 本地内容 + 这一次
+                    // 已经变化的远端内容重新判断，落进
+                    // `both_new_divergent`/`three_way_divergent` 的常规
+                    // Conflict 分支——双方各自的内容都原封不动（远端已提交
+                    // 的版本没被覆盖，本地文件也没被覆盖），这正是「双版本
+                    // 并存、绝不静默覆盖」（spec §5.3）在 CAS 冲突这条路径
+                    // 上的落地，不需要额外发明"冲突副本"机制。
+                    CommitOutcome::Conflict { .. } => {
+                        report.conflicts.push(path.clone());
+                    }
+                    // 身份校验没过（item_id 已被别的路径占用，或已被
+                    // tombstone 终结）——状态模糊，按 I5 停下等人，不猜测
+                    // 该怎么处理。
+                    CommitOutcome::IdentityMismatch { .. } => {
+                        report.needs_human.push(path.clone());
+                    }
+                }
+            }
+
+            Action::Download { version_id } => {
+                let _ = &version_id; // 语义同 `execute_download`，见其文档。
+                let local_path = dataset_root.join(to_native(path));
+                let (item_id, new_version_id, hash, size) = match &remote_state {
+                    RemoteState::Present {
+                        item_id,
+                        version_id,
+                        hash,
+                        size,
+                    } => (*item_id, version_id.clone(), *hash, *size),
+                    other => unreachable!("Download 只在 remote 是 Present 时产生，实得 {other:?}"),
+                };
+                // 与 `execute_download` 同一条 fsync 纪律（M2a Task 1）：
+                // `atomic::write_local` 负责 tmp → fsync → rename → fsync
+                // 父目录的原子提交链；内容本身经
+                // `Transport::read_content`——它的流式实现
+                // （`read_content_into`）已经保证 `Transport` 这一侧（读取
+                // 网络响应体/本地文件）不整份缓冲（服务端 C2 的镜像，见
+                // `transport::http::HttpTransport` 模块文档），`arca-cli`
+                // 没有能替代 `write_local(bytes: &[u8])` 的流式落盘原语
+                // （那需要一个不依赖 `tempfile`——它只是 dev-dependency——
+                // 的客户端侧临时文件方案，超出本切片范围，与 `execute_download`
+                // 现有实现的内存特征完全一致，不是本切片引入的新缺口）。
+                let bytes = transport.read_content(path).map_err(SyncError::Transport)?;
+                atomic::write_local(dataset_root, &local_path, &bytes)
+                    .map_err(SyncError::Atomic)?;
+                baseline.set(
+                    path.clone(),
+                    BaseState::Present {
+                        item_id,
+                        version_id: new_version_id,
+                        hash,
+                        size,
+                    },
+                );
+                report.downloaded.push(path.clone());
+            }
+
+            Action::AdoptBaseline { hash, version_id } => {
+                let item_id = remote_state
+                    .item_id()
+                    .expect("AdoptBaseline 只在 remote 已知该 item 时产生");
+                let size = match &local {
+                    LocalState::Present { size, .. } => *size,
+                    LocalState::Absent => unreachable!(
+                        "AdoptBaseline 的全部决策表分支都要求 local 是 Present（见 arca_core::reconcile）"
+                    ),
+                };
+                baseline.set(
+                    path.clone(),
+                    BaseState::Present {
+                        item_id,
+                        version_id,
+                        hash,
+                        size,
+                    },
+                );
+                report.adopted.push(path.clone());
+            }
+
+            Action::DeleteLocal { item_id } => {
+                let check = gates::DeleteCheckTransport {
+                    path,
+                    item_id,
+                    scanned_paths: &scanned_paths,
+                    remote_state: &remote_state,
+                    dataset_root,
+                    base: &base,
+                    transport,
+                };
+                match gates::check_delete_transport(&check) {
+                    Ok(()) => {
+                        let local_path = dataset_root.join(to_native(path));
+                        match fs::remove_file(&local_path) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(io_err(&local_path, e)),
+                        }
+                        baseline.remove(path);
+                        report.deleted_local.push(path.clone());
+                    }
+                    Err(failure) => {
+                        report.delete_blocked.push((path.clone(), failure));
+                    }
+                }
+            }
+
+            Action::TombstoneRemote { item_id, parent } => {
+                let at = clock::now_rfc3339();
+                let outcome = transport
+                    .tombstone(&TombstoneRequest {
+                        path: path.clone(),
+                        item_id,
+                        parent,
+                        actor: actor.clone(),
+                        at,
+                    })
+                    .map_err(SyncError::Transport)?;
+                match outcome {
+                    CommitOutcome::Committed { .. } => {
+                        baseline.remove(path);
+                        report.tombstone_submitted.push(path.clone());
+                    }
+                    CommitOutcome::Conflict { .. } => {
+                        report.conflicts.push(path.clone());
+                    }
+                    CommitOutcome::IdentityMismatch { .. } => {
+                        report.needs_human.push(path.clone());
+                    }
+                }
+            }
+
+            Action::Conflict { .. } => {
+                report.conflicts.push(path.clone());
+            }
+
+            Action::NeedsHuman { .. } => {
+                report.needs_human.push(path.clone());
+            }
+        }
+    }
+
+    baseline.save(dataset_root).map_err(SyncError::Baseline)?;
+    write_manifest(dataset_root, &baseline)?;
+
+    Ok(report)
+}
+
+/// 改名检测：内容哈希匹配的"消失路径 ↔ 新增路径"配对，**唯一匹配才算数**
+/// （I5：绝不猜测）——同一份内容在这一轮里有多处消失、或多处新增，任何一种
+/// 歧义都直接放弃把它们当作改名处理，退回常规的 tombstone+upload 路径
+/// （模块文档「改名检测」一节）。
+///
+/// "消失"的判定同时要求 **hub 侧仍然认得这个 item 的这个版本**
+/// （`remote.get(old_path)` 与 baseline 记录的 item_id/version_id 一致）：
+/// 如果远端已经不是我们认识的状态（被别的设备删除/修改过），说明这不是
+/// 单纯的本地改名，是需要走常规调和（很可能落进 Conflict/TombstoneRemote）
+/// 的场景，不应该被 rename 检测抢先接管。
+fn detect_renames(
+    scan_result: &scan::ScanResult,
+    baseline: &baseline::Baseline,
+    remote: &BTreeMap<String, RemoteState>,
+) -> Vec<(String, String)> {
+    use std::collections::HashMap;
+
+    let mut vanished: HashMap<ContentHash, Vec<String>> = HashMap::new();
+    for (path, state) in baseline.iter() {
+        let BaseState::Present {
+            item_id,
+            version_id,
+            hash,
+            ..
+        } = state
+        else {
+            continue;
+        };
+        if scan_result.files.contains_key(path) {
+            continue; // 本地还在，不是"消失"。
+        }
+        match remote.get(path) {
+            Some(RemoteState::Present {
+                item_id: r_item,
+                version_id: r_version,
+                ..
+            }) if *r_item == *item_id && r_version == version_id => {
+                vanished.entry(*hash).or_default().push(path.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let mut appeared: HashMap<ContentHash, Vec<String>> = HashMap::new();
+    for (path, local) in &scan_result.files {
+        let LocalState::Present { hash, .. } = local else {
+            continue;
+        };
+        if baseline.get(path) != BaseState::Absent {
+            continue; // baseline 里已经有记录——不是"全新出现"的路径。
+        }
+        appeared.entry(*hash).or_default().push(path.clone());
+    }
+
+    let mut renames: Vec<(String, String)> = Vec::new();
+    for (hash, olds) in vanished {
+        let [old_path] = olds.as_slice() else {
+            continue; // 同一内容多处消失——歧义，不猜。
+        };
+        let Some(news) = appeared.get(&hash) else {
+            continue;
+        };
+        let [new_path] = news.as_slice() else {
+            continue; // 同一内容多处新增——歧义，不猜。
+        };
+        renames.push((old_path.clone(), new_path.clone()));
+    }
+    renames.sort();
+    renames
+}
+
+/// 改名检测的接收端一半——对称于 [`detect_renames`]（那是"本地发起"），
+/// 这里识别"hub 上已经发生过一次改名，这台设备该怎么在本地体现它"：
+/// 旧路径本地内容原封未动（与基线一致，没有本地独立修改）、但 hub 侧那个
+/// item_id/version_id 现在挂在另一个路径下——这就是同一个改名事件从
+/// 接收端看到的样子，不需要下载任何字节（内容本来就在本地），只需要一次
+/// 本地 `fs::rename`。**唯一匹配才算数**（I5：同一条规则，见
+/// [`detect_renames`] 文档）：一个 item_id/version_id 在 `remote` 里只可能
+/// 出现在一个路径下（`local.rs::commit`/`rename` 的身份校验保证这一点），
+/// 所以这里不会有"同一 item 多个候选新路径"的歧义，但新路径本地若已经被
+/// 别的内容占用，仍然放弃，交给常规决策处理。
+fn detect_remote_renames(
+    scan_result: &scan::ScanResult,
+    baseline: &baseline::Baseline,
+    remote: &BTreeMap<String, RemoteState>,
+    handled: &BTreeSet<String>,
+) -> Vec<(String, String)> {
+    let mut renames: Vec<(String, String)> = Vec::new();
+    for (old_path, base) in baseline.iter() {
+        if handled.contains(old_path) {
+            continue; // 本轮已经被"本地发起改名"处理过，见调用点注释。
+        }
+        let BaseState::Present {
+            item_id,
+            version_id,
+            hash,
+            ..
+        } = base
+        else {
+            continue;
+        };
+        // 本地内容必须与基线一致（没有独立的本地修改）——否则本地这一侧
+        // 也在变化，不能让"远端改名"这个判断悄悄吞掉本地的修改，交给常规
+        // 冲突/上传路径处理。
+        match scan_result.files.get(old_path) {
+            Some(LocalState::Present { hash: h, .. }) if h == hash => {}
+            _ => continue,
+        }
+        // 远端此刻这个路径必须已经不在（否则不是"消失"，是别的场景）。
+        if matches!(remote.get(old_path), Some(RemoteState::Present { .. })) {
+            continue;
+        }
+        let Some(new_path) = remote.iter().find_map(|(p, s)| match s {
+            RemoteState::Present {
+                item_id: i,
+                version_id: v,
+                ..
+            } if i == item_id && v == version_id && p != old_path && !handled.contains(p) => {
+                Some(p)
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        if scan_result.files.contains_key(new_path) {
+            continue; // 本地已经有内容占着这个新路径——不覆盖，交给常规决策。
+        }
+        renames.push((old_path.clone(), new_path.clone()));
+    }
+    renames.sort();
+    renames
 }
 
 #[cfg(test)]
@@ -1370,6 +1914,176 @@ mod tests {
         assert!(
             baseline.get("c.bin") == arca_core::state::BaseState::Absent,
             "报错路径上绝不能把基线写成已同步"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // M2c Task 5：sync_transport（`Transport` 泛化引擎，用 `LocalTransport`
+    // 验证——`HttpTransport` 走的是同一份代码路径，两机端到端演示另外用
+    // 真实 `arcad` 进程验证网络这一层，这里只验证决策/执行逻辑本身）。
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sync_transport_本地新增文件被上传() {
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        fs::write(dataset.path().join("a.txt"), b"hello").unwrap();
+
+        let root = open_root(store.path());
+        let transport = crate::transport::local::LocalTransport::new(&root);
+        let mut sink = NullSink;
+        let report = sync_transport(dataset.path(), &transport, &actor(), &mut sink).unwrap();
+
+        assert_eq!(report.uploaded, vec!["a.txt".to_string()]);
+        assert!(report.is_clean());
+        assert!(store.path().join("files/a.txt").is_file());
+    }
+
+    #[test]
+    fn sync_transport_远端新增被下载() {
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        let root = open_root(store.path());
+        let transport = crate::transport::local::LocalTransport::new(&root);
+        let mut sink = NullSink;
+
+        let seed = tempfile::tempdir().unwrap();
+        fs::write(seed.path().join("b.txt"), b"remote content").unwrap();
+        sync_transport(seed.path(), &transport, &actor(), &mut sink).unwrap();
+
+        let dataset = tempfile::tempdir().unwrap();
+        let report = sync_transport(dataset.path(), &transport, &actor(), &mut sink).unwrap();
+        assert_eq!(report.downloaded, vec!["b.txt".to_string()]);
+        assert!(report.is_clean());
+        assert_eq!(
+            fs::read(dataset.path().join("b.txt")).unwrap(),
+            b"remote content"
+        );
+    }
+
+    /// I7 核心验证：本地 `mv old new`（对 arca 而言就是"旧路径消失、新路径
+    /// 以相同内容出现"）之后跑 `sync_transport`，`item_id` 必须原样延续，
+    /// 不能因为改名而分配了一个新身份。
+    #[test]
+    fn sync_transport_本地改名被检测并提交_item_id不变() {
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        fs::write(dataset.path().join("old.txt"), b"same bytes").unwrap();
+
+        let root = open_root(store.path());
+        let transport = crate::transport::local::LocalTransport::new(&root);
+        let mut sink = NullSink;
+        sync_transport(dataset.path(), &transport, &actor(), &mut sink).unwrap();
+
+        let item_id_before = match crate::hub::read_remote(&root).unwrap().get("old.txt") {
+            Some(RemoteState::Present { item_id, .. }) => *item_id,
+            other => panic!("应为 Present，实得 {other:?}"),
+        };
+
+        // 真实改名：`mv old.txt new.txt`（内容字节不变）。
+        fs::rename(
+            dataset.path().join("old.txt"),
+            dataset.path().join("new.txt"),
+        )
+        .unwrap();
+
+        let report = sync_transport(dataset.path(), &transport, &actor(), &mut sink).unwrap();
+        assert_eq!(
+            report.renamed,
+            vec![("old.txt".to_string(), "new.txt".to_string())]
+        );
+        assert!(report.is_clean());
+        // 不应该被误判成"删除旧的 + 新增一个新身份"。
+        assert!(report.tombstone_submitted.is_empty());
+        assert!(report.uploaded.is_empty());
+
+        let remote = crate::hub::read_remote(&root).unwrap();
+        assert!(!remote.contains_key("old.txt"));
+        match remote.get("new.txt") {
+            Some(RemoteState::Present { item_id, .. }) => {
+                assert_eq!(*item_id, item_id_before, "I7：item_id 必须跨改名稳定");
+            }
+            other => panic!("应为 Present，实得 {other:?}"),
+        }
+
+        // 基线也要跟着改名——不是"旧路径删了、新路径当新文件认领"。
+        let baseline = crate::baseline::load(dataset.path()).unwrap();
+        assert_eq!(baseline.get("old.txt"), BaseState::Absent);
+        assert!(matches!(baseline.get("new.txt"), BaseState::Present { .. }));
+    }
+
+    #[test]
+    fn sync_transport_本地删除传播为远端tombstone() {
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        fs::write(dataset.path().join("e.txt"), b"content").unwrap();
+
+        let root = open_root(store.path());
+        let transport = crate::transport::local::LocalTransport::new(&root);
+        let mut sink = NullSink;
+        sync_transport(dataset.path(), &transport, &actor(), &mut sink).unwrap();
+
+        fs::remove_file(dataset.path().join("e.txt")).unwrap();
+        let report = sync_transport(dataset.path(), &transport, &actor(), &mut sink).unwrap();
+
+        assert_eq!(report.tombstone_submitted, vec!["e.txt".to_string()]);
+        assert!(report.is_clean());
+        let remote = crate::hub::read_remote(&root).unwrap();
+        assert!(matches!(
+            remote.get("e.txt"),
+            Some(RemoteState::Tombstoned { .. })
+        ));
+    }
+
+    /// 两台设备各自通过 `sync_transport` 同步到同一个存储根，验证
+    /// upload/download/rename/tombstone 全部经由同一份 `Transport` 泛化
+    /// 代码路径串联起来，与 `LocalTransport` 已有的 file:// 行为一致。
+    #[test]
+    fn sync_transport_两台设备端到端_上传_下载_改名_删除() {
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        let root = open_root(store.path());
+        let transport = crate::transport::local::LocalTransport::new(&root);
+        let mut sink = NullSink;
+
+        let device_a = tempfile::tempdir().unwrap();
+        fs::write(device_a.path().join("photo.png"), b"bytes").unwrap();
+        sync_transport(device_a.path(), &transport, &actor(), &mut sink).unwrap();
+
+        let device_b = tempfile::tempdir().unwrap();
+        let report_b1 = sync_transport(device_b.path(), &transport, &actor(), &mut sink).unwrap();
+        assert_eq!(report_b1.downloaded, vec!["photo.png".to_string()]);
+
+        // 设备甲改名。
+        fs::rename(
+            device_a.path().join("photo.png"),
+            device_a.path().join("renamed.png"),
+        )
+        .unwrap();
+        let report_a2 = sync_transport(device_a.path(), &transport, &actor(), &mut sink).unwrap();
+        assert_eq!(
+            report_a2.renamed,
+            vec![("photo.png".to_string(), "renamed.png".to_string())]
+        );
+
+        // 设备乙同步：`detect_remote_renames`（接收端一半）识别出"旧路径
+        // 本地内容原封未动、item_id/version_id 现在挂在新路径下"，本地做
+        // 一次 `fs::rename`，零传输——不下载、不走 tombstone+DeleteLocal
+        // 这条更笨拙但结果相同的路径。
+        let report_b2 = sync_transport(device_b.path(), &transport, &actor(), &mut sink).unwrap();
+        assert_eq!(
+            report_b2.renamed,
+            vec![("photo.png".to_string(), "renamed.png".to_string())]
+        );
+        assert!(report_b2.downloaded.is_empty());
+        assert!(report_b2.deleted_local.is_empty());
+        assert!(!device_b.path().join("photo.png").exists());
+        assert_eq!(
+            fs::read(device_b.path().join("renamed.png")).unwrap(),
+            b"bytes"
         );
     }
 }

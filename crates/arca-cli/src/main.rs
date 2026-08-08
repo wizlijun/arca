@@ -52,6 +52,12 @@ enum Command {
         /// hub 是新建的且未给 --hub-url 时，从这个路径推导 file:// 地址
         #[arg(long)]
         root: Option<std::path::PathBuf>,
+        /// 新建 dataset.toml 时用它代替随机生成的 dataset_id——"加入一个
+        /// 已经在 hub 上存在的数据集"时用它声明已知的 id（M2c Task 5，两机
+        /// 端到端场景：第二台设备必须用第一台设备 adopt 时分配到的同一个
+        /// dataset_id，不能各自随机生成两个互不相干的 id）
+        #[arg(long = "dataset-id")]
+        dataset_id: Option<String>,
     },
     /// 就地纳管一个已登记的数据集：算哈希、上传、写 .gitignore 块（文件原地不动）
     Adopt {
@@ -202,12 +208,14 @@ fn main() -> std::process::ExitCode {
             hub_instance_id,
             hub_url,
             root,
+            dataset_id,
         } => commands::porcelain::register_cmd(
             &path,
             &hub,
             hub_instance_id.as_deref(),
             hub_url.as_deref(),
             root.as_deref(),
+            dataset_id.as_deref(),
         ),
         Command::Adopt {
             path,

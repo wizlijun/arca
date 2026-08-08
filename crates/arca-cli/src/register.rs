@@ -36,6 +36,19 @@ pub struct RegisterOptions<'a> {
     pub hub_url: Option<&'a str>,
     /// 仅用于在新建 hub 条目、且未显式给出 `hub_url` 时推导 `file://` 地址。
     pub root_hint: Option<&'a Path>,
+    /// **M2c Task 5**：新建 `dataset.toml` 时用它代替随机生成的
+    /// `dataset_id`——"第二台设备加入一个已经在 hub 上存在的数据集"这个
+    /// 场景（两机端到端演示的前提）需要它：第一台设备 `adopt` 时随机分配
+    /// 了一个 `dataset_id`，第二台设备必须登记同一个 id 才能连到
+    /// hub 上同一份数据，不能各自随机生成两个互不相干的 id。**这不是完整
+    /// 的"加入现有数据集"引导流程**（那需要发现/配对机制，spec 没有为它
+    /// 定协议，规划里点名"多卷映射与 server/client 角色属 M2d"——本质是
+    /// 同一类缺口）；这里只补最小的、能让 `arca register --dataset-id
+    /// <hex>` 显式声明"我加入的是这个已知 id"的原语，`id` 是通过何种带外
+    /// 渠道得知的不在本选项的职责范围内。缺省仍随机生成，不影响既有行为。
+    /// 已有 `dataset.toml` 时忽略这个字段（既有身份不能被覆盖，与
+    /// `hub_instance_id`/`hub_url` 校验既有一致性同一条纪律）。
+    pub dataset_id: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -74,6 +87,10 @@ pub enum RegisterError {
     },
     /// hub 是新建的，但既没有 `--hub-url` 也没有 `root_hint` 可以推导。
     MissingHubUrl,
+    /// `--dataset-id` 给出的值不是合法的 32 位小写十六进制。
+    BadDatasetId {
+        value: String,
+    },
     UnsupportedHubUrl(HubRootError),
     Registry(FormatError),
     Ignore(arca_git::ignore_block::BlockError),
@@ -120,6 +137,10 @@ impl fmt::Display for RegisterError {
             RegisterError::MissingHubUrl => {
                 write!(f, "新建 hub 需要 --hub-url，或提供 --root 以便从中推导")
             }
+            RegisterError::BadDatasetId { value } => write!(
+                f,
+                "--dataset-id {value:?} 不是合法的 32 位小写十六进制（FORMAT.md §1）"
+            ),
             RegisterError::UnsupportedHubUrl(e) => write!(f, "{e}"),
             RegisterError::Registry(e) => write!(f, ".gitarca 处理失败：{e}"),
             RegisterError::Ignore(e) => write!(f, "{e}"),
@@ -193,16 +214,25 @@ pub fn register(start: &Path, opts: RegisterOptions) -> Result<RegisterOutcome, 
             }
         },
     };
-    // 及早校验 URL 是否可解析（M1 只支持 file:// 与裸路径），即便这一步的
-    // 结果这次调用不会立刻用到——好过把一个日后打不开的 hub 条目写进 .gitarca。
-    vault::resolve_hub_root(
-        &HubEntry {
-            instance_id: hub_instance_id.clone(),
-            url: hub_url.clone(),
-        },
-        None,
-    )
-    .map_err(RegisterError::UnsupportedHubUrl)?;
+    // 及早校验 URL 是否可解析（`file://`/裸路径/`http://`），即便这一步的
+    // 结果这次调用不会立刻用到——好过把一个日后打不开的 hub 条目写进
+    // `.gitarca`。`http://` 不经 `vault::resolve_hub_root`（M2c Task 5：
+    // 那个函数只解析本地存储根路径，`http://` 走的是
+    // `dataset::resolve`/`HubTarget::Http`，不是它的职责）——这里只做一次
+    // 语法层面的"这是不是一个非空的 http:// 地址"检查，真正的连通性/
+    // 数据集匹配留到 `arca sync` 实际发起请求时暴露。
+    if !hub_url.starts_with("http://") {
+        vault::resolve_hub_root(
+            &HubEntry {
+                instance_id: hub_instance_id.clone(),
+                url: hub_url.clone(),
+            },
+            None,
+        )
+        .map_err(RegisterError::UnsupportedHubUrl)?;
+    } else if hub_url == "http://" {
+        return Err(RegisterError::UnsupportedHubUrl(HubRootError::EmptyUrl));
+    }
 
     // --- 既有 dataset.toml 的身份必须与本次解析出的 hub 一致 ----------------
     if let Some(cfg) = &existing_cfg {
@@ -215,10 +245,20 @@ pub fn register(start: &Path, opts: RegisterOptions) -> Result<RegisterOutcome, 
         }
     }
 
-    let dataset_id = existing_cfg
-        .as_ref()
-        .map(|c| c.dataset_id.clone())
-        .unwrap_or_else(crate::ids::random_hex32);
+    let dataset_id = match &existing_cfg {
+        Some(c) => c.dataset_id.clone(),
+        None => match opts.dataset_id {
+            Some(id) => {
+                if !arca_format::model::is_hex32(id) {
+                    return Err(RegisterError::BadDatasetId {
+                        value: id.to_string(),
+                    });
+                }
+                id.to_string()
+            }
+            None => crate::ids::random_hex32(),
+        },
+    };
 
     // --- 重建注册表：保留全部既有 hub/dataset，追加/更新这一条 --------------
     let mut hub_map: BTreeMap<String, HubEntry> = registry
@@ -339,6 +379,7 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: Some("file:///mnt/nas/assets"),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap();
@@ -381,6 +422,7 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: None,
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap_err();
@@ -401,6 +443,7 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: None,
                 root_hint: Some(Path::new("/mnt/usb/assets")),
+                dataset_id: None,
             },
         )
         .unwrap();
@@ -428,6 +471,7 @@ mod tests {
                 hub_instance_id: Some("3f2a000000000000000000000000beef"),
                 hub_url: Some("file:///mnt/nas/orphan"),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap();
@@ -464,6 +508,7 @@ mod tests {
                 hub_instance_id: Some("3f2a000000000000000000000000beef"),
                 hub_url: Some("file:///mnt/nas/orphan"),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap_err();
@@ -483,6 +528,7 @@ mod tests {
                 hub_instance_id: Some("3f2a000000000000000000000000beef"),
                 hub_url: Some("file:///mnt/nas/a"),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap();
@@ -496,6 +542,7 @@ mod tests {
                 hub_instance_id: Some("00000000000000000000000000000000"),
                 hub_url: None,
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap_err();
@@ -513,6 +560,7 @@ mod tests {
             hub_instance_id: Some("3f2a000000000000000000000000beef"),
             hub_url: Some("file:///mnt/nas/assets"),
             root_hint: None,
+            dataset_id: None,
         };
         let first = register(dir.path(), opts()).unwrap();
         let second = register(dir.path(), opts()).unwrap();
@@ -536,6 +584,7 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: Some("file:///mnt/nas/assets"),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap();
@@ -548,6 +597,7 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: Some("file:///mnt/nas2/assets"),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap_err();
@@ -574,6 +624,7 @@ mod tests {
                 hub_instance_id: Some("3f2a000000000000000000000000beef"),
                 hub_url: Some("file:///mnt/nas/assets"),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap();
@@ -586,6 +637,7 @@ mod tests {
                 hub_instance_id: Some("3f2a000000000000000000000000beef"),
                 hub_url: Some("file:///mnt/nas/assets"),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap_err();
@@ -609,6 +661,7 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: Some("https://nas.example.com/assets"),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap_err();
@@ -636,6 +689,7 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: Some("file:///mnt/nas/assets"),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap_err();

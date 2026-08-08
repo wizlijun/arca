@@ -26,13 +26,15 @@
 
 use arca_cli::adopt::{self, AdoptOptions};
 use arca_cli::clock;
-use arca_cli::dataset;
+use arca_cli::dataset::{self, HubTarget};
 use arca_cli::doctor;
 use arca_cli::init::{self, HookOutcome};
 use arca_cli::register::{self, RegisterOptions};
 use arca_cli::status as status_lib;
-use arca_cli::sync::{self as sync_lib, SyncActor};
+use arca_cli::sync::{self as sync_lib, SyncActor, SyncError};
 use arca_cli::trace_sink;
+use arca_cli::transport::http::HttpTransport;
+use arca_cli::transport::TransportError;
 use arca_cli::trash;
 use arca_cli::vault;
 use arca_format::trace::{NullSink, RingSink};
@@ -96,13 +98,14 @@ pub fn init_cmd(path: Option<PathBuf>, no_hook: bool) -> ExitCode {
     }
 }
 
-/// `arca register <path> --hub <name> [--hub-instance-id <id>] [--hub-url <url>] [--root <path>]`。
+/// `arca register <path> --hub <name> [--hub-instance-id <id>] [--hub-url <url>] [--root <path>] [--dataset-id <id>]`。
 pub fn register_cmd(
     path: &str,
     hub_name: &str,
     hub_instance_id: Option<&str>,
     hub_url: Option<&str>,
     root: Option<&Path>,
+    dataset_id: Option<&str>,
 ) -> ExitCode {
     let opts = RegisterOptions {
         path,
@@ -110,6 +113,7 @@ pub fn register_cmd(
         hub_instance_id,
         hub_url,
         root_hint: root,
+        dataset_id,
     };
     match register::register(&cwd(), opts) {
         Ok(outcome) => {
@@ -227,135 +231,147 @@ pub fn adopt_cmd(path: &str, root: Option<&Path>, allow_create_root: bool) -> Ex
     code
 }
 
+/// 打印一次 [`sync_lib::SyncReport`]——`arca sync` 与两种 hub target 共用
+/// 同一份措辞（M2c Task 5：`file://`/`http://` 走的是不同的
+/// `sync_lib::sync`/`sync_transport` 引擎，但报告的呈现方式必须一致，不能
+/// 让用户从输出上感觉出"这是两个不同的命令"）。返回 `report.is_clean()`。
+fn print_sync_report(report: &sync_lib::SyncReport) -> bool {
+    // 评审 Important #2：基线被重置（缺失/损坏，本轮是全量对账）是"为什么
+    // 这次结果长这样"的关键线索——`status_cmd` 已经打印这条提示，`sync_cmd`
+    // 此前算出了同一个字段却从不读它，混合场景下用户会看到一堆
+    // upload/adopt 或一个"结构化冲突"却不知道起因就是基线被重建。
+    if report.baseline_reset {
+        eprintln!("基线已重建（此前缺失或损坏）——本轮是一次全量对账");
+    }
+    for p in &report.uploaded {
+        println!("upload\t{p}");
+    }
+    for p in &report.downloaded {
+        println!("download\t{p}");
+    }
+    for p in &report.adopted {
+        println!("adopt\t{p}");
+    }
+    // `renamed`：M2c Task 5 新增——只有 `sync_transport`（`http://`，以及
+    // 未来任何走 `Transport` 的路径）才会填充这个桶，`file://` 的旧
+    // `sync()` 引擎本切片不变，恒空（`SyncReport::default()`）。
+    for (from, to) in &report.renamed {
+        println!("rename\t{from}\t{to}");
+    }
+    for p in &report.deleted_local {
+        println!("delete-local\t{p}");
+    }
+    for p in &report.tombstone_submitted {
+        println!("tombstone\t{p}");
+    }
+    for (p, failure) in &report.delete_blocked {
+        eprintln!("删除闸门拦下，未移除本地副本：{p}：{failure}");
+    }
+    for p in &report.tombstone_pending {
+        eprintln!("本该提交为删除（tombstone）但本轮未能执行：{p}");
+    }
+    for p in &report.conflicts {
+        eprintln!("结构化冲突，未动数据：{p}");
+    }
+    for p in &report.needs_human {
+        eprintln!("状态模糊，需要人工介入：{p}");
+    }
+    for (p, reason) in &report.scan_rejected {
+        eprintln!("扫描阶段被拒绝（{}）：{p}", reason.as_str());
+    }
+    report.is_clean()
+}
+
+/// `SyncError` → 退出码——**I11**：`Transport::Offline`（数据集离线）与
+/// `StorageRoot::open` 打不开是同一严重性，走退出码 2；其余（含
+/// `Network`/`Protocol`）是命令本身的失败，退出码 1——命令壳这一层不区分
+/// `retryable`/`bug`（那是 agent/更上层调用方看 `TransportError::class()`
+/// 该做的事，见其文档），只保证"离线"这一种情形不会被和"随便什么问题"
+/// 混在同一个退出码里，与 `status_cmd`/`verify_cmd` 对 `StorageRoot::open`
+/// 失败的既有处置保持一致的信号强度。
+fn sync_error_exit_code(e: &SyncError) -> ExitCode {
+    match e {
+        SyncError::Transport(TransportError::Offline { .. }) => ExitCode::from(2),
+        _ => ExitCode::from(1),
+    }
+}
+
 /// `arca sync <path> [--root <path>]`——对一个已 `arca register`/`arca adopt`
 /// 过的数据集再跑一轮调和闭环。**不引导全新存储根**（那是 `adopt` 的职责）：
-/// 存储根打不开一律按 I11 视为身份不明。
+/// 存储根打不开/数据集离线一律按 I11 视为身份不明。
+///
+/// # M2c Task 5：`file://` 与 `http://` 分流
+///
+/// `dataset::resolve` 产出的 [`HubTarget`] 决定走哪条引擎：`Local` 沿用
+/// M1d 起就有的 `sync_lib::sync`（`StorageRoot` + `Batch`/`AppendBatch` 批量
+/// 收口，性能设计只对本地磁盘有意义）；`Http` 走本切片新增的
+/// `sync_lib::sync_transport` + [`HttpTransport`]——`Arca-Session` 头带的是
+/// 这次命令解析出的 `sid`（M2c Task 4 sid 闭环：客户端 trace 里的 sid 与
+/// 服务端 journal 里的 `actor.session` 由此串起来）。两条路径共享
+/// [`print_sync_report`]，用户看到的输出格式不因 hub 类型而分裂。
 pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
-    let vault = match vault::open(&cwd()) {
+    let resolved = match dataset::resolve(&cwd(), path, root) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
-            // 评审 Minor：与 status/verify/ls/state dump 对同一个 VaultError
-            // 统一退出码——"不是 git 仓库"/".gitarca 缺失"不是 I11 意义上的
-            // "身份不明"（那专指存储根挂载失败/卷身份不符），不该占用退出码 2。
-            return ExitCode::from(1);
-        }
-    };
-    let normalized = match arca_format::path_rules::check(path) {
-        Ok(p) => p,
-        Err(status) => {
-            eprintln!("数据集路径不合规：{}", status.as_str());
-            return ExitCode::from(1);
-        }
-    };
-    let dataset_dir = vault.repo.root().join(&normalized);
-
-    let dataset_toml_path = dataset_dir.join(".arca").join("dataset.toml");
-    let cfg_text = match std::fs::read_to_string(&dataset_toml_path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{normalized} 尚未登记为数据集（{e}）——请先 `arca register`/`arca adopt`");
-            return ExitCode::from(1);
-        }
-    };
-    let cfg = match arca_format::dataset::DatasetConfig::parse(&cfg_text) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("dataset.toml 解析失败：{e}");
-            return ExitCode::from(2);
-        }
-    };
-
-    let Some(entry) = vault.registry.datasets().iter().find(|e| {
-        arca_format::path_rules::casefold(&e.path) == arca_format::path_rules::casefold(&normalized)
-    }) else {
-        eprintln!("{normalized} 未在 .gitarca 登记——请先运行 `arca register`");
-        return ExitCode::from(1);
-    };
-    let Some(hub) = vault.registry.hub(&entry.hub) else {
-        eprintln!("hub {:?} 未在 .gitarca 登记", entry.hub);
-        return ExitCode::from(1);
-    };
-
-    let root_path = match vault::resolve_hub_root(hub, root) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{e}");
             return ExitCode::from(1);
         }
     };
 
-    // sid/sink 建在挂载检查之前——mount.check 是"全项目最危险的判断"（见
-    // `arca_store::root` 模块文档），失败时同样要能落盘诊断，不能只有后面
-    // `sync_lib::sync` 内部的决策轨迹被记录下来。
+    // sid/sink 建在挂载检查/连接之前——mount.check 是"全项目最危险的判断"
+    // （见 `arca_store::root` 模块文档），失败时同样要能落盘诊断，不能只有
+    // 后面 `sync_lib::sync`/`sync_transport` 内部的决策轨迹被记录下来。
     let sid = trace_sink::resolve_sid();
     let mut sink = RingSink::default();
-    let storage_root = match arca_store::root::StorageRoot::open_traced(
-        &root_path,
-        Some(&cfg.dataset_id),
-        0,
-        &mut sink,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{e}");
-            flush_trace_if_needed(&sid, &mut sink, false);
-            return ExitCode::from(2);
+
+    let result = match &resolved.target {
+        HubTarget::Local(root_path) => {
+            let storage_root = match arca_store::root::StorageRoot::open_traced(
+                root_path,
+                Some(&resolved.cfg.dataset_id),
+                0,
+                &mut sink,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    flush_trace_if_needed(&sid, &mut sink, false);
+                    return ExitCode::from(2);
+                }
+            };
+            sync_lib::sync(
+                &resolved.dataset_dir,
+                &storage_root,
+                &default_actor(),
+                &mut sink,
+            )
+        }
+        HubTarget::Http { base_url } => {
+            let transport =
+                HttpTransport::new(base_url, &resolved.cfg.dataset_id, Some(sid.clone()));
+            sync_lib::sync_transport(
+                &resolved.dataset_dir,
+                &transport,
+                &default_actor(),
+                &mut sink,
+            )
         }
     };
 
-    let (code, succeeded) =
-        match sync_lib::sync(&dataset_dir, &storage_root, &default_actor(), &mut sink) {
-            Ok(report) => {
-                // 评审 Important #2：基线被重置（缺失/损坏，本轮是全量对账）
-                // 是"为什么这次结果长这样"的关键线索——`status_cmd` 已经打印
-                // 这条提示，`sync_cmd` 此前算出了同一个字段却从不读它，混合
-                // 场景下用户会看到一堆 upload/adopt 或一个"结构化冲突"却不知道
-                // 起因就是基线被重建。
-                if report.baseline_reset {
-                    eprintln!("基线已重建（此前缺失或损坏）——本轮是一次全量对账");
-                }
-                for p in &report.uploaded {
-                    println!("upload\t{p}");
-                }
-                for p in &report.downloaded {
-                    println!("download\t{p}");
-                }
-                for p in &report.adopted {
-                    println!("adopt\t{p}");
-                }
-                for p in &report.deleted_local {
-                    println!("delete-local\t{p}");
-                }
-                for p in &report.tombstone_submitted {
-                    println!("tombstone\t{p}");
-                }
-                for (p, failure) in &report.delete_blocked {
-                    eprintln!("删除闸门拦下，未移除本地副本：{p}：{failure}");
-                }
-                for p in &report.tombstone_pending {
-                    eprintln!("本该提交为删除（tombstone）但本轮未能执行：{p}");
-                }
-                for p in &report.conflicts {
-                    eprintln!("结构化冲突，未动数据：{p}");
-                }
-                for p in &report.needs_human {
-                    eprintln!("状态模糊，需要人工介入：{p}");
-                }
-                for (p, reason) in &report.scan_rejected {
-                    eprintln!("扫描阶段被拒绝（{}）：{p}", reason.as_str());
-                }
-                if report.is_clean() {
-                    (ExitCode::SUCCESS, true)
-                } else {
-                    (ExitCode::from(1), false)
-                }
-            }
-            Err(e) => {
-                eprintln!("{e}");
+    let (code, succeeded) = match result {
+        Ok(report) => {
+            let clean = print_sync_report(&report);
+            if clean {
+                (ExitCode::SUCCESS, true)
+            } else {
                 (ExitCode::from(1), false)
             }
-        };
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            (sync_error_exit_code(&e), false)
+        }
+    };
 
     flush_trace_if_needed(&sid, &mut sink, succeeded);
     code
@@ -372,7 +388,16 @@ pub fn status_cmd(path: &str, root: Option<&Path>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let store_root = match StorageRoot::open(&resolved.root_path, Some(&resolved.cfg.dataset_id)) {
+    // M2c Task 5：`status` 尚未 Transport 化，`http://` hub 报明确的
+    // "这条命令不支持"（`dataset::ResolvedDataset::local_root` 文档）。
+    let root_path = match resolved.local_root() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let store_root = match StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{e}");
@@ -433,17 +458,27 @@ pub fn verify_cmd(path: &str, root: Option<&Path>) -> ExitCode {
         }
     };
 
+    // M2c Task 5：`verify` 尚未 Transport 化——`http://` hub 报明确的
+    // "这条命令不支持"。
+    let root_path = match resolved.local_root() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
     // I11：先按已知身份打开一次，确认挂载的是期望的那个数据集——
     // `fsck::check_path` 本身不预设期望身份（诊断工具的设计，服务于任意
     // 存储根路径），但 `verify` 是针对一个具体已登记数据集的巡检，必须先
     // 做这道身份检查；否则挂错了别的空盘会被 `check_path` 老老实实巡检出
     // "零个问题"，把"身份不明"误判成"库是空的、一切正常"（I11）。
-    if let Err(e) = StorageRoot::open(&resolved.root_path, Some(&resolved.cfg.dataset_id)) {
+    if let Err(e) = StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
         eprintln!("{e}");
         return ExitCode::from(2);
     }
 
-    match arca_store::fsck::check_path(&resolved.root_path) {
+    match arca_store::fsck::check_path(root_path) {
         Ok(report) => {
             if report.problems.is_empty() {
                 ExitCode::SUCCESS
@@ -576,7 +611,16 @@ pub fn restore_cmd(dataset_path: &str, file: &str, root: Option<&Path>) -> ExitC
             return ExitCode::from(1);
         }
     };
-    let store_root = match StorageRoot::open(&resolved.root_path, Some(&resolved.cfg.dataset_id)) {
+    // M2c Task 5：`restore` 尚未 Transport 化——`http://` hub 报明确的
+    // "这条命令不支持"。
+    let root_path = match resolved.local_root() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let store_root = match StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{e}");
@@ -638,7 +682,16 @@ pub fn restore_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let store_root = match StorageRoot::open(&resolved.root_path, Some(&resolved.cfg.dataset_id)) {
+    // M2c Task 5：`restore --list` 尚未 Transport 化——`http://` hub 报明确的
+    // "这条命令不支持"。
+    let root_path = match resolved.local_root() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let store_root = match StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{e}");

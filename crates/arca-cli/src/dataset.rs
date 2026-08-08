@@ -21,7 +21,25 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// 一个已解析、但尚未打开存储根的数据集。
+/// hub 连接目标——M2c Task 5「`dataset.rs`：解析 `http://` 的 hub url」：
+/// M1d 时 `resolve()` 只认 `file://`/裸路径，遇到其它 scheme 一律报
+/// 「该 transport 属 M2，本版本不支持」（`vault::HubRootError::UnsupportedTransport`）；
+/// 本切片让 `resolve()` 认出 `http://`，产出这个枚举而不是裸 `PathBuf`，
+/// 调用方据此决定走 [`arca_store::root::StorageRoot`] 还是
+/// [`crate::transport::http::HttpTransport`]。
+#[derive(Debug, Clone)]
+pub enum HubTarget {
+    /// `file://`/裸路径解析出的本地存储根路径，尚未 `StorageRoot::open`
+    /// （与 M1d 起的既有行为完全一致）。
+    Local(PathBuf),
+    /// `http://` hub 的基址——`http://<host>[:port]`，不含末尾 `/`、不含
+    /// `/v1/datasets/...` 后缀（数据集坐标由 [`ResolvedDataset::cfg`] 的
+    /// `dataset_id` 另外提供，两者合起来才是完整端点，见
+    /// `transport::http::HttpTransport::new`）。
+    Http { base_url: String },
+}
+
+/// 一个已解析、但尚未打开存储根/建立连接的数据集。
 #[derive(Debug)]
 pub struct ResolvedDataset {
     /// 数据集目录的绝对路径（vault 根 + 归一化后的相对路径）。
@@ -29,9 +47,26 @@ pub struct ResolvedDataset {
     /// 归一化后的、相对 vault 根的路径（`/` 分隔）。
     pub normalized_path: String,
     pub cfg: DatasetConfig,
-    /// 这个数据集绑定的 hub 对应的本地存储根路径（`vault::resolve_hub_root`
-    /// 的产物，尚未 `StorageRoot::open`）。
-    pub root_path: PathBuf,
+    /// 这个数据集绑定的 hub——本地存储根路径或 `http://` 基址，见
+    /// [`HubTarget`]。
+    pub target: HubTarget,
+}
+
+impl ResolvedDataset {
+    /// 只支持本地存储根的命令（`status`/`verify`/`doctor`/plumbing/`adopt`——
+    /// M2c Task 5 只把 `arca sync` 接通 `http://`，见
+    /// `docs/superpowers/plans/2026-08-08-m2c-journal-longpoll.md` 自评
+    /// 「多卷映射与 server/client 角色属 M2d」一节，其它命令的 Transport
+    /// 化同理留给后续切片）用它取路径；`target` 是 `Http` 时返回一个明确
+    /// 的、可诊断的错误，不是让调用方自己 `match` 时手忙脚乱地拼错误信息。
+    pub fn local_root(&self) -> Result<&Path, ResolveError> {
+        match &self.target {
+            HubTarget::Local(p) => Ok(p),
+            HubTarget::Http { base_url } => Err(ResolveError::LocalOnlyCommand {
+                hub_url: base_url.clone(),
+            }),
+        }
+    }
 }
 
 /// 解析失败——彼此可区分（I5）。措辞与 `adopt.rs::AdoptError`/
@@ -53,6 +88,11 @@ pub enum ResolveError {
         hub: String,
     },
     HubRoot(HubRootError),
+    /// 这条命令只支持本地存储根（`file://`），hub 是 `http://` 时报这个——
+    /// 见 [`ResolvedDataset::local_root`] 文档。
+    LocalOnlyCommand {
+        hub_url: String,
+    },
     Io {
         path: String,
         reason: String,
@@ -74,6 +114,11 @@ impl fmt::Display for ResolveError {
             }
             ResolveError::HubNotFound { hub } => write!(f, "hub {hub:?} 未在 .gitarca 登记"),
             ResolveError::HubRoot(e) => write!(f, "{e}"),
+            ResolveError::LocalOnlyCommand { hub_url } => write!(
+                f,
+                "{hub_url} 是 http:// hub——这条命令目前只支持本地（file://）存储根，\
+                 改用 `arca sync` 之类已接通 http:// 的命令"
+            ),
             ResolveError::Io { path, reason } => write!(f, "{path}：{reason}"),
         }
     }
@@ -122,13 +167,31 @@ pub fn resolve(
         .ok_or_else(|| ResolveError::HubNotFound {
             hub: entry.hub.clone(),
         })?;
-    let root_path = vault::resolve_hub_root(hub, root_override).map_err(ResolveError::HubRoot)?;
+
+    // M2c Task 5：`--root` 覆盖永远赢（与 M1d 起既有语义一致，`--root` 是
+    // "外置盘换挂载点"这类纯本地场景的一次性覆盖，不可能覆盖成一个
+    // `http://` 地址）；否则才看 `hub.url` 是不是 `http://`。裸 `http://`
+    // 之外的其它 scheme（`https://` 等）继续交给 `vault::resolve_hub_root`
+    // 报「该 transport 属 M2，本版本不支持」，行为不变。
+    let target = if let Some(root) = root_override {
+        HubTarget::Local(root.to_path_buf())
+    } else if let Some(rest) = hub.url.strip_prefix("http://") {
+        let base = rest.trim_end_matches('/');
+        if base.is_empty() {
+            return Err(ResolveError::HubRoot(HubRootError::EmptyUrl));
+        }
+        HubTarget::Http {
+            base_url: format!("http://{base}"),
+        }
+    } else {
+        HubTarget::Local(vault::resolve_hub_root(hub, None).map_err(ResolveError::HubRoot)?)
+    };
 
     Ok(ResolvedDataset {
         dataset_dir,
         normalized_path,
         cfg,
-        root_path,
+        target,
     })
 }
 
@@ -172,13 +235,14 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: Some(&format!("file://{}", root_path.display())),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap();
 
         let resolved = resolve(vault_dir.path(), "assets", None).unwrap();
         assert_eq!(resolved.normalized_path, "assets");
-        assert_eq!(resolved.root_path, root_path);
+        assert_eq!(resolved.local_root().unwrap(), root_path);
         // `Repo::open` 把工作树根归一化成 canonical 路径（macOS 上
         // `/var` 是指向 `/private/var` 的符号链接）——两侧都 canonicalize
         // 再比较，不依赖 tempfile 产出的路径字面量恰好等于 canonical 形式。
@@ -216,13 +280,45 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: Some(&format!("file://{}", registered_root.display())),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap();
 
         let overridden = store_dir.path().join("override-root");
         let resolved = resolve(vault_dir.path(), "assets", Some(&overridden)).unwrap();
-        assert_eq!(resolved.root_path, overridden);
-        assert_ne!(resolved.root_path, registered_root);
+        assert_eq!(resolved.local_root().unwrap(), overridden);
+        assert_ne!(resolved.local_root().unwrap(), registered_root);
+    }
+
+    #[test]
+    fn http_hub的url被解析成httptarget而不是报不支持() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        建仓库(vault_dir.path());
+        fs::write(vault_dir.path().join(GITARCA_FILE), "schema = 1\n").unwrap();
+        fs::create_dir_all(vault_dir.path().join("assets")).unwrap();
+
+        register::register(
+            vault_dir.path(),
+            RegisterOptions {
+                path: "assets",
+                hub_name: "home",
+                hub_instance_id: None,
+                hub_url: Some("http://127.0.0.1:18420/"),
+                root_hint: None,
+                dataset_id: None,
+            },
+        )
+        .unwrap();
+
+        let resolved = resolve(vault_dir.path(), "assets", None).unwrap();
+        match &resolved.target {
+            HubTarget::Http { base_url } => assert_eq!(base_url, "http://127.0.0.1:18420"),
+            other => panic!("应为 HubTarget::Http，实得 {other:?}"),
+        }
+        assert!(matches!(
+            resolved.local_root().unwrap_err(),
+            ResolveError::LocalOnlyCommand { .. }
+        ));
     }
 }

@@ -229,8 +229,22 @@ pub fn doctor(repo: &Repo, registry: &Registry, root_override: Option<&Path>) ->
             }
         };
 
+        // M2c Task 5：`doctor` 尚未 Transport 化——`http://` hub 报同一套
+        // `ResolveFailed`（`local_root()` 的 `LocalOnlyCommand` 错误信息
+        // 已经讲清楚原因），不是本切片的范围（见 `dataset::ResolvedDataset::local_root`
+        // 文档）。
+        let root_path = match resolved.local_root() {
+            Ok(p) => p,
+            Err(e) => {
+                datasets.push(DatasetHealth::ResolveFailed {
+                    path: resolved.normalized_path.clone(),
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
         let mut sink = NullSink;
-        match StorageRoot::open(&resolved.root_path, Some(&resolved.cfg.dataset_id)) {
+        match StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
             Ok(store_root) => {
                 let health = match check_dataset(
                     repo,
@@ -487,6 +501,7 @@ mod tests {
                 hub_instance_id: None,
                 hub_url: Some(&format!("file://{}", root_path.display())),
                 root_hint: None,
+                dataset_id: None,
             },
         )
         .unwrap();

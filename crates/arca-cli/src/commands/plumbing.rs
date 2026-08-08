@@ -56,11 +56,17 @@ fn open_dataset_and_root(
         eprintln!("{e}");
         ExitCode::from(1)
     })?;
-    let store_root = StorageRoot::open(&resolved.root_path, Some(&resolved.cfg.dataset_id))
-        .map_err(|e| {
-            eprintln!("{e}");
-            ExitCode::from(2)
-        })?;
+    // M2c Task 5：plumbing（ls/cat/resolve）尚未 Transport 化——`http://`
+    // hub 报明确的"这条命令不支持"（`dataset::ResolvedDataset::local_root`
+    // 文档），不是退出码 2 的 I11 身份不明。
+    let root_path = resolved.local_root().map_err(|e| {
+        eprintln!("{e}");
+        ExitCode::from(1)
+    })?;
+    let store_root = StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)).map_err(|e| {
+        eprintln!("{e}");
+        ExitCode::from(2)
+    })?;
     Ok((resolved, store_root))
 }
 
