@@ -18,6 +18,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adopt;
 pub mod baseline;
+pub mod clock;
 pub mod hub;
+pub mod ids;
+pub mod init;
+pub mod register;
 pub mod scan;
+pub mod sync;
+pub mod vault;
