@@ -13,8 +13,8 @@
 //! | `Upload{parent}` | 写 `files/` + 追加 `items/` + 更新 `index/` |
 //! | `Download{version_id}` | 从存储根读出内容写到本地 |
 //! | `AdoptBaseline{hash, version_id}` | 零传输，只更新基线 |
-//! | `DeleteLocal{item_id}` | 移除本地副本（权威副本在 hub） |
-//! | `TombstoneRemote{item_id, parent}` | M1 无处落盘（tombstone 属 M2）——如实报告，绝不静默当 no-op |
+//! | `DeleteLocal{item_id}` | **过四道闸门（`gates::check_delete`，M2a Task 4）后**才移除本地副本；任一闸门不过则不删，计入 `delete_blocked` |
+//! | `TombstoneRemote{item_id, parent}` | 提交 tombstone：`files/` → `.arca/trash/` + 追加 journal `op=tombstone` 事件（M2a Task 4 收尾，复用 Task 3 交付的 `trash`/`journal` 原语） |
 //! | `Conflict{..}` | 不动数据，计入报告 |
 //! | `NeedsHuman{..}` | 停下，计入报告 |
 //!
@@ -27,15 +27,31 @@
 //! 确定性测试没法注入固定值。与 `scan.rs` 顶部同一条先例（brief 签名落后
 //! 于实现，文档说明偏离之处）。
 //!
-//! # tombstone 无处落盘的连带后果（读 `hub.rs` 顶部注释）
+//! # tombstone 传播的两端：接收（Task 4 前半）与发起（Task 4 收尾）都已接通
 //!
-//! `hub::read_remote` 结构上产不出 `RemoteState::Tombstoned`（M1 没有把
-//! journal 接上），所以 `TombstoneRemote` 这一格在 M1 的真实运行中**必然
-//! 是"发生过"但从未被"验证执行成功"**——它只能停在"如实报告"这一步。
-//! `SyncReport::is_clean()` 把它算进"有问题"，`arca sync` 的退出码据此非零，
-//! 绝不能让用户误以为删除已经生效。
+//! M2a Task 3 之后，`hub::read_remote` 已经能读 journal 产出
+//! `RemoteState::Tombstoned`（决策表 `present|unchanged|tombstoned ->
+//! DeleteLocal` 第一次在真实运行中可达）；Task 4 前半接通了 `DeleteLocal`
+//! 的**安全执行**——过四道闸门（`gates::check_delete`）之后才真的移除本地
+//! 副本，任一闸门不过则不删、计入 `SyncReport::delete_blocked`。
+//!
+//! `TombstoneRemote`（本地删除 → 向 hub **提交** tombstone）此前也无处落盘
+//! （brief 字面只覆盖接收侧的四道闸门），但端到端验证要求这条链路必须真的
+//! 走通——`execute_tombstone` 补上了"发起"这一侧：直接复用 Task 3 已经交付、
+//! 已被独立测试覆盖的 [`crate::trash::move_to_trash`] + [`crate::journal::append`]，
+//! **不新增任何销毁数据的代码路径**（I3：移进 `.arca/trash/` 是 tombstone，
+//! 不是物理销毁，保留期内 `arca restore` 能找回）。这一步之所以安全、甚至是
+//! Task 1（下载内容 fsync 纪律）想要防住的那类崩溃场景的进一步兜底：即便
+//! 某台设备因为过去的 bug/崩溃把"内容还在但没同步"的文件误判成本地删除，
+//! 传播到 hub 的后果也只是把内容移进回收站（可恢复），不是无法挽回的销毁。
+//! `SyncReport::tombstone_submitted` 记录本轮成功提交的路径（不影响
+//! `is_clean()`，与 `deleted_local` 同一性质——正常完成的动作）；
+//! `tombstone_pending` 字段保留给未来可能出现的"决定要提交但暂时不安全"的
+//! 情形（当前决策表到达 `TombstoneRemote` 时 `remote_state` 必然是
+//! `RemoteState::Present`，`trash::move_to_trash` 因此总能找到源文件，这个
+//! 桶目前恒空，但类型上保留，供未来加发起侧闸门时使用）。
 
-use crate::{baseline, clock, hub, ids, scan, vault};
+use crate::{baseline, clock, gates, hub, ids, journal, scan, trash, vault};
 use arca_core::reconcile::{decide_traced, Action};
 use arca_core::state::{BaseState, LocalState, RemoteState};
 use arca_format::hub_layout::layout;
@@ -61,8 +77,20 @@ pub struct SyncReport {
     pub downloaded: Vec<String>,
     pub adopted: Vec<String>,
     pub deleted_local: Vec<String>,
-    /// M1 无处落盘的 tombstone 传播——**不是空操作**，是"本该做但这一版做不了"
-    /// 的如实记录（见模块顶部文档）。
+    /// `DeleteLocal` 被四道闸门（`gates::check_delete`）里的至少一道拦下——
+    /// **不删**（I3、I5：状态模糊或不安全就停下，绝不"尽力删"）。逐条保留
+    /// 具体是哪个 [`gates::GateFailure`]，供 `arca sync` 的诊断输出与
+    /// `--json` 消费。
+    pub delete_blocked: Vec<(String, gates::GateFailure)>,
+    /// 本轮成功提交给 hub 的 tombstone（`TombstoneRemote` 已执行：内容进了
+    /// `.arca/trash/`，journal 追加了 `op=tombstone` 事件）——正常完成的动作，
+    /// 与 `deleted_local` 同一性质，不计入 `is_clean()` 的"有问题"判断。
+    pub tombstone_submitted: Vec<String>,
+    /// 决定要提交 tombstone 但暂时做不到的路径——**不是空操作**，是"本该做
+    /// 但这一版做不了"的如实记录（见模块顶部文档）。当前决策表到达
+    /// `TombstoneRemote` 时源文件必然还在 hub（`remote_state` 是
+    /// `RemoteState::Present`），这个桶目前恒空；类型上保留，供未来给发起侧
+    /// 加安全闸门时使用。
     pub tombstone_pending: Vec<String>,
     pub conflicts: Vec<String>,
     pub needs_human: Vec<String>,
@@ -77,7 +105,8 @@ impl SyncReport {
     /// tombstone 传播、也没有扫描阶段被拒绝的路径。供调用方（`arca sync`
     /// 命令壳）决定退出码——0 = 干净，非 0 = 有问题/有未完成（spec §3.2）。
     pub fn is_clean(&self) -> bool {
-        self.tombstone_pending.is_empty()
+        self.delete_blocked.is_empty()
+            && self.tombstone_pending.is_empty()
             && self.conflicts.is_empty()
             && self.needs_human.is_empty()
             && self.scan_rejected.is_empty()
@@ -90,6 +119,7 @@ impl SyncReport {
             || !self.downloaded.is_empty()
             || !self.adopted.is_empty()
             || !self.deleted_local.is_empty()
+            || !self.tombstone_submitted.is_empty()
     }
 }
 
@@ -102,7 +132,14 @@ pub enum SyncError {
     Hub(hub::HubError),
     Atomic(AtomicError),
     Format(arca_format::error::FormatError),
-    Io { path: String, reason: String },
+    /// 提交 tombstone 时 `trash::move_to_trash` 失败。
+    Trash(crate::trash::TrashError),
+    /// 提交 tombstone 时 journal 追加失败。
+    Journal(crate::journal::JournalError),
+    Io {
+        path: String,
+        reason: String,
+    },
 }
 
 impl fmt::Display for SyncError {
@@ -113,6 +150,8 @@ impl fmt::Display for SyncError {
             SyncError::Hub(e) => write!(f, "{e}"),
             SyncError::Atomic(e) => write!(f, "{e}"),
             SyncError::Format(e) => write!(f, "{e}"),
+            SyncError::Trash(e) => write!(f, "{e}"),
+            SyncError::Journal(e) => write!(f, "{e}"),
             SyncError::Io { path, reason } => write!(f, "{path}：{reason}"),
         }
     }
@@ -178,6 +217,12 @@ pub fn sync(
     paths.extend(baseline.iter().map(|(p, _)| p.clone()));
     paths.extend(remote.keys().cloned());
 
+    // 闸门第 1 道（read_roots 范围）要问的正是"这个路径本次调和真的扫描到了
+    // 吗"——`scan_result.files` 的键正是这个问题的答案（只有真的在磁盘上
+    // 找到、判定为 `Present` 的路径才会进这个集合），与 `paths`（额外并入了
+    // 基线与远端已知的路径，用于驱动整个调和循环）是不同的集合，不能共用。
+    let scanned_paths: BTreeSet<String> = scan_result.files.keys().cloned().collect();
+
     let mut batch = Batch::new(root);
 
     for (idx, path) in paths.iter().enumerate() {
@@ -239,21 +284,40 @@ pub fn sync(
                 report.adopted.push(path.clone());
             }
 
-            Action::DeleteLocal { .. } => {
-                let local_path = dataset_root.join(to_native(path));
-                match fs::remove_file(&local_path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(io_err(&local_path, e)),
+            Action::DeleteLocal { item_id } => {
+                let check = gates::DeleteCheck {
+                    path,
+                    item_id,
+                    scanned_paths: &scanned_paths,
+                    remote_state: &remote_state,
+                    dataset_root,
+                    base: &base,
+                    root,
+                };
+                match gates::check_delete(&check) {
+                    Ok(()) => {
+                        let local_path = dataset_root.join(to_native(path));
+                        match fs::remove_file(&local_path) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(io_err(&local_path, e)),
+                        }
+                        baseline.remove(path);
+                        report.deleted_local.push(path.clone());
+                    }
+                    Err(failure) => {
+                        // 闸门拒绝：不删、不改基线，如实计入报告（I5）——下次
+                        // 重跑会重新走一遍这四道检查，一旦竞态窗口关闭（例如
+                        // 用户的修改已经通过正常上传流程同步），自然会通过。
+                        report.delete_blocked.push((path.clone(), failure));
+                    }
                 }
-                baseline.remove(path);
-                report.deleted_local.push(path.clone());
             }
 
-            Action::TombstoneRemote { .. } => {
-                // M1 无处落盘（tombstone 属 M2）——不改基线、不删任何东西，
-                // 如实计入报告。绝不静默当 no-op（见模块顶部文档）。
-                report.tombstone_pending.push(path.clone());
+            Action::TombstoneRemote { item_id, parent } => {
+                execute_tombstone(root, path, item_id, &parent, actor)?;
+                baseline.remove(path);
+                report.tombstone_submitted.push(path.clone());
             }
 
             Action::Conflict { .. } => {
@@ -382,10 +446,14 @@ fn execute_download(
     // 下载的内容必须 fsync 之后才允许保存基线（M2a tombstone 计划「为什么这是
     // M2 的第一块」一节；`arca_store::atomic::write_local` 的文档展开了完整
     // 论证）：这里若只是写完就 rename、不确认落盘，崩溃窗口里会留下「基线
-    // 已保存、内容却丢失」的状态——下次调和把它读成「本地删除」，M1 只导致
-    // 一条无处执行的 `TombstoneRemote` 报告，M2 接通 tombstone 执行之后就会
-    // 变成崩溃引发的 hub 权威副本销毁。`execute_download` 返回之前，`?` 已经
-    // 保证这一步失败时函数整体报错、调用方不会继续把 `new_state` 写进基线。
+    // 已保存、内容却丢失」的状态——下次调和把它读成「本地删除」，进而向 hub
+    // 提交一次并非用户本意的 tombstone。这个函数把这个窗口关上，是
+    // `execute_tombstone`（M2a Task 4 收尾）安全性的前提之一：即便这里的
+    // 防线失守，`execute_tombstone` 也只会把内容移进可恢复的 `.arca/trash/`
+    // （I3），不是无法挽回的销毁，但防线本身仍然值得关——避免用户为一次
+    // 从未发生过的删除去手动 `arca restore`。`execute_download` 返回之前，
+    // `?` 已经保证这一步失败时函数整体报错、调用方不会继续把 `new_state`
+    // 写进基线。
     let local_path = dataset_root.join(to_native(path));
     atomic::write_local(dataset_root, &local_path, &bytes).map_err(SyncError::Atomic)?;
 
@@ -395,6 +463,52 @@ fn execute_download(
         hash,
         size,
     })
+}
+
+/// 执行一次 `TombstoneRemote`：向 hub 提交本地删除意图——把 `files/<path>`
+/// 移进 `.arca/trash/`，追加一条 journal `op=tombstone` 事件。**这不是销毁**，
+/// 内容留在回收站，保留期内 `arca restore`（M2a Task 5）能找回（I3）；
+/// 复用 Task 3 已交付、已被独立测试覆盖的
+/// [`crate::trash::move_to_trash`] + [`crate::journal::append`]，不在本函数
+/// 重新实现落盘细节。
+///
+/// `version_id` 取 `parent`（决策表给出的、这次要终结的远端当前版本）：
+/// journal 事件的 `version_id` 字段语义本就是"改动前最后一个存活版本的
+/// id"（FORMAT.md §7.2），恰好就是决策表算好、随 `Action::TombstoneRemote`
+/// 一起带出来的 CAS If-Match 对象，不需要另外去读一次版本链。
+///
+/// 决策表到达 `TombstoneRemote` 的两条路径（`local_deleted`）都要求
+/// `remote_state` 是 `RemoteState::Present`（`arca_core::reconcile::decide_base_present`
+/// 的 `(LocalState::Absent, RemoteState::Present)` 分支），而 `hub::read_remote`
+/// 产出 `Present` 的前提是 `files/<path>` 确实存在（评审 Critical #1），所以
+/// 正常运行下 `trash::move_to_trash` 总能找到源文件；万一磁盘在这两步之间
+/// 被外部改动导致源缺失，`move_to_trash` 会如实报出 `TrashError::Atomic`
+/// （包住底层的 `NotFound`），本函数整体报错、不吞掉。
+fn execute_tombstone(
+    root: &StorageRoot,
+    path: &str,
+    item_id: ItemId,
+    parent: &arca_format::model::VersionId,
+    actor: &SyncActor,
+) -> Result<(), SyncError> {
+    let at = clock::now_rfc3339();
+    trash::move_to_trash(root, path, item_id, &at).map_err(SyncError::Trash)?;
+
+    let seq = journal::next_seq(root).map_err(SyncError::Journal)?;
+    journal::append(
+        root,
+        &arca_format::journal::JournalEvent {
+            seq,
+            op: arca_format::journal::Op::Tombstone,
+            item_id,
+            version_id: parent.clone(),
+            path: path.to_string(),
+            from: None,
+            actor: actor.clone(),
+            at,
+        },
+    )
+    .map_err(SyncError::Journal)
 }
 
 /// 追加一条版本记录到 `items/<xx>/<item_id>.jsonl`。`items/` 是 append-only
@@ -480,7 +594,11 @@ fn write_manifest(dataset_root: &Path, baseline: &baseline::Baseline) -> Result<
 }
 
 /// 把索引/清单使用的 `/` 分隔路径转成当前平台的 [`PathBuf`]。
-fn to_native(path: &str) -> PathBuf {
+///
+/// `pub(crate)`：`gates.rs` 的第 3 道闸门（基线一致性）需要用同一套转换
+/// 规则重新定位本地文件，不能自己另写一份——两处对"逻辑路径怎么落到本地
+/// 文件系统路径"的理解必须逐字节一致，否则闸门检查的就不是同一个文件。
+pub(crate) fn to_native(path: &str) -> PathBuf {
     let mut out = PathBuf::new();
     for seg in path.split('/') {
         out.push(seg);
@@ -625,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn 本地删除传播为远端删除但m1无处落盘_如实报告() {
+    fn 本地删除传播为远端tombstone且hub权威副本仍可恢复() {
         let dataset = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         造存储根(store.path());
@@ -638,15 +756,36 @@ mod tests {
         fs::remove_file(dataset.path().join("e.txt")).unwrap();
         let report = sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
 
-        assert_eq!(report.tombstone_pending, vec!["e.txt".to_string()]);
+        // M2a Task 4 收尾：TombstoneRemote 现在真的执行——本地删除成功提交
+        // 为 hub 侧的 tombstone，是正常完成的动作，不再是"无处落盘的报告"。
+        assert_eq!(report.tombstone_submitted, vec!["e.txt".to_string()]);
+        assert!(report.tombstone_pending.is_empty());
         assert!(
-            !report.is_clean(),
-            "未完成的 tombstone 传播必须让退出码非零"
+            report.is_clean(),
+            "成功提交的 tombstone 是正常终态，不应让退出码非零：{report:?}"
         );
+        assert!(report.changed(), "提交 tombstone 是一次真实的状态变化");
         // 绝不能被静默当 no-op：不应该出现在任何其它分类桶里。
         assert!(report.uploaded.is_empty());
         assert!(report.downloaded.is_empty());
         assert!(report.deleted_local.is_empty());
+
+        // hub 侧现在应该看到 Tombstoned，且内容确实在 .arca/trash/ 里——
+        // 不是被销毁（I3）。
+        let remote = hub::read_remote(&root).unwrap();
+        assert!(matches!(
+            remote.get("e.txt"),
+            Some(RemoteState::Tombstoned { .. })
+        ));
+        assert!(!store.path().join("files/e.txt").exists());
+        let trash_has_data = fs::read_dir(store.path().join(".arca/trash"))
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".data"));
+        assert!(trash_has_data, "hub 的权威副本必须仍在 .arca/trash/ 里");
+
+        // 基线应已清空这个路径——本地、远端都不再"存在"这个 item。
+        let baseline = crate::baseline::load(dataset.path()).unwrap();
+        assert_eq!(baseline.get("e.txt"), BaseState::Absent);
     }
 
     // -----------------------------------------------------------------
@@ -663,10 +802,12 @@ mod tests {
     /// 真实的 `sync`/`baseline`/`hub::read_remote` 拼出「基线已保存、内容却
     /// 缺失」这个崩溃窗口状态（正常下载一次后，手工删掉本地内容，模拟
     /// fsync 时机不对时崩溃会留下的后果——不是用户主动删除）。断言下一轮
-    /// `decide` 给出 `TombstoneRemote`：M1 里这只是一条无处落盘的报告，
-    /// 但 M2（本计划 Task 3/4）接通 tombstone 执行之后，这个决策会真的
-    /// 删除 hub 的权威副本——这正是 Task 1 必须先于 tombstone 执行落地的
-    /// 理由。
+    /// `decide` 给出 `TombstoneRemote`：`execute_tombstone`（M2a Task 4 收尾）
+    /// 现在真的会执行这个决策——但执行的后果是把 hub 的内容移进
+    /// `.arca/trash/`（I3：tombstone 不是销毁，`arca restore` 能找回），
+    /// 不是无法挽回的数据丢失。这正是 Task 1 必须先于 tombstone 执行落地的
+    /// 理由：关上这个窗口，用户就不会遇到一次自己从未做过的删除、需要去
+    /// 手动 restore 才能找回文件的意外。
     #[test]
     fn 崩溃窗口状态_基线已保存内容却缺失_会让下一轮决策给出tombstone_remote() {
         let dataset = tempfile::tempdir().unwrap();
@@ -818,6 +959,79 @@ mod tests {
             .unwrap()
             .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".data"));
         assert!(trash_has_data, "hub 的权威副本必须仍在 .arca/trash/ 里");
+    }
+
+    /// 端到端闭环（M2a tombstone 计划收尾）：两台设备**只通过 `sync()` 调用**
+    /// 完成"上传 → 另一设备下载 → 一台设备本地删除并同步（提交 tombstone）
+    /// → 另一设备同步（过闸门后移除本地副本）→ `arca restore` 找回"整条链路，
+    /// 不手工拼任何中间状态——这是本切片最终交付的性质，其它测试各自验证
+    /// 链路上的一个环节，这条测试验证环节真的能串起来。
+    #[test]
+    fn 端到端_两台设备通过sync完成删除传播_闸门放行_restore找回() {
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        let root = open_root(store.path());
+        let mut sink = NullSink;
+
+        // 设备甲：上传。
+        let device_a = tempfile::tempdir().unwrap();
+        fs::write(device_a.path().join("photo.png"), b"precious bytes").unwrap();
+        let report_a1 = sync(device_a.path(), &root, &actor(), &mut sink).unwrap();
+        assert_eq!(report_a1.uploaded, vec!["photo.png".to_string()]);
+
+        // 设备乙：下载，两端此刻都持有这份内容。
+        let device_b = tempfile::tempdir().unwrap();
+        let report_b1 = sync(device_b.path(), &root, &actor(), &mut sink).unwrap();
+        assert_eq!(report_b1.downloaded, vec!["photo.png".to_string()]);
+        assert!(device_b.path().join("photo.png").is_file());
+
+        // 设备甲：本地删除，sync 应把删除意图提交为 hub 侧 tombstone
+        // （内容进 .arca/trash/，不是销毁）。
+        fs::remove_file(device_a.path().join("photo.png")).unwrap();
+        let report_a2 = sync(device_a.path(), &root, &actor(), &mut sink).unwrap();
+        assert_eq!(report_a2.tombstone_submitted, vec!["photo.png".to_string()]);
+        assert!(report_a2.is_clean());
+
+        // 设备乙：再同步一次，四道闸门全过（本地内容与基线一致、远端确实是
+        // 对同一 item 的 tombstone、路径在扫描范围内、hub 的回收站里确实
+        // 有这份内容），应当移除本地副本。
+        let report_b2 = sync(device_b.path(), &root, &actor(), &mut sink).unwrap();
+        assert_eq!(report_b2.deleted_local, vec!["photo.png".to_string()]);
+        assert!(
+            report_b2.delete_blocked.is_empty(),
+            "四道闸门应当全过，不应被拦下：{:?}",
+            report_b2.delete_blocked
+        );
+        assert!(report_b2.is_clean());
+        assert!(!device_b.path().join("photo.png").exists());
+
+        // arca restore：保留期内一条命令找回——直接操作共享的存储根（模拟
+        // `arca restore` 命令壳的核心调用）。
+        let restored_version =
+            crate::trash::restore(&root, "photo.png", &actor(), "2026-08-08T10:00:00Z").unwrap();
+        assert_eq!(
+            fs::read(store.path().join("files/photo.png")).unwrap(),
+            b"precious bytes",
+            "找回的内容必须与删除前完全一致"
+        );
+
+        // 恢复后，设备丙（一台此前从未见过这个文件的新设备）同步应当能重新
+        // 下载到这份找回的内容——证明 restore 不只是写了字节，index/items/
+        // journal 全套指针都被正确地重新建立起来了。
+        let device_c = tempfile::tempdir().unwrap();
+        let report_c = sync(device_c.path(), &root, &actor(), &mut sink).unwrap();
+        assert_eq!(report_c.downloaded, vec!["photo.png".to_string()]);
+        assert_eq!(
+            fs::read(device_c.path().join("photo.png")).unwrap(),
+            b"precious bytes"
+        );
+        let remote = hub::read_remote(&root).unwrap();
+        match remote.get("photo.png") {
+            Some(RemoteState::Present { version_id, .. }) => {
+                assert_eq!(*version_id, restored_version.version_id)
+            }
+            other => panic!("恢复后应为 Present，实得 {other:?}"),
+        }
     }
 
     #[test]
