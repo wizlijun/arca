@@ -115,12 +115,21 @@ fn io_err(path: &Path, e: io::Error) -> TrashError {
     }
 }
 
-/// `.meta` 记录：原逻辑路径、`item_id`、移入回收站的时刻（FORMAT.md §7.3）。
+/// `.meta` 记录：原逻辑路径、`item_id`、移入回收站的时刻、内容哈希与大小
+/// （FORMAT.md §7.3）。
+///
+/// `hash`/`size`（评审 Critical #2）：`.meta`/`.data` 两个文件都"存在"不代表
+/// `.data` 里此刻的字节没有被外部工具截断、替换或换成悬空符号链接——闸门
+/// 第 4 道（`gates::check_delete`）与 `restore` 写回前都要拿它们与重新打开
+/// `.data` 算出的实际哈希比对，三方一致才当作"确实可取回"（见
+/// [`crate::gates::check_delete`] 与本模块 [`restore`] 的文档）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrashMeta {
     pub path: String,
     pub item_id: ItemId,
     pub deleted_at: String,
+    pub hash: ContentHash,
+    pub size: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -129,6 +138,8 @@ struct MetaWire {
     path: String,
     item_id: String,
     deleted_at: String,
+    hash: String,
+    size: u64,
 }
 
 impl TrashMeta {
@@ -138,6 +149,8 @@ impl TrashMeta {
             path: self.path.clone(),
             item_id: self.item_id.to_hex(),
             deleted_at: self.deleted_at.clone(),
+            hash: self.hash.to_text(),
+            size: self.size,
         };
         serde_json::to_string(&wire).map_err(|e| FormatError::Malformed {
             line: 0,
@@ -162,10 +175,16 @@ impl TrashMeta {
             line: 0,
             reason: format!("item_id {:?} 不合法：{e}", wire.item_id),
         })?;
+        let hash = ContentHash::parse(&wire.hash).map_err(|e| FormatError::Malformed {
+            line: 0,
+            reason: format!("hash {:?} 不合法：{e}", wire.hash),
+        })?;
         Ok(TrashMeta {
             path: wire.path,
             item_id,
             deleted_at: wire.deleted_at,
+            hash,
+            size: wire.size,
         })
     }
 }
@@ -199,10 +218,20 @@ pub fn move_to_trash(
     let source = format!("{}/{}", layout::FILES_DIR, path);
     atomic::rename(root, &source, &data_path(trash_id)).map_err(TrashError::Atomic)?;
 
+    // hash/size 算的是刚移动到位的 `.data`（评审 Critical #2，FORMAT.md §7.3）：
+    // 读的是 rename 已经落地的那份内容，不会因为先读源再 rename 之间的窗口
+    // 读到不一致的字节；`.data` 先于 `.meta` 的写入顺序纪律不受影响——这里
+    // 只是多读一次已经属于回收站的内容，不改变两个文件谁先落盘。
+    let bytes = read_content(root, trash_id)?;
+    let hash = ContentHash::from_bytes(&bytes);
+    let size = bytes.len() as u64;
+
     let meta = TrashMeta {
         path: path.to_string(),
         item_id,
         deleted_at: deleted_at.to_string(),
+        hash,
+        size,
     };
     let text = meta.to_json().map_err(TrashError::Format)?;
     atomic::write(root, &meta_path(trash_id), text.as_bytes()).map_err(TrashError::Atomic)?;
@@ -257,6 +286,74 @@ pub fn list(root: &StorageRoot) -> Result<Vec<TrashEntry>, TrashError> {
     Ok(out)
 }
 
+/// 一条 `.arca/trash/` 巡检问题：哪个文件、为什么读不懂——供 [`scan_issues`]
+/// 逐条累积（评审 Minor：`list()` 遇到第一条损坏就整体报错是对的，但那留下
+/// 一个后果——一条损坏的 `.meta` 会让整个数据集的删除与 `restore --list`
+/// 永久失效，且没有任何诊断通路指出到底是哪一条坏的）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrashIssue {
+    pub file_name: String,
+    pub reason: String,
+}
+
+impl fmt::Display for TrashIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}：{}", self.file_name, self.reason)
+    }
+}
+
+/// 巡检 `.arca/trash/` 下每一条 `.meta`，逐条尝试解析、**不因为某一条损坏
+/// 就整体放弃**——只服务诊断（`arca doctor`），不服务任何操作路径
+/// （[`list`]/闸门第 4 道/`restore` 仍然维持"读错一条就整体报错"的既有纪律，
+/// 见 `list` 的文档；操作路径需要的是"要么完整可信、要么不用"的证据，诊断
+/// 路径需要的恰恰相反——尽量多找出几条具体问题）。
+///
+/// 目录本身不存在视为没有问题（与 [`list`] 同一处理）。返回值按文件名排序，
+/// 确定性输出。
+pub fn scan_issues(root: &StorageRoot) -> Result<Vec<TrashIssue>, TrashError> {
+    let dir = root.path().join(layout::TRASH_DIR);
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io_err(&dir, e)),
+    };
+
+    let mut issues = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| io_err(&dir, e))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".meta") else {
+            continue;
+        };
+        if let Err(e) = TrashId::parse(stem) {
+            issues.push(TrashIssue {
+                file_name: name.to_string(),
+                reason: e.to_string(),
+            });
+            continue;
+        }
+        match fs::read_to_string(&path) {
+            Ok(text) => {
+                if let Err(e) = TrashMeta::parse(&text) {
+                    issues.push(TrashIssue {
+                        file_name: name.to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+            Err(e) => issues.push(TrashIssue {
+                file_name: name.to_string(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+    issues.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    Ok(issues)
+}
+
 /// `.data` 内容此刻是否确实存在——闸门第 4 道在"有一条 `.meta` 记录"之上
 /// 再核验一次内容本身没有缺失（`.meta` 先于内容存在的窗口理论上不该出现，
 /// 见 [`move_to_trash`] `.data` 先于 `.meta` 的写入顺序纪律；闸门存在的
@@ -275,6 +372,45 @@ pub fn read_content(root: &StorageRoot, id: TrashId) -> Result<Vec<u8>, TrashErr
     fs::read(&path).map_err(|e| io_err(&path, e))
 }
 
+/// 重新打开 `.data` 并现场重算 BLAKE3（评审 Critical #2，FORMAT.md §7.3）：
+/// `.meta`/`.data` 两个文件都"存在"（[`data_exists`]）不代表 `.data` 里此刻的
+/// 字节没有被外部工具截断、替换或换成悬空符号链接——`fs::read` 会照常跟随
+/// 符号链接，悬空链接读出的是 `NotFound`，截断成 0 字节的文件读出的是一个
+/// 与任何非空内容都不同的哈希，两种攻击面都被这里的重新计算自然捕获，不需要
+/// 额外的符号链接/长度特判。闸门第 4 道（`gates::check_delete`）与
+/// [`restore`] 写回前都必须调用它，与 `.meta.hash` 及各自上下文里已知的
+/// 期望哈希三方比对一致，才能当作"这份内容确实可取回"。
+pub fn content_hash(root: &StorageRoot, id: TrashId) -> Result<ContentHash, TrashError> {
+    let bytes = read_content(root, id)?;
+    Ok(ContentHash::from_bytes(&bytes))
+}
+
+/// 保留期默认值（spec §7）：180 天。spec 明文"默认 180 天，可配"——本切片
+/// 只接一个硬编码常量，按 dataset 配置覆盖它是后续切片的范围（评审
+/// Important #4：这里只补上"判断"本身，`gc` 落地时需要的互斥/租约约定
+/// 记进报告，不在本轮实现）。
+pub const DEFAULT_RETENTION_DAYS: i64 = 180;
+
+/// 这条回收站记录此刻是否仍在保留期内：`deleted_at + retention_days > now`
+/// （spec §7，评审 Important #4）。
+///
+/// `deleted_at`/`now` 解析失败（结构上不该出现：两者都出自
+/// `clock::now_rfc3339()` 同一条生成规则，见 `move_to_trash`/`restore` 的
+/// 调用点）时保守地当作"仍在保留期内"（`true`）——I5 通常要求"状态模糊就
+/// 停下"，但这里的下游后果是"是否在 `restore --list` 里标一个过期提示"，
+/// 不是任何会销毁数据的判断（本切片没有 `gc`，回收站里的内容不会因为这个
+/// 判断的结果而消失）；错误地少标一次"已过期"远好于错误地让用户以为一份
+/// 其实还在保留期内的内容已经不能恢复。
+pub fn within_retention(meta: &TrashMeta, now: &str, retention_days: i64) -> bool {
+    let (Some(deleted_at), Some(now)) = (
+        crate::clock::parse_rfc3339(&meta.deleted_at),
+        crate::clock::parse_rfc3339(now),
+    ) else {
+        return true;
+    };
+    deleted_at + retention_days * 86_400 > now
+}
+
 // ---------------------------------------------------------------------------
 // `arca restore`（M2a tombstone 计划 Task 5，spec §7）
 // ---------------------------------------------------------------------------
@@ -286,6 +422,13 @@ pub enum RestoreError {
     /// `arca gc`（M2 后续切片，本切片不实现）物理销毁。
     NotFound {
         path: String,
+    },
+    /// 回收站记录的 `.data` 内容与其 `.meta.hash` 不一致（评审 Critical #2）——
+    /// 内容已经被截断/替换/篡改，拒绝把可能损坏的字节当作"找回成功"写回
+    /// `files/`。
+    ContentMismatch {
+        path: String,
+        trash_id: TrashId,
     },
     Trash(TrashError),
     Format(FormatError),
@@ -304,6 +447,11 @@ impl fmt::Display for RestoreError {
                 f,
                 "{path}：保留期内没有可恢复的回收站记录——从未删除过，或已被 `arca gc` 物理销毁"
             ),
+            RestoreError::ContentMismatch { path, trash_id } => write!(
+                f,
+                "{path}：回收站记录 {trash_id} 的内容与其 .meta 记录的哈希不一致\
+                 （可能已损坏或被篡改），拒绝写回"
+            ),
             RestoreError::Trash(e) => write!(f, "{e}"),
             RestoreError::Format(e) => write!(f, "{e}"),
             RestoreError::Journal(e) => write!(f, "{e}"),
@@ -320,7 +468,9 @@ impl std::error::Error for RestoreError {
             RestoreError::Format(e) => Some(e),
             RestoreError::Journal(e) => Some(e),
             RestoreError::Atomic(e) => Some(e),
-            RestoreError::NotFound { .. } | RestoreError::Io { .. } => None,
+            RestoreError::NotFound { .. }
+            | RestoreError::ContentMismatch { .. }
+            | RestoreError::Io { .. } => None,
         }
     }
 }
@@ -359,6 +509,22 @@ impl std::error::Error for RestoreError {
 /// 本函数只读 `.arca/trash/` 的内容，不删除、不移动它——本切片不做任何过期
 /// 清理，物理销毁只经显式 `arca gc`（M2 后续切片，I3）。同一份回收站记录
 /// 因此可以被 `restore` 多次（每次都产生一条新版本，指向同一份原始字节）。
+///
+/// # 恢复不该比删除拥有更大的销毁权（评审 Critical #1）
+///
+/// spec §4.1 明文预期"删除后同名重建"：`photo.png` 被删除（进回收站）后，
+/// 用户完全可能在同一路径上新建一份**完全不相关**的内容，`sync` 会把它当作
+/// 新身份上传（`Upload{parent:None}`），`files/<path>` 因此指向一个与本次要
+/// 恢复的 item **不同**的、此刻鲜活的 item。若 `restore` 只顾着把回收站里的
+/// 旧内容写回 `files/<path>`，会把这份新内容**直接覆盖销毁**——不进回收站、
+/// 不留痕迹、exit 0——比 `arca` 里任何一条已知的删除路径都更危险：删除
+/// 好歹要过四道闸门，`restore` 却完全没有对"即将被覆盖的内容"做任何核验。
+///
+/// 写回前必须探测 `files/<path>` 此刻是否已经被占用（[`current_occupant`]）：
+/// 占用者据当前 index 记录得到的 `item_id` 与即将写回的 item 不同、或内容
+/// 哈希与即将写入的不同，都视为"这是另一份鲜活的内容"，写回前先把它自己
+/// `move_to_trash` 一遍——恢复因此绝不会比删除拥有更大的销毁权：任何被
+/// `restore` 顶替下去的内容，都能用同一个 `arca restore` 再找回来。
 pub fn restore(
     root: &StorageRoot,
     path: &str,
@@ -374,10 +540,33 @@ pub fn restore(
             path: path.to_string(),
         })?;
 
+    // 评审 Critical #2：写回前重新核验一次内容与 `.meta.hash` 一致——回收站
+    // 记录本身也可能被外部工具截断/替换（见 `content_hash` 文档），不能只信
+    // "读得到字节"就当作内容完好，绝不能把可能损坏的内容当作"找回成功"。
     let bytes = read_content(root, chosen.trash_id).map_err(RestoreError::Trash)?;
     let hash = ContentHash::from_bytes(&bytes);
+    if hash != chosen.meta.hash {
+        return Err(RestoreError::ContentMismatch {
+            path: path.to_string(),
+            trash_id: chosen.trash_id,
+        });
+    }
     let size = bytes.len() as u64;
     let item_id = chosen.meta.item_id;
+
+    // 评审 Critical #1：见本函数顶部「恢复不该比删除拥有更大的销毁权」一节。
+    if let Some(occupant) = current_occupant(root, path)? {
+        let same_item = occupant.item_id == Some(item_id);
+        let same_content = occupant.hash == hash;
+        if !(same_item && same_content) {
+            // 占用者若有存活的 index 记录，用它记录的 item_id；没有（孤儿
+            // 字节，结构上不该出现但防御性处理）则铸一个全新身份，绝不能
+            // 借用即将写入的 `item_id`——那会把这份内容错误地并入另一个
+            // item 的历史。
+            let protect_item_id = occupant.item_id.unwrap_or_else(crate::ids::new_item_id);
+            move_to_trash(root, path, protect_item_id, at).map_err(RestoreError::Trash)?;
+        }
+    }
 
     let parent = last_version_id(root, item_id)?;
     let version_id = crate::ids::new_version_id();
@@ -416,6 +605,58 @@ pub fn restore(
     .map_err(RestoreError::Journal)?;
 
     Ok(version)
+}
+
+/// `files/<path>` 此刻的占用者——`restore` 写回前用它判断"覆盖会不会销毁
+/// 一份鲜活的内容"（评审 Critical #1，见 [`restore`] 文档）。
+struct CurrentOccupant {
+    /// 当前 index 记录指向的 item_id；没有存活 index 记录（路径当前是
+    /// tombstoned/absent，或结构上不该出现的孤儿字节）时为 `None`。
+    item_id: Option<ItemId>,
+    hash: ContentHash,
+}
+
+/// 探测 `files/<path>` 此刻是否有内容，有则一并给出它据当前 index 记录得到
+/// 的 `item_id`（可能没有）与内容哈希。路径当前没有内容（正常情况：已被
+/// tombstone 且从未重建，或从未存在过）返回 `None`，不是错误。
+fn current_occupant(
+    root: &StorageRoot,
+    path: &str,
+) -> Result<Option<CurrentOccupant>, RestoreError> {
+    let full = root.path().join(format!("{}/{}", layout::FILES_DIR, path));
+    let bytes = match fs::read(&full) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(RestoreError::Io {
+                path: full.display().to_string(),
+                reason: e.to_string(),
+            })
+        }
+    };
+    let hash = ContentHash::from_bytes(&bytes);
+    let item_id = read_index_item_id(root, path)?;
+    Ok(Some(CurrentOccupant { item_id, hash }))
+}
+
+/// 读 `index/<key>.json` 对 `path` 的当前记录（若有）——`restore` 用它判断
+/// `files/<path>` 此刻的占用者归属哪个 item；`index/` 记录缺失（路径当前是
+/// tombstoned 或从未存在）返回 `None`，不是错误。
+fn read_index_item_id(root: &StorageRoot, path: &str) -> Result<Option<ItemId>, RestoreError> {
+    let key = path_rules::index_key(path);
+    let rel = layout::index_path(&key);
+    let full = root.path().join(&rel);
+    match fs::read_to_string(&full) {
+        Ok(text) => {
+            let record = IndexRecord::parse(&text).map_err(RestoreError::Format)?;
+            Ok(Some(record.item_id))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(RestoreError::Io {
+            path: full.display().to_string(),
+            reason: e.to_string(),
+        }),
+    }
 }
 
 /// 读出 `item_id` 版本链的最后一条 `version_id`，作为这次恢复产生的新版本
@@ -530,6 +771,9 @@ mod tests {
         assert_eq!(meta.path, "a.png");
         assert_eq!(meta.item_id, item_id);
         assert_eq!(meta.deleted_at, "2026-08-08T09:00:05Z");
+        // 评审 Critical #2：`.meta` 现在必须记下移入时刻内容的哈希与大小。
+        assert_eq!(meta.hash, ContentHash::from_bytes(b"photo bytes"));
+        assert_eq!(meta.size, "photo bytes".len() as u64);
     }
 
     #[test]
@@ -568,6 +812,8 @@ mod tests {
             path: "京都/鸭川.png".to_string(),
             item_id: ItemId::from_bytes([0x77; 16]),
             deleted_at: "2026-08-08T09:00:05Z".to_string(),
+            hash: ContentHash::from_bytes(b"content"),
+            size: 7,
         };
         let text = meta.to_json().unwrap();
         assert_eq!(TrashMeta::parse(&text).unwrap(), meta);
@@ -642,6 +888,62 @@ mod tests {
         assert!(!data_exists(&root, phantom));
     }
 
+    // -----------------------------------------------------------------
+    // `within_retention`（评审 Important #4）
+    // -----------------------------------------------------------------
+
+    fn meta_deleted_at(deleted_at: &str) -> TrashMeta {
+        TrashMeta {
+            path: "a.png".to_string(),
+            item_id: ItemId::from_bytes([0x11; 16]),
+            deleted_at: deleted_at.to_string(),
+            hash: ContentHash::from_bytes(b"content"),
+            size: 7,
+        }
+    }
+
+    #[test]
+    fn within_retention刚删除时在保留期内() {
+        let meta = meta_deleted_at("2026-08-08T09:00:00Z");
+        assert!(within_retention(
+            &meta,
+            "2026-08-08T09:00:01Z",
+            DEFAULT_RETENTION_DAYS
+        ));
+    }
+
+    #[test]
+    fn within_retention超出180天则不再在保留期内() {
+        let meta = meta_deleted_at("2026-01-01T00:00:00Z");
+        // 180 天之后的同一时刻——deleted_at + 180d 应该恰好等于 now，
+        // `>` 而不是 `>=`，此刻已经不算"仍在保留期内"。
+        assert!(!within_retention(
+            &meta,
+            "2026-06-30T00:00:00Z",
+            DEFAULT_RETENTION_DAYS
+        ));
+    }
+
+    #[test]
+    fn within_retention未满180天仍在保留期内() {
+        let meta = meta_deleted_at("2026-01-01T00:00:00Z");
+        assert!(within_retention(
+            &meta,
+            "2026-06-29T00:00:00Z",
+            DEFAULT_RETENTION_DAYS
+        ));
+    }
+
+    #[test]
+    fn within_retention时间戳解析失败时保守地当作仍在保留期内() {
+        let meta = meta_deleted_at("不是合法的rfc3339");
+        assert!(within_retention(
+            &meta,
+            "2026-08-08T09:00:00Z",
+            DEFAULT_RETENTION_DAYS
+        ));
+    }
+
     #[test]
     fn list遇到损坏的meta文件时整体报错而不是跳过() {
         let dir = tempfile::tempdir().unwrap();
@@ -660,6 +962,52 @@ mod tests {
 
         let err = list(&root).unwrap_err();
         assert!(matches!(err, TrashError::Format(_)), "实得 {err:?}");
+    }
+
+    /// 评审 Minor 的复现测试：`list()` 因为一条损坏的 `.meta` 整体报错时，
+    /// `scan_issues()` 必须还能点名具体是哪个文件、坏在哪——不能像 `list()`
+    /// 一样在第一条就放弃，也不能把好的记录一并当成"有问题"。
+    #[test]
+    fn scan_issues点名具体哪个文件损坏且不影响健康记录() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        fs::write(dir.path().join("files/a.png"), b"a").unwrap();
+        let root = open(dir.path());
+        move_to_trash(&root, "a.png", ItemId::from_bytes([0x11; 16]), "t").unwrap();
+
+        let phantom = TrashId(crate::ids::random_bytes16());
+        fs::write(
+            dir.path().join(format!(".arca/trash/{phantom}.meta")),
+            "不是合法json",
+        )
+        .unwrap();
+
+        // list() 仍然按既有纪律整体报错（操作路径的证据要么完整、要么不用）。
+        assert!(list(&root).is_err());
+
+        let issues = scan_issues(&root).unwrap();
+        assert_eq!(issues.len(), 1, "只有那一条损坏记录应该被点名：{issues:?}");
+        assert_eq!(issues[0].file_name, format!("{phantom}.meta"));
+    }
+
+    #[test]
+    fn scan_issues对健康的trash目录返回空列表() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        fs::write(dir.path().join("files/a.png"), b"a").unwrap();
+        let root = open(dir.path());
+        move_to_trash(&root, "a.png", ItemId::from_bytes([0x11; 16]), "t").unwrap();
+
+        assert!(scan_issues(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_issues对不存在的trash目录返回空列表而不是报错() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        fs::remove_dir(dir.path().join(".arca/trash")).unwrap();
+        let root = open(dir.path());
+        assert!(scan_issues(&root).unwrap().is_empty());
     }
 
     // -----------------------------------------------------------------
@@ -808,6 +1156,36 @@ mod tests {
         assert!(matches!(err, RestoreError::NotFound { .. }), "实得 {err:?}");
     }
 
+    /// 评审 Minor 相关的前提验证（`last_version_id` 文档已经写明"结构上不
+    /// 应该发生，防御性地允许恢复继续进行"）：手工构造一条回收站记录，但
+    /// **不**写它对应的 `items/<item_id>.jsonl`（正常执行流程不会产生这种
+    /// 状态——move_to_trash 前必然已经有至少一条 upsert 版本，这里是直接
+    /// 绕过正常流程去模拟"版本链文件本身丢失/损坏到读不出内容"）。`restore`
+    /// 仍然应该成功找回内容，但产出的版本 `parent` 必须是 `None`——命令壳
+    /// （`restore_cmd`）依据这个信号在 stderr 打印警告，本测试钉住这个信号
+    /// 本身在这种场景下确实会出现，不会被静默吞掉。
+    #[test]
+    fn restore时版本链缺失仍能找回内容但parent为none() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        fs::write(dir.path().join("files/orphan.png"), b"orphan bytes").unwrap();
+        let root = open(dir.path());
+        let item_id = ItemId::from_bytes([0x66; 16]);
+        // 刻意不写 items/<item_id>.jsonl。
+        move_to_trash(&root, "orphan.png", item_id, "2026-08-08T09:00:00Z").unwrap();
+
+        let restored = restore(&root, "orphan.png", &actor(), "2026-08-08T09:20:00Z").unwrap();
+        assert_eq!(
+            restored.parent, None,
+            "版本链缺失时 parent 应为 None（结构上不该发生，但要能观测到）"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("files/orphan.png")).unwrap(),
+            b"orphan bytes",
+            "即便版本链缺失，内容本身仍应正常找回"
+        );
+    }
+
     #[test]
     fn restore命中同路径多条历史记录时取最晚删除的一条() {
         let dir = tempfile::tempdir().unwrap();
@@ -889,5 +1267,76 @@ mod tests {
 
         assert_ne!(first.version_id, second.version_id);
         assert_eq!(first.item_id, second.item_id, "两次恢复的都是同一个 item");
+    }
+
+    /// 评审 Critical #1 的实机复现：`photo.png = OLD` adopt → 删除 → sync
+    /// （tombstone，OLD 进 trash）→ `photo.png = NEW` 同名重建 → sync（spec
+    /// §4.1：新身份上传）→ `arca restore photos photo.png`。全程只用真实的
+    /// `sync()`/`restore()`，不手工拼中间状态——这正是评审实机跑出来的攻击
+    /// 路径。修复前：`files/photo.png` 变回 OLD，NEW 的字节从 hub 上物理
+    /// 消失，`.arca/trash/` 里找不到它，不经 `arca gc`、无提示、exit 0。
+    /// 修复后：用户显式要求的恢复（OLD 写回 `files/photo.png`）照常生效，
+    /// 但 NEW 必须仍能在 `.arca/trash/` 里找到——恢复不该比删除拥有更大的
+    /// 销毁权。
+    #[test]
+    fn restore覆盖当前占用者时先移入trash_评审critical1实机复现() {
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        let root = open(store.path());
+        let mut sink = arca_format::trace::NullSink;
+
+        // 1. photo.png = OLD，adopt/sync 上传。
+        fs::write(dataset.path().join("photo.png"), b"OLD bytes").unwrap();
+        let r1 = crate::sync::sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+        assert_eq!(r1.uploaded, vec!["photo.png".to_string()]);
+
+        // 2. 删除并 sync——提交 tombstone，OLD 的字节移进 .arca/trash/。
+        fs::remove_file(dataset.path().join("photo.png")).unwrap();
+        let r2 = crate::sync::sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+        assert_eq!(r2.tombstone_submitted, vec!["photo.png".to_string()]);
+
+        // 3. 同名路径重建为完全不相关的新内容——spec §4.1 明文预期的场景，
+        // sync 把它当作全新身份上传，不是延续 OLD 的历史。
+        fs::write(dataset.path().join("photo.png"), b"NEW bytes").unwrap();
+        let r3 = crate::sync::sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+        assert_eq!(r3.uploaded, vec!["photo.png".to_string()]);
+        assert_eq!(
+            fs::read(store.path().join("files/photo.png")).unwrap(),
+            b"NEW bytes"
+        );
+        let remote_before_restore = crate::hub::read_remote(&root).unwrap();
+        let item_id_new = match remote_before_restore.get("photo.png") {
+            Some(arca_core::state::RemoteState::Present { item_id, .. }) => *item_id,
+            other => panic!("应为 Present，实得 {other:?}"),
+        };
+
+        // 4. `arca restore photos photo.png`——用户显式要找回 OLD，意图已经
+        // 消歧义（见本函数所在模块 `restore` 文档），修复不阻止这个操作。
+        let restored = restore(&root, "photo.png", &actor(), "2026-08-08T10:00:00Z").unwrap();
+        assert_eq!(
+            fs::read(store.path().join("files/photo.png")).unwrap(),
+            b"OLD bytes",
+            "用户显式要求的恢复必须照常生效"
+        );
+        assert_ne!(
+            restored.item_id, item_id_new,
+            "恢复出来的应该是 OLD 的身份，不是 NEW 的"
+        );
+
+        // 核心断言：NEW 的字节必须仍能在 .arca/trash/ 里找到，且记录着它
+        // 自己的 item_id——不能被这次 restore 静默销毁（等价于
+        // `grep -rl "NEW bytes" $HUB` 应该有命中）。
+        let entries = list(&root).unwrap();
+        let new_still_recoverable = entries.iter().any(|e| {
+            e.meta.item_id == item_id_new
+                && read_content(&root, e.trash_id)
+                    .map(|bytes| bytes == b"NEW bytes")
+                    .unwrap_or(false)
+        });
+        assert!(
+            new_still_recoverable,
+            "NEW 的字节必须仍能在 .arca/trash/ 里找到，不能被 restore 静默销毁：{entries:?}"
+        );
     }
 }

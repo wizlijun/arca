@@ -26,12 +26,19 @@
 //!    执行前重新读一次实际字节再判一次**——调和与执行之间的窗口内，文件可能
 //!    被用户改动。这是四道里唯一需要真正做 IO 的一道，也是本任务最有价值的
 //!    一条：它证明闸门不是决策的复读机，而是独立的、面向"现在"的二次核验。
-//! 4. **保留期存在**：hub 的 `.arca/trash/` 里确实有这份内容（`item_id` 匹配
-//!    的 `.meta` 记录 + 对应的 `.data` 文件都在）。本地副本被移除后，权威副本
-//!    必须仍然可取回——否则这就是销毁，不是删除（I3）。本切片不做保留期
-//!    过期判断（那是 `arca restore`/`arca gc` 的范围，见 `trash.rs` 与
+//! 4. **保留期存在**：hub 的 `.arca/trash/` 里确实有这份**可取回**的内容。
+//!    "可取回"不等于"`.meta`/`.data` 两个文件都 `symlink_metadata().is_ok()`"
+//!    （评审 Critical #2）——0 字节的 `.data`、悬空符号链接、外部工具截断/
+//!    替换过的内容都能通过那种检查，闸门却已经报告"放行"。这里改成打开
+//!    `.data`、现场重算 BLAKE3（[`trash::content_hash`]），与 `.meta.hash`
+//!    及 `ctx.base` 记录的期望哈希三方一致才放行——同一个 `item_id` 可能有
+//!    多条历史 trash 记录（该路径曾被删除又恢复/重建又再次删除），只按
+//!    `item_id` 取第一条会让一条**陈旧**记录为一条**缺失**记录背书，三方
+//!    哈希核验顺带堵死这个口子（逐条候选都要现场核验，不是找到第一个
+//!    `item_id` 匹配就停）。本切片不做保留期过期判断（那是 `arca restore`/
+//!    `arca gc` 的范围，见 `trash.rs` 与
 //!    `docs/superpowers/plans/2026-08-08-m2a-tombstone.md` Task 5），这里只
-//!    确认"存在"这个当下的事实。
+//!    确认"此刻确实可取回"这个当下的事实。
 //!
 //! **任一闸门不过 → 不删，把失败原因原样报给调用方**（I5：停下并可诊断）。
 //! `sync.rs` 把闸门拒绝计入 `SyncReport::delete_blocked`，让退出码非零、
@@ -127,6 +134,14 @@ pub struct DeleteCheck<'a> {
     pub base: &'a BaseState,
     /// hub 存储根——第 4 道闸门据此查询 `.arca/trash/`。
     pub root: &'a StorageRoot,
+    /// 本次调和开始时读到的 `.arca/trash/` 全量快照（评审 Important #3）：
+    /// 第 4 道闸门在同一次 `sync()` 里可能被调用成百上千次，每次都重新
+    /// `read_dir` + 逐条解析整个回收站目录是 O(n·m)——`sync.rs` 在循环开始
+    /// 前只读一次目录列表，这里只在内存里按 `item_id`/哈希过滤，不再重复
+    /// `read_dir`；对通过预筛的候选，仍然逐条现场重算 `.data` 的哈希
+    /// （C2 的安全性核心不能省，见 [`check_retention`]），省掉的只是目录
+    /// 遍历本身。
+    pub trash_entries: &'a [trash::TrashEntry],
 }
 
 /// 依次跑四道闸门，任一不过立即返回对应的 [`GateFailure`]，不继续往下检查——
@@ -213,20 +228,42 @@ fn check_baseline_consistency(ctx: &DeleteCheck) -> Result<(), GateFailure> {
 }
 
 /// 第 4 道：保留期存在——hub 的 `.arca/trash/` 里确实有这个 `item_id` 对应、
-/// 内容也在场的记录。
+/// 内容也在场的记录（评审 Critical #2：三方哈希核验，见模块顶部文档）。
 fn check_retention(ctx: &DeleteCheck) -> Result<(), GateFailure> {
-    let entries = trash::list(ctx.root).map_err(|e| GateFailure::Io {
-        path: ".arca/trash".to_string(),
-        reason: e.to_string(),
-    })?;
+    // `ctx.base` 到这里必然是 `Present`——`check_baseline_consistency` 已经在
+    // 它之前跑过，`Absent` 分支在那一步就已经拒绝。这里的 `Absent` 分支只是
+    // 防御性兜底（I5：绝不假设调用顺序不会变），不是正常可达路径。
+    let expected_hash = match ctx.base {
+        BaseState::Present { hash, .. } => *hash,
+        BaseState::Absent => {
+            return Err(GateFailure::RetentionMissing {
+                path: ctx.path.to_string(),
+                item_id: ctx.item_id,
+            });
+        }
+    };
 
-    let found = entries.iter().find(|e| e.meta.item_id == ctx.item_id);
-    match found {
-        Some(entry) if trash::data_exists(ctx.root, entry.trash_id) => Ok(()),
-        _ => Err(GateFailure::RetentionMissing {
+    // 目录列表来自调用方在循环开始前读好的快照（评审 Important #3），这里
+    // 不再重复 `read_dir` 整个 `.arca/trash/`——`.meta.hash` 先做一次快速
+    // 预筛（同一 item_id 可能有多条历史记录，见模块顶部文档），再逐条现场
+    // 重算 `.data` 的哈希——只信 `.meta` 记录的哈希不够：`.meta` 说的是
+    // "移入时刻"的内容，`.data` 此刻可能已经被外部工具截断/替换。任一候选
+    // 三方一致（`ctx.base` 的期望哈希 = `.meta.hash` = 现场重算的哈希）即
+    // 放行；一条候选核验失败不放弃，继续看下一条，绝不让一条陈旧/损坏的
+    // 记录为另一条缺失的记录背书。
+    let recoverable = ctx
+        .trash_entries
+        .iter()
+        .filter(|e| e.meta.item_id == ctx.item_id && e.meta.hash == expected_hash)
+        .any(|entry| matches!(trash::content_hash(ctx.root, entry.trash_id), Ok(h) if h == expected_hash));
+
+    if recoverable {
+        Ok(())
+    } else {
+        Err(GateFailure::RetentionMissing {
             path: ctx.path.to_string(),
             item_id: ctx.item_id,
-        }),
+        })
     }
 }
 
@@ -313,6 +350,9 @@ mod tests {
 
     impl Scene {
         fn check(&self) -> Result<(), GateFailure> {
+            // 测试里不追求性能，每次 check() 都重新读一遍 trash 快照即可——
+            // 生产代码（`sync.rs`）才是真正只读一次的调用方。
+            let trash_entries = crate::trash::list(&self.root).unwrap();
             check_delete(&DeleteCheck {
                 path: "a.png",
                 item_id: self.item_id,
@@ -321,6 +361,7 @@ mod tests {
                 dataset_root: &self.dataset_root,
                 base: &self.base,
                 root: &self.root,
+                trash_entries: &trash_entries,
             })
         }
     }
@@ -446,6 +487,7 @@ mod tests {
         };
         let mut scanned_paths = BTreeSet::new();
         scanned_paths.insert("a.png".to_string());
+        let trash_entries = crate::trash::list(&root).unwrap();
 
         let err = check_delete(&DeleteCheck {
             path: "a.png",
@@ -455,11 +497,137 @@ mod tests {
             dataset_root: &dataset_root,
             base: &base,
             root: &root,
+            trash_entries: &trash_entries,
         })
         .unwrap_err();
         assert!(
             matches!(err, GateFailure::RetentionMissing { .. }),
             "实得 {err:?}"
+        );
+    }
+
+    /// 评审 Critical #2 实机复现之一：`.data` 被截成 0 字节（ENOSPC 下的部分
+    /// 拷贝、位腐都会造出这个状态）——旧实现只用 `symlink_metadata().is_ok()`
+    /// 判断"存在"，0 字节文件照样通过；修复后必须重新打开、重算哈希，与
+    /// `.meta.hash`/`ctx.base` 的期望哈希不一致就拦住。
+    #[test]
+    fn 第4道_trash的data被截成0字节时拦住_评审critical2实机复现() {
+        let scene = 搭建全过场景();
+        assert!(scene.check().is_ok(), "测试前置条件：改坏之前应先能全过");
+
+        let entries = crate::trash::list(&scene.root).unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.meta.item_id == scene.item_id)
+            .expect("测试前置条件：应能找到对应的 trash 记录");
+        let data_path = scene
+            ._dir
+            .path()
+            .join(format!(".arca/trash/{}.data", entry.trash_id));
+        fs::write(&data_path, b"").unwrap();
+
+        let err = scene.check().unwrap_err();
+        assert!(
+            matches!(err, GateFailure::RetentionMissing { .. }),
+            "0 字节的 .data 不应被当作可取回，实得 {err:?}"
+        );
+    }
+
+    /// 评审 Critical #2 实机复现之二：`.data` 被换成悬空符号链接（hub 常年
+    /// 放在外置盘/网盘同步目录/备份还原出来的副本上，rsync 出来的悬空链接
+    /// 是真实会出现的状态）——旧实现的 `symlink_metadata` 不跟随链接，"链接
+    /// 本身存在"就判定通过；修复后 `content_hash` 用 `fs::read` 跟随链接，
+    /// 悬空链接读出 `NotFound`，闸门必须拦住而不是放行后让紧随其后的
+    /// `arca restore` 才发现"其实找不到"。
+    #[test]
+    #[cfg(unix)]
+    fn 第4道_trash的data换成悬空符号链接时拦住_评审critical2实机复现() {
+        use std::os::unix::fs::symlink;
+
+        let scene = 搭建全过场景();
+        assert!(scene.check().is_ok(), "测试前置条件：改坏之前应先能全过");
+
+        let entries = crate::trash::list(&scene.root).unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.meta.item_id == scene.item_id)
+            .expect("测试前置条件：应能找到对应的 trash 记录");
+        let data_path = scene
+            ._dir
+            .path()
+            .join(format!(".arca/trash/{}.data", entry.trash_id));
+        fs::remove_file(&data_path).unwrap();
+        symlink(scene._dir.path().join("不存在的目标"), &data_path).unwrap();
+
+        let err = scene.check().unwrap_err();
+        assert!(
+            matches!(err, GateFailure::RetentionMissing { .. }),
+            "悬空符号链接不应被当作可取回，实得 {err:?}"
+        );
+    }
+
+    /// 评审 Critical #2 指出的连带问题：旧实现 `entries.iter().find(|e|
+    /// e.meta.item_id == ctx.item_id)` 只按 `item_id` 取第一条——同一个
+    /// item 若有多条历史 trash 记录（该 item 曾被删除又重建又再次删除，
+    /// 从未 `arca gc`），一条**陈旧**记录（内容与本次要保护的版本不同）
+    /// 足以为一条**缺失**记录（本该匹配、但 `.data` 已损坏）背书，`list()`
+    /// 按 `trash_id`（随机十六进制）排序，谁排在前全看运气。三方哈希核验
+    /// 逐条候选现场核验，从根上堵死这个口子。
+    #[test]
+    fn 第4道_陈旧的历史记录不能为缺失的当前记录背书_评审critical2实机复现() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let dataset_root = dir.path().join("dataset");
+        fs::create_dir_all(&dataset_root).unwrap();
+        fs::write(dataset_root.join("a.png"), b"content").unwrap();
+
+        let root = open(dir.path());
+        let item_id = ItemId::from_bytes([0x3f; 16]);
+
+        // 陈旧记录：同一 item_id 更早一次删除留下的历史 trash 记录，内容与
+        // "现在"要保护的版本不同。
+        fs::write(dir.path().join("files/old.png"), b"old stale content").unwrap();
+        crate::trash::move_to_trash(&root, "old.png", item_id, "t1").unwrap();
+
+        // "现在"这条记录：内容本应与本次删除要保护的版本一致，但它的
+        // `.data` 随后被截断——这才是本次删除真正应该核验、也确实核验失败
+        // 的那一条。
+        fs::write(dir.path().join("files/a.png"), b"content").unwrap();
+        let current_id = crate::trash::move_to_trash(&root, "a.png", item_id, "t2").unwrap();
+        fs::write(
+            dir.path().join(format!(".arca/trash/{current_id}.data")),
+            b"",
+        )
+        .unwrap();
+
+        let base = BaseState::Present {
+            item_id,
+            version_id: version_id(),
+            hash: ContentHash::from_bytes(b"content"),
+            size: 7,
+        };
+        let remote_state = RemoteState::Tombstoned {
+            item_id,
+            version_id: version_id(),
+        };
+        let mut scanned_paths = BTreeSet::new();
+        scanned_paths.insert("a.png".to_string());
+        let trash_entries = crate::trash::list(&root).unwrap();
+
+        let err = check_delete(&DeleteCheck {
+            path: "a.png",
+            item_id,
+            scanned_paths: &scanned_paths,
+            remote_state: &remote_state,
+            dataset_root: &dataset_root,
+            base: &base,
+            root: &root,
+            trash_entries: &trash_entries,
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, GateFailure::RetentionMissing { .. }),
+            "陈旧记录不应为损坏的当前记录背书，实得 {err:?}"
         );
     }
 
@@ -483,6 +651,7 @@ mod tests {
         };
         let remote_state = RemoteState::Absent;
         let scanned_paths = BTreeSet::new();
+        let trash_entries = crate::trash::list(&root).unwrap();
 
         let err = check_delete(&DeleteCheck {
             path: "a.png",
@@ -492,6 +661,7 @@ mod tests {
             dataset_root: &dataset_root,
             base: &base,
             root: &root,
+            trash_entries: &trash_entries,
         })
         .unwrap_err();
         assert!(
