@@ -36,7 +36,7 @@
 //! 用旧版本二进制跑过的既有数据集、或被人手工改过清单的数据集仍可能处于
 //! 漂移状态——`doctor` 独立比对一遍，见 [`check_manifest`]。
 
-use crate::{baseline, dataset, hub, scan};
+use crate::{baseline, dataset, hub, scan, trash};
 use arca_core::state::BaseState;
 use arca_format::gitarca::Registry;
 use arca_format::manifest::Manifest;
@@ -139,6 +139,11 @@ pub enum DatasetHealth {
         ignore_issues: Vec<IgnoreIssue>,
         /// 清单与基线不一致时的具体问题（模块顶部「债四」），`None` 即一致。
         manifest_issue: Option<ManifestIssue>,
+        /// `.arca/trash/` 里逐条巡检出的损坏记录（评审 Minor）：`trash::list`
+        /// 遇到第一条损坏的 `.meta` 就整体报错是对的（I5），但那会让整个
+        /// 数据集的删除与 `restore --list` 永久失效，且不指出到底是哪一条
+        /// 坏的——这里用 `trash::scan_issues` 逐条累积，点名具体的文件。
+        trash_issues: Vec<trash::TrashIssue>,
     },
     /// 存储根打不开（I11：未挂载或卷身份不符）——数据集离线。**绝不能因此
     /// 假装"本地没有未同步文件"**：那本该是 `local_only` 检查要回答的问题，
@@ -180,8 +185,14 @@ impl DoctorReport {
                     local_only,
                     ignore_issues,
                     manifest_issue,
+                    trash_issues,
                     ..
-                } => local_only.is_empty() && ignore_issues.is_empty() && manifest_issue.is_none(),
+                } => {
+                    local_only.is_empty()
+                        && ignore_issues.is_empty()
+                        && manifest_issue.is_none()
+                        && trash_issues.is_empty()
+                }
                 DatasetHealth::Offline { .. }
                 | DatasetHealth::CheckFailed { .. }
                 | DatasetHealth::ResolveFailed { .. } => false,
@@ -233,6 +244,7 @@ pub fn doctor(repo: &Repo, registry: &Registry, root_override: Option<&Path>) ->
                         local_only: details.local_only,
                         ignore_issues: details.ignore_issues,
                         manifest_issue: details.manifest_issue,
+                        trash_issues: details.trash_issues,
                     },
                     Err(reason) => DatasetHealth::CheckFailed {
                         path: resolved.normalized_path,
@@ -259,6 +271,7 @@ struct CheckedDetails {
     local_only: Vec<String>,
     ignore_issues: Vec<IgnoreIssue>,
     manifest_issue: Option<ManifestIssue>,
+    trash_issues: Vec<trash::TrashIssue>,
 }
 
 /// 扫描本地 + 读远端 +（评审新增）实测 `.gitignore` 反选块 + 比对清单与
@@ -282,11 +295,13 @@ fn check_dataset(
 
     let ignore_issues = check_ignore_block(repo, normalized_path)?;
     let manifest_issue = check_manifest(dataset_dir)?;
+    let trash_issues = trash::scan_issues(store_root).map_err(|e| e.to_string())?;
 
     Ok(CheckedDetails {
         local_only,
         ignore_issues,
         manifest_issue,
+        trash_issues,
     })
 }
 
@@ -728,5 +743,64 @@ mod tests {
             other => panic!("应为 Checked，实得 {other:?}"),
         }
         assert!(!report.is_clean());
+    }
+
+    /// 评审 Minor 的复现测试：`.arca/trash/` 里一条损坏的 `.meta` 记录
+    /// 此前完全没有代码路径能点名——`trash::list()` 遇到它就整体报错，
+    /// 让整个数据集的删除与 `restore --list` 永久失效，但没有任何诊断指出
+    /// 到底是哪个文件坏的。`doctor` 现在用 `trash::scan_issues` 单独巡检，
+    /// 必须能点名具体是哪个 `trash_id`。
+    #[test]
+    fn trash里损坏的meta被doctor点名具体文件() {
+        let (vault_dir, _store_dir) = 建已登记的数据集(&[("a.txt", b"hello")]);
+
+        let vault = crate::vault::open(vault_dir.path()).unwrap();
+        let entry = &vault.registry.datasets()[0];
+        let hub = vault.registry.hub(&entry.hub).unwrap();
+        let root_path = crate::vault::resolve_hub_root(hub, None).unwrap();
+        let cfg_text =
+            fs::read_to_string(vault_dir.path().join("assets/.arca/dataset.toml")).unwrap();
+        let cfg = arca_format::dataset::DatasetConfig::parse(&cfg_text).unwrap();
+        let store_root = arca_store::root::StorageRoot::create(
+            &root_path,
+            &cfg.dataset_id,
+            "2026-08-08T09:00:00Z",
+        )
+        .unwrap();
+        let mut sink = NullSink;
+        sync::sync(
+            &vault_dir.path().join("assets"),
+            &store_root,
+            &actor(),
+            &mut sink,
+        )
+        .unwrap();
+
+        // 手工放一个文件名合法、内容损坏的 .meta（与 trash.rs 同名测试同一
+        // 手法）——不需要真的先删除任何文件，doctor 的巡检面向的是磁盘上
+        // 已经存在的记录，与它们是怎么来的无关。
+        let phantom_id = crate::trash::TrashId::parse(&"a".repeat(32)).unwrap();
+        fs::write(
+            root_path.join(format!(".arca/trash/{phantom_id}.meta")),
+            "不是合法json",
+        )
+        .unwrap();
+
+        let report = doctor(&vault.repo, &vault.registry, None);
+        match &report.datasets[0] {
+            DatasetHealth::Checked { trash_issues, .. } => {
+                assert_eq!(trash_issues.len(), 1, "{trash_issues:?}");
+                assert!(
+                    trash_issues[0].file_name.contains(&phantom_id.to_string()),
+                    "应点名具体的 trash_id：{:?}",
+                    trash_issues[0]
+                );
+            }
+            other => panic!("应为 Checked，实得 {other:?}"),
+        }
+        assert!(
+            !report.is_clean(),
+            "损坏的 trash 记录必须让 doctor 判定为不干净"
+        );
     }
 }

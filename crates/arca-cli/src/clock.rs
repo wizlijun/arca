@@ -75,6 +75,52 @@ pub fn rfc3339_from_unix_secs(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
+/// `(年,月,日)` → 自 Unix 纪元以来的天数（proleptic Gregorian，UTC）——
+/// [`civil_from_days`] 的逆运算，同样来自 Howard Hinnant 的公有领域算法
+/// <http://howardhinnant.github.io/date_algorithms.html>。
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as u64 + 2) / 5 + d as u64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// 解析 RFC 3339 全形式（`"2026-08-08T09:00:00Z"`）为自 Unix 纪元以来的秒数
+/// （评审 Important #4：保留期判断 `deleted_at + retention > now` 需要把两个
+/// RFC 3339 字符串换算成可以相加减的数值）。
+///
+/// 只接受本模块唯一产出的这一种形状——固定 20 字节、零填充、UTC、以 `Z`
+/// 结尾，不支持时区偏移、不支持小数秒：本项目从不产出也不需要消费别的形状
+/// （I5：宁可拒绝也不去猜一个"看起来差不多"的宽松解析）。格式不符或字段
+/// 超出合法范围（月份 13、日期 32 等）一律返回 `None`，交给调用方决定如何
+/// 兜底（[`crate::trash::within_retention`] 的兜底策略见其文档）。
+pub fn parse_rfc3339(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let y: i64 = text.get(0..4)?.parse().ok()?;
+    let m: u32 = text.get(5..7)?.parse().ok()?;
+    let d: u32 = text.get(8..10)?.parse().ok()?;
+    let hh: i64 = text.get(11..13)?.parse().ok()?;
+    let mm: i64 = text.get(14..16)?.parse().ok()?;
+    let ss: i64 = text.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let days = days_from_civil(y, m, d);
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +166,48 @@ mod tests {
     fn 跨月边界换算正确() {
         // 2026-03-01T00:00:00Z == 1772323200（2026 非闰年，2 月只有 28 天）。
         assert_eq!(parts_from_unix_secs(1_772_323_200), (2026, 3, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn parse_rfc3339与rfc3339_from_unix_secs互为逆运算() {
+        for secs in [
+            0,
+            1,
+            1_704_067_200, // 2024-01-01T00:00:00Z
+            1_786_192_496, // 2026-08-08T12:34:56Z
+            1_772_323_200, // 2026-03-01T00:00:00Z（跨月边界）
+            1_735_689_599, // 某年最后一秒附近
+        ] {
+            let text = rfc3339_from_unix_secs(secs);
+            assert_eq!(
+                parse_rfc3339(&text),
+                Some(secs),
+                "往返失败：{secs} -> {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rfc3339拒绝格式不合规的输入() {
+        for bad in [
+            "",
+            "不是时间",
+            "2026-08-08T09:00:00",  // 缺 Z
+            "2026-08-08 09:00:00Z", // 缺 T
+            "2026/08/08T09:00:00Z", // 分隔符不对
+            "2026-13-08T09:00:00Z", // 月份非法
+            "2026-08-08T25:00:00Z", // 小时非法
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "应拒绝：{bad:?}");
+        }
+    }
+
+    #[test]
+    fn parse_rfc3339接受now_rfc3339的实际输出() {
+        let text = now_rfc3339();
+        assert!(
+            parse_rfc3339(&text).is_some(),
+            "应能解析 now_rfc3339 自己产出的形状：{text:?}"
+        );
     }
 }

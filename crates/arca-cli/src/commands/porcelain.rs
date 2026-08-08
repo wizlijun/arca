@@ -25,6 +25,7 @@
 //! 1 = 有问题/有未完成的工作，2 = 身份不明（存储根挂载失败/身份不符，I11）。
 
 use arca_cli::adopt::{self, AdoptOptions};
+use arca_cli::clock;
 use arca_cli::dataset;
 use arca_cli::doctor;
 use arca_cli::init::{self, HookOutcome};
@@ -497,6 +498,7 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
                 local_only,
                 ignore_issues,
                 manifest_issue,
+                trash_issues,
             } => {
                 if !local_only.is_empty() {
                     eprintln!();
@@ -523,6 +525,11 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
                 // 清单可能已经不反映当前受管路径集合。
                 if let Some(issue) = manifest_issue {
                     eprintln!("数据集 {path} 的清单与基线不一致：{issue}");
+                }
+                // 评审 Minor：`.arca/trash/` 里损坏的记录——点名具体是哪个
+                // 文件，不能只笼统报"删除/restore --list 已失效"。
+                for issue in trash_issues {
+                    eprintln!("数据集 {path} 的 .arca/trash/ 记录损坏：{issue}");
                 }
             }
             doctor::DatasetHealth::Offline { path, reason } => {
@@ -581,9 +588,22 @@ pub fn restore_cmd(dataset_path: &str, file: &str, root: Option<&Path>) -> ExitC
         &store_root,
         &normalized_file,
         &default_actor(),
-        &arca_cli::clock::now_rfc3339(),
+        &clock::now_rfc3339(),
     ) {
         Ok(version) => {
+            // 评审 Minor：`version.parent == None` 只可能来自
+            // `trash::last_version_id` 找不到版本链——按其文档，这在结构上
+            // 不应该发生（能进回收站的 item 必然有过至少一条 upsert 版本）。
+            // `restore` 仍然照常把内容找回给用户（防御性合理，不该因为一处
+            // 不该出现的缺失就拒绝找回内容本身），但这个异常本身必须被看见
+            // （I5），不能悄悄产出一条 `parent: null` 的孤立首版就当无事发生。
+            if version.parent.is_none() {
+                eprintln!(
+                    "警告：{normalized_file} 的版本链缺失（结构上不应该发生）——\
+                     刚恢复出的版本没有 parent，`arca history` 会把它显示成一条孤立首版；\
+                     内容已经正常找回，建议之后跑一次 `arca doctor`"
+                );
+            }
             println!(
                 "restore\t{normalized_file}\t{}",
                 version.version_id.as_str()
@@ -597,9 +617,19 @@ pub fn restore_cmd(dataset_path: &str, file: &str, root: Option<&Path>) -> ExitC
     }
 }
 
-/// `arca restore <dataset> --list [--root <path>]`：列出保留期内可恢复的
-/// 条目——数据永远走 stdout（plumbing 同一条 Rule of Silence 纪律：即便
-/// 结果是空列表也不算"安静"，因为这是用户明确请求的数据，不是诊断）。
+/// `arca restore <dataset> --list [--root <path>]`：列出回收站里的全部条目
+/// ——数据永远走 stdout（plumbing 同一条 Rule of Silence 纪律：即便结果是
+/// 空列表也不算"安静"，因为这是用户明确请求的数据，不是诊断）。
+///
+/// # 输出的是全部条目，不是"只有保留期内的"（评审 Important #4：文案与实现对齐）
+///
+/// 本切片没有实现 `arca gc`，回收站里任何一条记录的内容都还实实在在地
+/// 可以被 `arca restore <path>` 找回——过了 spec §7 默认 180 天保留期的
+/// 记录**不会**因此从这份列表里消失或变得不可恢复，物理销毁只经显式
+/// `arca gc`（I3，未实现）。这里额外打印一列 `within_retention`（`true`/
+/// `false`）——`deleted_at + 180 天 > 现在`（[`trash::within_retention`]，
+/// spec §7）——告诉用户"这条记录是否已经过了默认保留期"，供运维判断哪些
+/// 记录未来 `arca gc` 落地后会成为清理候选，不是"能不能恢复"的判断依据。
 pub fn restore_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
     let resolved = match dataset::resolve(&cwd(), dataset_path, root) {
         Ok(v) => v,
@@ -616,15 +646,19 @@ pub fn restore_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
         }
     };
 
+    let now = clock::now_rfc3339();
     match trash::list(&store_root) {
         Ok(entries) => {
             for entry in &entries {
+                let retained =
+                    trash::within_retention(&entry.meta, &now, trash::DEFAULT_RETENTION_DAYS);
                 println!(
-                    "{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}",
                     entry.meta.path,
                     entry.meta.item_id.to_hex(),
                     entry.meta.deleted_at,
-                    entry.trash_id
+                    entry.trash_id,
+                    retained
                 );
             }
             ExitCode::SUCCESS
