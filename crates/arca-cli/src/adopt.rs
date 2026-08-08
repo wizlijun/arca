@@ -375,6 +375,65 @@ mod tests {
         assert!(outcome.report.is_clean());
     }
 
+    /// **评审 C2 攻击重跑**：`arca adopt`（走 `sync::sync`，file:// 路径）
+    /// 此前只写 `files/`+`items/`+`index/`，从不追加 journal 事件——用户
+    /// 描述的实测："arca adopt（两个文件）+ arca sync（一个文件）之后
+    /// journal 0 字节"。修复后 journal 必须包含每个上传文件各一条
+    /// `Op::Upsert` 事件，`GET .../changes` 的消费者（M3 agentd 的地基）
+    /// 才能看到完整的变更历史，不是一份"这些文件从未发生过任何事"的假象
+    /// （I9：真相在 hub 的 journal）。
+    #[test]
+    fn adopt后journal包含每个上传文件的upsert事件_评审c2攻击重跑() {
+        let (vault_dir, store_dir) =
+            建已登记的数据集(&[("a.txt", b"hello"), ("sub/b.txt", b"world")]);
+
+        let mut sink = NullSink;
+        let outcome = adopt(
+            vault_dir.path(),
+            AdoptOptions {
+                path: "assets",
+                root_override: None,
+                actor: actor(),
+                allow_create_root: false,
+            },
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(outcome.report.uploaded.len(), 2);
+
+        let root =
+            arca_store::root::StorageRoot::open(&store_dir.path().join("root"), None).unwrap();
+        let (_cursor, events) = crate::journal::read_all(&root).unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "adopt 上传的两个文件都应该各自留下一条 journal 事件，实得 {events:?}"
+        );
+        let mut paths: Vec<&str> = events
+            .iter()
+            .map(|e| {
+                assert_eq!(e.op, arca_format::journal::Op::Upsert);
+                e.path.as_str()
+            })
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["a.txt", "sub/b.txt"]);
+
+        // 再来一次 `arca sync`（不经 adopt，直接调用同一个 file:// 闭环）：
+        // 新增第三个文件，journal 应该追加第三条事件，不是仍然停在两条。
+        fs::write(vault_dir.path().join("assets/c.txt"), b"third").unwrap();
+        let report =
+            crate::sync::sync(&vault_dir.path().join("assets"), &root, &actor(), &mut sink)
+                .unwrap();
+        assert_eq!(report.uploaded, vec!["c.txt".to_string()]);
+
+        let (_cursor, events) = crate::journal::read_all(&root).unwrap();
+        assert_eq!(events.len(), 3, "实得 {events:?}");
+        assert!(events
+            .iter()
+            .any(|e| e.path == "c.txt" && e.op == arca_format::journal::Op::Upsert));
+    }
+
     #[test]
     fn adopt后清单生成且内容与基线一致() {
         let (vault_dir, _store_dir) = 建已登记的数据集(&[("a.txt", b"hello")]);

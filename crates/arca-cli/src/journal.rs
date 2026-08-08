@@ -3,8 +3,8 @@
 //!
 //! `arca_format::journal` 只管解析/序列化单行与整段文本（sans-io，那一层的
 //! 纪律见其模块文档）；本模块补上"落到磁盘的哪个位置、怎么原子追加"这一层，
-//! 与 `arca-cli` 里 `sync.rs::append_item_version`（items 版本链的追加）是
-//! 同一职责在不同事件流上的对应实现。
+//! 与 `arca-cli` 里 `transport::local::append_item_version`（items 版本链的
+//! 追加）是同一职责在不同事件流上的对应实现。
 //!
 //! # 损坏处置纪律（FORMAT.md §7.2，直接复用 `arca_format::journal::parse_stream`）
 //!
@@ -16,8 +16,9 @@
 //! # `append` 为什么要先解析现有内容再整体重写
 //!
 //! `arca_store::atomic` 只提供整文件原子替换，没有原子追加（与 `items.jsonl`
-//! 同样的限制，见 `sync.rs::append_item_version` 的文档）。但如果只是"读现有
-//! 原始字节 + 拼接新行 + 整体重写"（`append_item_version` 现在的做法），一旦
+//! 同样的限制，见 `transport::local::append_item_version` 的文档）。但如果
+//! 只是"读现有原始字节 + 拼接新行 + 整体重写"（`append_item_version` 现在的
+//! 做法），一旦
 //! 上一次追加在崩溃中留下了一条撕裂的末行，这条撕裂行就不再是"末行"
 //! 了——它会变成新写入内容之前的一条**中间行**，下次任何读取都会把它当成
 //! 中间行损坏而报错，永久损坏这条 journal。所以这里先用 `parse_stream`
@@ -168,6 +169,38 @@ pub fn read_all(root: &StorageRoot) -> Result<(Option<Cursor>, Vec<JournalEvent>
     let events = arca_format::journal::parse_stream(&text).map_err(JournalError::Format)?;
     let seq = events.last().map(|e| e.seq).unwrap_or(0);
     Ok((Some(Cursor { epoch, seq }), events))
+}
+
+/// 当前 epoch 事件流文件的廉价指纹：`(epoch, 文件长度, mtime)`——**评审 C1**：
+/// `arcad` 的 longpoll 挂起循环每次被唤醒（`Notify` 或轮询间隔到期）都要
+/// 判断"这一轮值不值得付一次 [`read_all`] 的代价"，[`read_all`] 本身要
+/// 读整段文本再完整解析成 `Vec<JournalEvent>`，是 `O(当前 journal 大小)`；
+/// 本函数只做一次 `stat`（不读取任何文件内容），`O(1)`，供调用方与"上一次
+/// 真正读取时"的指纹比较——不相等才值得付那次真正的读取。
+///
+/// 没有 epoch（journal 从未初始化过）→ `Ok(None)`，与 [`read_all`] 对同一
+/// 情形的处置一致（合法的未初始化态，不是错误）。
+pub fn fingerprint(
+    root: &StorageRoot,
+) -> Result<Option<(String, u64, std::time::SystemTime)>, JournalError> {
+    let Some(epoch) = current_epoch(root)? else {
+        return Ok(None);
+    };
+    let full = root.path().join(journal_path(&epoch));
+    match fs::metadata(&full) {
+        Ok(meta) => {
+            let mtime = meta.modified().map_err(|e| io_err(&full, e))?;
+            Ok(Some((epoch, meta.len(), mtime)))
+        }
+        // 指针已创建、事件流文件本尚未写入首条事件的瞬间——与 `read_epoch_text`
+        // 同一条处置（合法的中间态，不是错误），指纹退化成"长度 0、mtime 取不到"
+        // 用一个不会与任何真实写入撞上的占位值表达：调用方只关心"和上一次比
+        // 是否变化"，这里给出的占位值只要在文件真正被创建之前保持不变即可。
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Ok(Some((epoch, 0, std::time::SystemTime::UNIX_EPOCH)))
+        }
+        Err(e) => Err(io_err(&full, e)),
+    }
 }
 
 /// 下一个应该使用的 `seq`——当前完整事件流的游标 + 1（没有任何历史事件时
@@ -525,6 +558,37 @@ mod tests {
         // 实则建在损坏地基上的假象。
         let err = append(&root, &样例事件(2, "b.png")).unwrap_err();
         assert!(matches!(err, JournalError::Format(_)), "实得 {err:?}");
+    }
+
+    #[test]
+    fn fingerprint在journal未初始化时返回none() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        assert_eq!(fingerprint(&root).unwrap(), None);
+    }
+
+    #[test]
+    fn fingerprint在追加后变化_未变化时保持不变() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+
+        append(&root, &样例事件(1, "a.png")).unwrap();
+        let fp1 = fingerprint(&root).unwrap();
+        assert!(fp1.is_some());
+
+        // 没有任何新写入——重复探测必须得到完全相同的指纹（C1 修法的正确性
+        // 前提：指纹相同就跳过真正的 read_all，不能有假阴性）。
+        let fp2 = fingerprint(&root).unwrap();
+        assert_eq!(fp1, fp2);
+
+        append(&root, &样例事件(2, "b.png")).unwrap();
+        let fp3 = fingerprint(&root).unwrap();
+        assert_ne!(
+            fp1, fp3,
+            "追加新事件后指纹必须变化，否则 longpoll 会漏掉这次写入"
+        );
     }
 
     #[test]

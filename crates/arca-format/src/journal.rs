@@ -45,27 +45,39 @@ pub struct JournalEvent {
     pub at: String,
 }
 
+/// 一条 journal 事件的行式/线上字段结构（FORMAT.md §7.2）——`.jsonl` 落盘
+/// 与 HTTP `GET .../changes` 响应体共用同一个形状与同一份构造逻辑
+/// （[`JournalEvent::to_wire`]），只是前者再套一层 `to_string` 落成单行
+/// 文本，后者直接把这个结构体交给 `serde_json`/`axum::Json` 序列化。
+///
+/// **评审 C1**：此前 `arcad` 用 `to_line()` 拿到字符串、再 `serde_json::from_str`
+/// 解析回一棵 `serde_json::Value` 树、再整体收集成 `Vec<Value>`——对同一批
+/// 事件在内存里同时保有"结构体 + 行文本 + JSON 树"三份等价表示，是量出的
+/// "16 倍于文件体积"内存占用的主因之一。公开这个类型让调用方可以直接拿到
+/// 一份可序列化的结构体，跳过字符串/`Value` 这两级中间表示，同时不引入
+/// 第二套字段映射（[`to_line`](JournalEvent::to_line)/[`parse_line`](JournalEvent::parse_line)
+/// 仍然是唯一的构造点，`arcad` 端只是复用这个类型的 `Serialize`，不重新
+/// 决定"哪个字段叫什么名字"）。
 #[derive(Serialize, Deserialize)]
-struct Wire {
-    v: u32,
-    seq: u64,
-    op: Op,
-    item_id: String,
-    version_id: String,
-    path: String,
+pub struct JournalEventWire {
+    pub v: u32,
+    pub seq: u64,
+    pub op: Op,
+    pub item_id: String,
+    pub version_id: String,
+    pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    from: Option<String>,
-    actor: Actor,
-    at: String,
+    pub from: Option<String>,
+    pub actor: Actor,
+    pub at: String,
 }
 
 impl JournalEvent {
-    /// 序列化为单行 JSON。判断点同 `items::to_line`：返回 `Result` 而非
-    /// `unwrap_or_default()`，避免序列化失败被静默写成空行追加进 append-only 事件流
-    /// （Task 6 先例）。`Wire` 全是标量/字符串字段，`Err` 分支当前不可达，保留
-    /// `Result` 签名为未来加字段留防线。
-    pub fn to_line(&self) -> Result<String, FormatError> {
-        let wire = Wire {
+    /// 构造这条事件的线上字段结构——[`to_line`](Self::to_line)（落盘）与
+    /// `arcad` 的 HTTP 响应体（评审 C1）共用的唯一构造点，避免两处各自维护
+    /// 一份字段映射、迟早悄悄分叉。
+    pub fn to_wire(&self) -> JournalEventWire {
+        JournalEventWire {
             v: RECORD_VERSION,
             seq: self.seq,
             op: self.op,
@@ -75,8 +87,15 @@ impl JournalEvent {
             from: self.from.clone(),
             actor: self.actor.clone(),
             at: self.at.clone(),
-        };
-        serde_json::to_string(&wire).map_err(|e| FormatError::Malformed {
+        }
+    }
+
+    /// 序列化为单行 JSON。判断点同 `items::to_line`：返回 `Result` 而非
+    /// `unwrap_or_default()`，避免序列化失败被静默写成空行追加进 append-only 事件流
+    /// （Task 6 先例）。`JournalEventWire` 全是标量/字符串字段，`Err` 分支当前不可达，保留
+    /// `Result` 签名为未来加字段留防线。
+    pub fn to_line(&self) -> Result<String, FormatError> {
+        serde_json::to_string(&self.to_wire()).map_err(|e| FormatError::Malformed {
             line: 0,
             reason: format!("journal 事件序列化失败：{e}"),
         })
@@ -87,10 +106,11 @@ impl JournalEvent {
     /// 不得携带——这是表里明写的结构性约束，携带矛盾字段是歧义状态，必须拒绝
     /// 而非放行（I5：绝不猜测该信任哪一个）。
     pub fn parse_line(line: &str, line_no: usize) -> Result<Self, FormatError> {
-        let wire: Wire = serde_json::from_str(line).map_err(|e| FormatError::Malformed {
-            line: line_no,
-            reason: format!("JSON 解析失败：{e}"),
-        })?;
+        let wire: JournalEventWire =
+            serde_json::from_str(line).map_err(|e| FormatError::Malformed {
+                line: line_no,
+                reason: format!("JSON 解析失败：{e}"),
+            })?;
         if wire.v > RECORD_VERSION {
             return Err(FormatError::UnsupportedVersion {
                 found: wire.v,

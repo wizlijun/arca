@@ -84,6 +84,13 @@ const MAX_WAIT_SECS: u64 = 90;
 /// `Notify`，靠这个间隔重新探测发现。
 const LONGPOLL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// `GET .../changes` 单次响应最多携带的事件数，省略 `limit` 时的默认值也是
+/// 这个数——**评审 C1**：此前响应体大小等于"游标之后全部积压事件数"，无
+/// 上界；50 MB/十几万事件的 journal 上做一次全量拉取（省略 `since`）会让
+/// 响应体与途中的中间表示一起把内存推到文件体积的十几倍。`PROTOCOL.md`
+/// §1.2「`GET .../changes`」端点表的 `limit` 参数与本常量是同一个数。
+const MAX_CHANGES_LIMIT: usize = 1000;
+
 // 编译期锁住上面两个常量之间的关系——任何一次编译都会检查，不依赖某条
 // 测试恰好覆盖到这个边界（见 `MAX_WAIT_SECS` 文档「必须严格小于
 // `REQUEST_TIMEOUT`」一节）。
@@ -1702,29 +1709,33 @@ fn rename_conflict_response(
 struct ChangesQuery {
     since: Option<String>,
     wait: Option<u64>,
+    /// **评审 C1**：省略、非正整数、或超过 [`MAX_CHANGES_LIMIT`] 都静默钳到
+    /// [`MAX_CHANGES_LIMIT`]——与 `wait` 越界同一处置纪律（资源上限不是
+    /// 客户端能商量的参数，`PROTOCOL.md` §1.2「`GET .../changes`」）。
+    limit: Option<u64>,
 }
 
-/// 一条 journal 事件的线上 JSON 形状——直接复用
-/// [`JournalEvent::to_line`]（`FORMAT.md` §7.2 的既有序列化，供 `.jsonl`
-/// 落盘用）再解析回 `serde_json::Value`，不重新写一遍字段映射：两处若各自
-/// 维护，迟早会悄悄分叉（`local.rs::append_upsert_journal_event` 的同一条
-/// 纪律「两条路径必须共享同一份判断」在这里的对应）。
-fn journal_event_json(event: &JournalEvent) -> serde_json::Value {
-    let line = event
-        .to_line()
-        .expect("journal 事件此前已经成功落盘过一次，序列化不应在这里失败");
-    serde_json::from_str(&line).expect("to_line 产出的 JSON 必然能被 serde_json 解析回来")
+/// `GET .../changes` 响应体——**评审 C1**：直接把
+/// `arca_format::journal::JournalEventWire`（与 `.jsonl` 落盘共用同一份
+/// 字段构造逻辑，见其文档）交给 `serde_json` 序列化，不再"先 `to_line()`
+/// 成字符串、再解析回 `serde_json::Value`、再整体收集、再整体重新序列化"——
+/// 旧路径对同一批事件在内存里同时保有结构体/行文本/JSON 树三份等价表示，
+/// 是评审量出的"16 倍于文件体积"内存占用的主因之一。
+#[derive(Serialize)]
+struct ChangesBody {
+    events: Vec<arca_format::journal::JournalEventWire>,
+    cursor: Option<String>,
 }
 
 fn changes_response(cursor: Option<&Cursor>, events: &[&JournalEvent]) -> Response {
-    let events_json: Vec<serde_json::Value> =
-        events.iter().map(|e| journal_event_json(e)).collect();
+    let events: Vec<arca_format::journal::JournalEventWire> =
+        events.iter().map(|e| e.to_wire()).collect();
     (
         StatusCode::OK,
-        axum::Json(json!({
-            "events": events_json,
-            "cursor": cursor.map(|c| c.to_string()),
-        })),
+        axum::Json(ChangesBody {
+            events,
+            cursor: cursor.map(|c| c.to_string()),
+        }),
     )
         .into_response()
 }
@@ -1790,6 +1801,25 @@ async fn get_changes(
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(effective_wait);
 
+    // **评审 C1**：单次响应最多携带这么多条事件——见 `MAX_CHANGES_LIMIT`
+    // 文档、`PROTOCOL.md` §1.2「`GET .../changes`」端点表新增的 `limit`
+    // 参数。省略、非正整数、超过上限都静默钳到上限，与 `wait` 越界同一
+    // 处置纪律。
+    let limit = query
+        .limit
+        .filter(|&l| l > 0)
+        .map(|l| l as usize)
+        .unwrap_or(MAX_CHANGES_LIMIT)
+        .min(MAX_CHANGES_LIMIT);
+
+    // **评审 C1**：`fingerprint`（`O(1)` 的 `stat`）与"上一次真正读取 journal
+    // 时"的指纹比较——只有变化了（或这是本次请求的第一轮，必须先建立基线）
+    // 才值得付一次 `read_all`（`O(journal 大小)`）的代价。`cached` 持有
+    // "上一次真正读取"的结果，指纹未变时直接复用，不重新读盘、不重新解析
+    // （见 `arca_cli::journal::fingerprint` 文档）。
+    let mut cached_fingerprint: Option<(String, u64, std::time::SystemTime)> = None;
+    let mut cached: Option<(Option<Cursor>, Vec<JournalEvent>)> = None;
+
     loop {
         // 见 tokio::sync::Notify 文档「notify after check」范式：`notified()`
         // 必须在本轮"检查是否已有新事件"之前创建，才不会错过检查之后、
@@ -1807,7 +1837,7 @@ async fn get_changes(
             Err(e) => return mount_error_response(&e),
         };
 
-        let (cursor_now, all_events) = match arca_cli::journal::read_all(&root) {
+        let fp = match arca_cli::journal::fingerprint(&root) {
             Ok(v) => v,
             Err(e) => {
                 return error_body(
@@ -1818,12 +1848,28 @@ async fn get_changes(
             }
         };
 
+        if cached.is_none() || fp != cached_fingerprint {
+            let (cursor_now, all_events) = match arca_cli::journal::read_all(&root) {
+                Ok(v) => v,
+                Err(e) => {
+                    return error_body(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "store.corrupt",
+                        format!("journal 读取失败：{e}"),
+                    )
+                }
+            };
+            cached_fingerprint = fp;
+            cached = Some((cursor_now, all_events));
+        }
+        let (cursor_now, all_events) = cached.as_ref().expect("上面已确保至少读取过一次");
+
         // 游标失效判定：语法已经合法，这里判断"是否还在保留区间内"——本
         // 切片没有 journal 压缩，`epoch` 只在从未初始化过时不存在，一旦
         // 存在就不会变，所以"`since.epoch` 与数据集当前 epoch 不一致"
         // 就是"早于保留区间"的完整判据（`PROTOCOL.md` 同一节）。
         if let Some(want) = &since {
-            let mismatch = match &cursor_now {
+            let mismatch = match cursor_now {
                 Some(c) => c.epoch != want.epoch,
                 None => true,
             };
@@ -1833,10 +1879,30 @@ async fn get_changes(
         }
 
         let start_seq = since.as_ref().map(|s| s.seq).unwrap_or(0);
-        let diff: Vec<&JournalEvent> = all_events.iter().filter(|e| e.seq > start_seq).collect();
+        let mut diff: Vec<&JournalEvent> =
+            all_events.iter().filter(|e| e.seq > start_seq).collect();
+        // **评审 C1**：`limit` 分页——积压事件数超过上限时只返回前 `limit`
+        // 条，游标相应地只推进到"这一批最后一条事件"，不是数据集当前最新
+        // 游标；客户端据此用新游标继续发起下一次 `GET`（`PROTOCOL.md` §1.2）。
+        let truncated = diff.len() > limit;
+        diff.truncate(limit);
 
         if !diff.is_empty() || effective_wait == 0 {
-            return changes_response(cursor_now.as_ref(), &diff);
+            let response_cursor = if truncated {
+                let epoch = cursor_now
+                    .as_ref()
+                    .expect("truncated 意味着 diff 非空，意味着 all_events 非空，意味着 cursor_now 是 Some")
+                    .epoch
+                    .clone();
+                let last_seq = diff.last().expect("truncated 意味着 diff 非空").seq;
+                Some(Cursor {
+                    epoch,
+                    seq: last_seq,
+                })
+            } else {
+                cursor_now.clone()
+            };
+            return changes_response(response_cursor.as_ref(), &diff);
         }
 
         let now = tokio::time::Instant::now();
@@ -1858,6 +1924,9 @@ async fn get_changes(
             _ = &mut notified => {}
             _ = tokio::time::sleep(step) => {}
         }
+        // 下一轮循环唤醒后会重新 `stat` 指纹——`Notify` 只保证"至少有一次
+        // 写入发生过"，不保证这次写入命中的就是本请求关心的这个数据集/
+        // epoch 文件；指纹比较仍然是判断"值不值得真读"的唯一依据。
     }
 }
 
@@ -3615,6 +3684,150 @@ mod tests {
         assert_eq!(events[0]["path"], "b.txt");
     }
 
+    /// 直接写入 `n` 条 journal 事件（绕开逐条 `journal::append`——那是每次
+    /// 调用都重新读+重写整个文件，用来快速构造测试用的"大" journal，不代表
+    /// 这是生产写入路径）。返回新建的 epoch。
+    fn 造大journal(dir: &std::path::Path, n: u64) -> String {
+        let epoch = arca_cli::ids::random_hex32();
+        std::fs::write(dir.join(".arca/journal/epoch"), format!("{epoch}\n")).unwrap();
+        let mut content = String::new();
+        for seq in 1..=n {
+            let mut item_bytes = [0u8; 16];
+            item_bytes[..8].copy_from_slice(&seq.to_be_bytes());
+            let event = JournalEvent {
+                seq,
+                op: arca_format::journal::Op::Upsert,
+                item_id: ItemId::from_bytes(item_bytes),
+                version_id: VersionId::new("20260808T090000Z", &format!("{seq:032x}")).unwrap(),
+                path: format!("f{seq}.txt"),
+                from: None,
+                actor: Actor {
+                    account: String::new(),
+                    device: String::new(),
+                    session: String::new(),
+                },
+                at: "2026-08-08T09:00:00Z".to_string(),
+            };
+            content.push_str(&event.to_line().unwrap());
+            content.push('\n');
+        }
+        std::fs::write(dir.join(format!(".arca/journal/{epoch}.jsonl")), &content).unwrap();
+        epoch
+    }
+
+    /// **评审 C1 攻击重跑**：`limit` 分页——积压事件数超过 `limit` 时只返回
+    /// 前 `limit` 条，`cursor` 只推进到这一批最后一条，客户端据此续拉下一页，
+    /// 直到追上为止；全部拉完之后事件顺序与原始 journal 完全一致。这是
+    /// 「响应体大小无界」的直接修复：无论 journal 有多大，单次响应的
+    /// `events` 长度都不会超过请求的 `limit`。
+    #[tokio::test]
+    async fn changes_limit分页_超过上限时游标只推进到本页最后一条_续拉能追上() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        造大journal(dir.path(), 5);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let resp = app
+            .clone()
+            .oneshot(changes_request(id, "limit=2"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2, "超过 limit 的部分本页不应携带");
+        assert_eq!(events[0]["path"], "f1.txt");
+        assert_eq!(events[1]["path"], "f2.txt");
+        let cursor1 = body["cursor"].as_str().unwrap().to_string();
+        assert!(
+            cursor1.ends_with(":2"),
+            "cursor 应只推进到本页最后一条（seq=2），不是数据集当前最新游标（seq=5）：{cursor1}"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(changes_request(id, &format!("since={cursor1}&limit=2")))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["path"], "f3.txt");
+        assert_eq!(events[1]["path"], "f4.txt");
+        let cursor2 = body["cursor"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(changes_request(id, &format!("since={cursor2}&limit=2")))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "最后一页应只剩第 5 条");
+        assert_eq!(events[0]["path"], "f5.txt");
+        let cursor3 = body["cursor"].as_str().unwrap().to_string();
+        assert!(cursor3.ends_with(":5"));
+    }
+
+    /// **评审 C1 攻击重跑**：省略/非法/超出上限的 `limit` 都钳到
+    /// `MAX_CHANGES_LIMIT`，不是无界——这里用一个比默认上限小的自定义环境
+    /// 无法直接构造（常量是模块私有编译期值），改为断言"省略 `limit` 时不会
+    /// 超过 `MAX_CHANGES_LIMIT`"，并用 `limit=0`（非正整数，等价于省略）与
+    /// 一个超过上限的巨大取值分别验证同一处置。
+    #[tokio::test]
+    async fn changes_limit省略或非法或超出上限时统一钳到默认上限而不是无界返回() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        // 造一个比默认上限小的 journal（用默认上限本身做压力测试见下面的
+        // bench），这里只需验证"没有 limit 时不会比 MAX_CHANGES_LIMIT 更大"
+        // 这条不变式在数据量不超过上限时的退化形态——全部返回，且不超过
+        // MAX_CHANGES_LIMIT。
+        造大journal(dir.path(), 10);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        for query in ["", "limit=0", "limit=999999999"] {
+            let resp = app
+                .clone()
+                .oneshot(changes_request(id, query))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "查询：{query:?}");
+            let body = body_json(resp).await;
+            let events = body["events"].as_array().unwrap();
+            assert!(
+                events.len() <= MAX_CHANGES_LIMIT,
+                "查询 {query:?} 返回 {} 条，超过上限 {MAX_CHANGES_LIMIT}",
+                events.len()
+            );
+            assert_eq!(events.len(), 10, "10 条全部在上限之内，应该全部返回");
+        }
+    }
+
+    /// **评审 C1 攻击重跑**：即便 journal 远大于单页上限，单次响应的事件数
+    /// 也不会超过 `MAX_CHANGES_LIMIT`——这是"响应体大小无界"这条攻击的直接
+    /// 回归防线：修复前，这里会一次性返回全部 `n` 条。
+    #[tokio::test]
+    async fn changes_大journal上单次响应不超过默认上限() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let n = MAX_CHANGES_LIMIT as u64 + 500;
+        造大journal(dir.path(), n);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let resp = app.oneshot(changes_request(id, "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(
+            events.len(),
+            MAX_CHANGES_LIMIT,
+            "省略 limit 时应钳到默认上限，不是返回全部 {n} 条"
+        );
+    }
+
     #[tokio::test]
     async fn changes空增量时游标不变() {
         let dir = tempfile::tempdir().unwrap();
@@ -3722,6 +3935,59 @@ mod tests {
         assert!(
             elapsed >= std::time::Duration::from_millis(900),
             "应该真的挂起了接近 1 秒，实得 {elapsed:?}"
+        );
+    }
+
+    /// **评审 C1 攻击重跑**：16 个空闲 longpoll 挂在一个较大的 journal 上，
+    /// 原攻击测出持续 90–440% CPU——直接测 CPU 占用在单元测试里不portable，
+    /// 这里退而求其次断言"多个并发、跨越多轮轮询间隔的空闲 longpoll 在一个
+    /// 上千事件的 journal 上，行为仍然正确且耗时不失控"：每一轮唤醒先
+    /// `fingerprint`（`O(1)`）探测，journal 没有变化就不会重新付一次
+    /// `read_all`（`O(journal 大小)`）的代价——`journal::fingerprint在追加后变化`
+    /// 系列单测已经覆盖这条机制本身的正确性，这里覆盖它在 `get_changes`
+    /// 循环里被正确接线：结果正确（超时后仍是空增量）、总耗时不因 journal
+    /// 体积或并发数而显著膨胀。
+    #[tokio::test]
+    async fn changes_大journal上多个并发空闲longpoll行为正确且耗时不失控() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let epoch = 造大journal(dir.path(), 3000);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        // 直接构造"当前游标"（=journal 尾）——不经过 `GET .../changes` 拉取
+        // （默认 `limit` 只有 1000，拉不到尾，见 `MAX_CHANGES_LIMIT`），这样
+        // 才是真正的"没有新事件"场景，不是省略/未追上 `since` 那种会非空的
+        // 情形（不是这条测试要验证的对象）。
+        let tip_cursor = format!("{epoch}:3000");
+
+        // wait=3：跨越 LONGPOLL_POLL_INTERVAL（1 秒）好几轮，确保循环真的
+        // 醒来过多次并各自做过 fingerprint 探测，不是只测到第一轮。
+        let start = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let a = app.clone();
+            let id_owned = id.to_string();
+            let since = tip_cursor.clone();
+            handles.push(tokio::spawn(async move {
+                a.oneshot(changes_request(&id_owned, &format!("since={since}&wait=3")))
+                    .await
+                    .unwrap()
+            }));
+        }
+        for h in handles {
+            let resp = h.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            assert!(
+                body["events"].as_array().unwrap().is_empty(),
+                "没有任何写入，超时后应该是空增量"
+            );
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(6),
+            "16 个空闲 longpoll 挂在 3000 事件的 journal 上不应显著拖慢总耗时，实得 {elapsed:?}"
         );
     }
 

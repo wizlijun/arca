@@ -117,7 +117,7 @@
 | `GET /v1/datasets/{id}/trash/{item_id}?hash=<blake3-hex>` | `Arca-Session` | 无 | `200`：`{"recoverable":true,"hash":"blake3:...","size":1234}`——`hash`/`size` 是现场重算的结果（三方核验：查询参数带的期望哈希 = `.meta` 记录 = 现场重算，与 `Transport::recoverable(item_id, expected_hash)` 同一签名，见 M2b Task 1） | `400`：`hash` 缺失或格式不合法（`code=request.hash_missing`）；`404`：`{"recoverable":false}`（没有匹配的可取回记录——用 JSON 体而不是空 404，闸门第 4 道的调用方不需要额外分支判断"是不是解析失败"）；`503`：数据集离线 |
 | `GET /v1/datasets/{id}/blobs/{hash}` | `Arca-Session` | 无 | `200`：全量字节，响应头 `ETag`（内容哈希，与请求路径的 `{hash}` 相同）、`Content-Length`——按内容哈希直接寻址，不经过路径/CAS（`arca cat <hash>` 的传输层对应，M2c Task 1；`Transport::read_by_hash` 同一签名）；多个路径共享同一份内容时结果确定（按路径 UTF-8 字节序取第一个命中，与 `arca cat` plumbing 现有算法一致，见 `commands/plumbing.rs::cat_cmd`） | `400`：`{hash}` 不是合法的 `blake3:<hex>` 形式（`code=request.hash_invalid`）；`404`：hub 侧当前没有任何路径的内容匹配这个哈希（`Absent`/`Tombstoned`/从未出现过统一折叠，与 `GET .../files/{path}` 的 404 同一纪律）；`503`：数据集离线 |
 | `PUT /v1/datasets/{id}/batch` | `Content-Type: application/json`；`Arca-Session` | JSON 数组，每条与单个 `PUT .../files/{path}` 的元数据同构：`{"path","item_id","version_id","parent","mtime","content_base64"}`（`parent` 为 `null` 表示仅创建，语义等价单文件的 `If-None-Match: *`；`content_base64` 是这次要落地的原始字节的标准 Base64——批量端点用 JSON 信封而不是多段 `multipart`，字节内联编码是这个信封形状能表达任意内容最简单的方式，M2c 尚不为批量端点做流式优化，见 Task 1 brief「批量提交」一节） | `200`：JSON 数组，与请求顺序一一对应，每条 `{"item_id","version_id","hash","size"}`（全部成功，`Transport::BatchOutcome::Committed` 的线上形状）——**要么整批成功要么整批不生效**（I5：不做"部分成功"，调用方无法据此判断该从哪里重试） | `400`：请求体不是合法 JSON、或某一条缺少必需字段/`content_base64` 不是合法 Base64（`code=request.batch_malformed`，响应体附 `index` 指出哪一条）；`409`：某一条的 `item_id` 与目标路径/该 item 自身版本链归属不符，或已被 tombstone 终结（`code=request.item_id_mismatch`，响应体附 `index`，整批不生效）；`412`：某一条 CAS 冲突（`code=commit.stale_parent`，结构化冲突体见下，附 `index` 指出哪一条，整批不生效——**CAS 仍逐条校验**，见 Task 1 brief）；`503`：数据集离线 |
-| `GET /v1/datasets/{id}/changes?since=<epoch:seq>&wait=<秒>` | `Arca-Session` | 无 | `200`：`{"events":[...],"cursor":"<epoch:seq>"或null}`——`events` 是该游标之后的 journal 事件（`FORMAT.md` §7.2 字段形状，`from`/`hash`/`size` 视 `op` 而定），`cursor` 是可用于下一次 `since` 的新游标（没有任何历史事件时为 `null`）；省略 `since` 等价于"从头开始"；`wait`（秒，可选，默认 0）大于 0 时挂起等待新事件（longpoll，spec §5.2，M2c Task 3），超时仍返回 `200` 与空 `events`+原游标，**不是错误**；服务端把 `wait` 钳制到 `[0, 90]`，超过上限不报错、静默取 90（资源耗尽面，见下） | `400`：`since` 不是合法的 `<epoch:seq>` 语法（`code=request.cursor_invalid`，**不当作"从头开始"处理**，I5：别猜）；`410`：`since` 携带的 `epoch` 与数据集当前 epoch 不符——本切片没有 journal 压缩，`epoch` 只会在（未来的）压缩后轮转，任何不匹配当前 epoch 的游标都视为"早于保留区间"（spec §5.2 `reset_required`），响应体 `{"code":"journal.reset_required","message":"...","cursor":"<当前有效游标>"}`，客户端应据此做一次全量对账，之后从响应体的 `cursor` 继续增量拉取；`503`：数据集离线（**含挂起期间掉线**——longpoll 等待过程中每次重新探测都会重新校验挂载，掉线立即返回 503，不等到 `wait` 超时才发现，I11） |
+| `GET /v1/datasets/{id}/changes?since=<epoch:seq>&wait=<秒>&limit=<n>` | `Arca-Session` | 无 | `200`：`{"events":[...],"cursor":"<epoch:seq>"或null}`——`events` 是该游标之后的 journal 事件（`FORMAT.md` §7.2 字段形状，`from`/`hash`/`size` 视 `op` 而定），`cursor` 是可用于下一次 `since` 的新游标（没有任何历史事件时为 `null`）；省略 `since` 等价于"从头开始"；`wait`（秒，可选，默认 0）大于 0 时挂起等待新事件（longpoll，spec §5.2，M2c Task 3），超时仍返回 `200` 与空 `events`+原游标，**不是错误**；服务端把 `wait` 钳制到 `[0, 90]`，超过上限不报错、静默取 90（资源耗尽面，见下）；`limit`（可选，正整数，默认与上限均为 1000，评审 C1）——单次响应最多携带这么多条事件；游标之后待返回的事件数超过 `limit` 时只返回前 `limit` 条，`cursor` 相应地只推进到"这一批最后一条事件"而不是数据集当前最新游标，客户端需要据此继续用新 `cursor` 发起下一次 `GET`（同一次 longpoll 只要凑够 `limit` 条或等到 `wait` 超时其一即可返回，不会为了凑够 `limit` 而多等）——省略或非正整数取默认值 1000，超过 1000 时静默钳到 1000（与 `wait` 越界同一处置纪律：这是资源上限,不是客户端能商量的参数） | `400`：`since` 不是合法的 `<epoch:seq>` 语法（`code=request.cursor_invalid`，**不当作"从头开始"处理**，I5：别猜）；`410`：`since` 携带的 `epoch` 与数据集当前 epoch 不符——本切片没有 journal 压缩，`epoch` 只会在（未来的）压缩后轮转，任何不匹配当前 epoch 的游标都视为"早于保留区间"（spec §5.2 `reset_required`），响应体 `{"code":"journal.reset_required","message":"...","cursor":"<当前有效游标>"}`，客户端应据此做一次全量对账，之后从响应体的 `cursor` 继续增量拉取；`503`：数据集离线（**含挂起期间掉线**——longpoll 等待过程中每次重新探测都会重新校验挂载，掉线立即返回 503，不等到 `wait` 超时才发现，I11） |
 | `POST /v1/datasets/{id}/rename` | `Content-Type: application/json`；`Arca-Session` | JSON 对象 `{"from","to","item_id","parent"}`（`from`/`to` 是改名前后的逻辑路径，`item_id` 是这次改名声称的身份，`parent` 是 `from` 此刻的版本——CAS 的 If-Match 对象，随请求体传而不是请求头，见下「为什么是 POST body 不是 If-Match 头」） | `200`：`{"item_id","version_id"}`——**`version_id` 与请求体的 `parent` 相同**（改名不产生新版本，`Transport::rename` 的文档「为什么需要这第三个写入原语」） | `400`：请求体不是合法 JSON、或 `from`/`to`/`item_id`/`parent` 缺失或格式不合法（`code=request.rename_malformed`）；`400`：`to` 未通过 `path_rules::check`（`code=path.rejected`，与其它端点同一纪律）；`409`：`from` 的实际归属与声称的 `item_id` 不符，或 `to` 此刻已被另一个 item_id 占用（`code=request.item_id_mismatch`，与 `PUT`/`DELETE` 同一个码，响应体额外带 `path` 指出是 `from` 还是 `to` 触发）；`412`：CAS 冲突（`code=commit.stale_parent`，结构化响应体同 `PUT`，`base`/`yours` 退化为只带 `item_id`/`version_id`——改名没有"这次要落地的新内容"，没有独立的 `yours.hash`/`yours.size` 概念，与 `base`/`yours` 描述 Range 续传冲突时的退化写法同一条纪律）；`503`：数据集离线 |
 
 `GET .../files/{path}` 对 `RemoteState::Tombstoned` 与从未存在过的
@@ -219,6 +219,34 @@ longpoll 并发上限**：一次挂起可能占用一个请求处理槽位长达
 全局配额，无助于隔离），而是**降级为立即返回当前增量**（可能为空），
 等价于 spec 提到的"2 秒短轮询"这条降级路径的极限形式——不算错误，客户端
 按正常的空增量处理，下一次重试即可。
+
+#### `GET .../changes`：响应体大小有界、空闲 longpoll 不为"无事发生"付全量解析代价（评审 C1）
+
+M2c 切片评审实机攻击：无请求体的 `GET .../changes`（省略 `since`，即全量拉取）
+是全部端点里最廉价的攻击面——50 MB journal 上 4 个并发请求把 RSS 推到
+3.25 GB（约 16 倍于文件本身），全局并发上限 64 时天花板约 52 GB；13.6 MB /
+19003 事件 journal 上 16 个**空闲**（没有任何新事件）longpoll 能把这个进程
+持续拖到 90–440% CPU，连累同一进程里无关的 `GET .../state` 从 13 ms 变成
+1.5 s。两条修法：
+
+1. **`limit` 分页**（端点表新增参数）：响应体大小从"等于游标之后全部积压
+   事件数"收紧为"至多 1000 条"，无论 journal 或积压增量多大，单次响应的
+   内存/网络占用都有一个不随数据量增长的上界。
+2. **挂起循环不再"每次醒来就整段重读+重解析 journal"**：`wait>0` 的挂起期间
+   每次被唤醒（`Notify` 或轮询间隔到期）时，先只对当前 epoch 的 `.jsonl`
+   文件做一次 `stat`（文件长度 + mtime，`O(1)`，不读取任何文件内容）；这个
+   指纹与"上一次真正读取 journal 时"的指纹相同，就直接判定"这一轮没有新
+   事件"，跳过整段读取+解析，回去继续等待/轮询——只有指纹变化（或这是
+   这次请求的第一轮判断，必须先建立一次基线）才值得付一次真正的
+   `read_all`。这不改变正确性（`Notify` 与轮询间隔仍然是唤醒的来源，指纹
+   探测只是"值不值得在这次唤醒时真的去读"的廉价前置判断），只是把"重复
+   为零变化付全量解析代价"这件事去掉。
+
+事件的线上序列化也改为直接把 `arca_format::journal::JournalEvent` 转成
+`FORMAT.md` §7.2 定义的行式字段结构体（`JournalEventWire`）再交给
+`serde_json` 一次性写出，不再"先 `to_line()` 成字符串、再解析回
+`serde_json::Value`、再整体收集、再整体序列化"——那条路径对**同一批**事件
+在内存里同时保有多份等价表示，是评审量出的"16 倍于文件"的主因之一。
 
 #### `POST .../rename`：为什么是独立端点，为什么请求体带 `parent` 不是 `If-Match` 头（M2c Task 5）
 

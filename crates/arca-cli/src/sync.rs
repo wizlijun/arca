@@ -51,19 +51,19 @@
 //! `RemoteState::Present`，`trash::move_to_trash` 因此总能找到源文件，这个
 //! 桶目前恒空，但类型上保留，供未来加发起侧闸门时使用）。
 
-use crate::transport::{CommitOutcome, CommitRequest, RenameRequest, TombstoneRequest, Transport};
+use crate::transport::{
+    BatchOutcome, CommitOutcome, CommitRequest, RenameRequest, TombstoneRequest, Transport,
+};
 use crate::{baseline, clock, gates, hub, ids, journal, scan, trash, vault};
 use arca_chunk::hash::ContentHash;
 use arca_core::reconcile::{decide_traced, Action};
 use arca_core::state::{BaseState, LocalState, RemoteState};
 use arca_format::hub_layout::layout;
-use arca_format::index::IndexRecord;
-use arca_format::items;
 use arca_format::manifest::{Manifest, ManifestEntry};
-use arca_format::model::{Actor, ItemId, Version};
+use arca_format::model::{Actor, ItemId};
 use arca_format::path_rules;
 use arca_format::trace::TraceSink;
-use arca_store::atomic::{self, AtomicError, Batch};
+use arca_store::atomic::{self, AtomicError};
 use arca_store::root::StorageRoot;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -153,6 +153,25 @@ pub enum SyncError {
     /// （`crate::transport::TransportError::class`），调用方（命令壳）据此
     /// 决定重试/停下/报告 bug。
     Transport(crate::transport::TransportError),
+    /// **仅 [`sync`]**（评审 C2/I7）：本轮 `Upload` 批量提交
+    /// （`LocalTransport::commit_batch`）时发现 CAS 冲突或身份不符——理论上
+    /// 不该发生：`sync()` 面向单进程、一次只跑一次的场景（模块顶部「与
+    /// brief 字面签名的一处刻意偏离」一节），本次调和用来做决策的 `remote`
+    /// 快照与批量提交之间不应该有其它写入方介入。一旦真的发生（例如同一
+    /// 存储根被另一个进程并发写入），必须整体停下如实报告，不能悄悄丢弃
+    /// 部分已经在内存里更新过的 `baseline`（I5）——`commit_batch` 本身已经
+    /// 保证"整批不生效"，`sync()` 因此也不会保存基线、不会让这些路径被
+    /// 误判为"已经同步成功"；下次重跑会用磁盘上未受影响的旧基线重新决策。
+    ///
+    /// `outcome` 装箱：`CommitOutcome::Conflict` 内嵌一个 `RemoteState`，
+    /// 直接内联会把 `SyncError` 整体的按值大小拖过 `clippy::result_large_err`
+    /// 的阈值，累及本文件里每一个返回 `Result<_, SyncError>` 的函数——纯粒度
+    /// 考量，不改变语义（`arcad/src/api.rs::open_dataset` 的 `Box<Response>`
+    /// 同一处置纪律）。
+    UploadRejected {
+        path: String,
+        outcome: Box<CommitOutcome>,
+    },
 }
 
 impl fmt::Display for SyncError {
@@ -167,6 +186,12 @@ impl fmt::Display for SyncError {
             SyncError::Journal(e) => write!(f, "{e}"),
             SyncError::Io { path, reason } => write!(f, "{path}：{reason}"),
             SyncError::Transport(e) => write!(f, "{e}"),
+            SyncError::UploadRejected { path, outcome } => write!(
+                f,
+                "上传 {path:?} 时批量提交被拒绝（{outcome:?}）——理论上不该发生，\
+                 说明存储根在本次调和期间被其它写入方并发改动过，未保存任何基线更新，\
+                 重跑一次 sync 会用磁盘上未受影响的旧基线重新决策"
+            ),
         }
     }
 }
@@ -237,8 +262,6 @@ pub fn sync(
     // 基线与远端已知的路径，用于驱动整个调和循环）是不同的集合，不能共用。
     let scanned_paths: BTreeSet<String> = scan_result.files.keys().cloned().collect();
 
-    let mut batch = Batch::new(root);
-
     // 评审 Important #3：闸门第 4 道与 `journal::append` 各自的 O(n·m)/O(n²)
     // 都源于"同一份磁盘状态在循环里被重复读取/重写"——这里跟内容侧的
     // `arca_store::atomic::Batch` 同一思路，把它们各自的"读一次、批量用"
@@ -251,12 +274,36 @@ pub fn sync(
     // trash/` 只读一次、循环内复用"这份纪律接管过去（惰性缓存，见其文档），
     // 效果与旧的 `trash_snapshot` 完全一致，只是职责搬进了 `Transport`
     // 实现内部，`sync()` 不用再自己操心这件事。
+    //
+    // **评审 C2/I7**：`transport` 现在还是本轮全部 `Upload` 收尾时那一次
+    // `LocalTransport::commit_batch` 调用的落点——见下面 `upload_reqs` 与
+    // 循环之后的批次收口。
     let transport = crate::transport::local::LocalTransport::new(root);
 
-    // `journal_batch`：本次调和可能提交多条 `TombstoneRemote`，每条都各自
-    // 重读+重写整段 journal 是 O(n²)（`journal::AppendBatch` 文档）；这里
-    // 只读一次现有事件流，循环内的每次追加都在内存里完成，最后统一收口。
-    let mut journal_batch = journal::AppendBatch::open(root).map_err(SyncError::Journal)?;
+    // `tombstone_events`：本次调和可能提交多条 `TombstoneRemote`——物理搬移
+    // （`.arca/trash/` + index 清理）在循环内立即执行，**journal 事件的追加
+    // 推迟到循环结束、`Upload` 的批量提交完成之后**，用一个在那之后才
+    // `open` 的全新 `journal::AppendBatch` 一次性收口（评审 C2 实机复现
+    // 修复：见 [`execute_tombstone_content`] 文档「两个独立的 `AppendBatch`
+    // 不能交错提交」一节——这正是 M2a 修过的 O(n²) 批量收口思路，只是
+    // 现在必须晚于 `Upload` 的批量提交才能 `open`，不能像旧代码那样在循环
+    // 开始前就抢先拍快照）。
+    let mut tombstone_events: Vec<(String, ItemId, arca_format::model::VersionId, String)> =
+        Vec::new();
+
+    // **评审 C2**：本轮全部 `Upload` 先收集成一批，循环结束后统一走一次
+    // `LocalTransport::commit_batch`——内容（`files/`）+ `items/` + `index/` +
+    // **journal `op=upsert` 事件**一次性整体提交。这是这次修复的核心：修复前
+    // `execute_upload` 只写 `files/`+`items/`+`index/`，从不追加 journal 事件，
+    // `arca adopt`/`file://` 的 `arca sync` 因此会产出一份"nara.png 从未发生过
+    // 任何事"的 journal（I9：真相在 hub 的 journal），只有经
+    // `LocalTransport::commit`/`commit_streamed`/`commit_batch` 的写入路径
+    // （此前只有 `arcad` 的 HTTP 端点在走）才会写。改走 `commit_batch` 同时
+    // 顺带解决评审 I7："Task 1 补的批量接口在生产路径上没有调用者"——现在
+    // 这就是它的生产调用点，也一并保留了 M1d 批量归档的性能特征（一次
+    // `arca_store::atomic::Batch` + 一次 `journal::AppendBatch` 收口，不是
+    // 逐文件各自 fsync）。
+    let mut upload_reqs: Vec<CommitRequest> = Vec::new();
 
     for (idx, path) in paths.iter().enumerate() {
         let base = baseline.get(path);
@@ -273,18 +320,11 @@ pub fn sync(
             Action::Noop => {}
 
             Action::Upload { parent } => {
-                let new_state = execute_upload(
-                    dataset_root,
-                    root,
-                    &mut batch,
-                    path,
-                    &base,
-                    &remote_state,
-                    parent,
-                    actor,
-                )?;
+                let (req, new_state) =
+                    prepare_upload(dataset_root, path, &base, &remote_state, parent, actor)?;
                 baseline.set(path.clone(), new_state);
                 report.uploaded.push(path.clone());
+                upload_reqs.push(req);
             }
 
             Action::Download { version_id } => {
@@ -348,7 +388,8 @@ pub fn sync(
             }
 
             Action::TombstoneRemote { item_id, parent } => {
-                execute_tombstone(root, &mut journal_batch, path, item_id, &parent, actor)?;
+                let at = execute_tombstone_content(root, path, item_id)?;
+                tombstone_events.push((path.clone(), item_id, parent, at));
                 baseline.remove(path);
                 report.tombstone_submitted.push(path.clone());
             }
@@ -363,17 +404,59 @@ pub fn sync(
         }
     }
 
-    // 批次收口：本次 sync 触碰过的每个目录 fsync 一次，确认落盘。必须在
-    // `baseline.save` 之前完成——commit 失败就不能保存基线继续声称这些路径
-    // 已经同步成功（见本函数顶部「存储根写入走批量提交」一节，I3）。
-    batch.commit().map_err(SyncError::Atomic)?;
+    // 批次收口：本轮全部 `Upload` 一次性提交（评审 C2/I7，见上面 `upload_reqs`
+    // 的文档）。必须在 `baseline.save` 之前完成——`commit_batch` 要么整批
+    // 成功要么整批不生效（`BatchOutcome` 文档），不生效时绝不能让内存里已经
+    // 更新过的 `baseline` 继续声称这些路径"已经同步成功"（I3）。本次调和
+    // 用的 `remote` 快照与这里之间不应该有其它写入方介入——`sync()` 面向的
+    // 是单进程、一次只跑一次的场景（模块顶部「与 brief 字面签名的一处刻意
+    // 偏离」一节），`commit_batch` 仍然做真正的 CAS 校验（不是来者不拒），
+    // 一旦这个假设被打破（例如同一存储根被另一个进程并发写入），这里必须
+    // 停下如实报告为 `SyncError::UploadRejected`，而不是悄悄丢弃部分已经
+    // 决策过的路径（I5）。
+    if !upload_reqs.is_empty() {
+        match transport
+            .commit_batch(&upload_reqs)
+            .map_err(SyncError::Transport)?
+        {
+            BatchOutcome::Committed(_) => {}
+            BatchOutcome::Rejected { index, outcome } => {
+                return Err(SyncError::UploadRejected {
+                    path: upload_reqs[index].path.clone(),
+                    outcome: Box::new(outcome),
+                });
+            }
+        }
+    }
 
-    // journal 批次收口——同一条纪律（评审 Important #3）：本次调和累积的
-    // 全部 tombstone 事件在这里一次性落盘，必须先于 `baseline.save`。commit
-    // 失败意味着这些路径的删除提交还没有真正记进 journal，不能让基线继续
-    // 声称它们"已经同步成功"；下次重跑 `hub::read_remote` 仍会看到旧的
-    // journal 状态，`decide` 会重新给出 `TombstoneRemote`，不构成数据风险。
-    journal_batch.commit().map_err(SyncError::Journal)?;
+    // tombstone 的 journal 批次收口——同一条纪律（评审 Important #3）：本次
+    // 调和累积的全部 tombstone 事件在这里一次性落盘，必须先于 `baseline.save`。
+    // **必须在上面 `Upload` 的 `commit_batch` 完成之后才 `open`**（评审 C2
+    // 实机复现修复，见 [`execute_tombstone_content`] 文档）——这里才第一次
+    // 打开 `AppendBatch`，读到的是已经包含全部 upsert 事件的最新状态，不会
+    // 冲掉它们。commit 失败意味着这些路径的删除提交还没有真正记进
+    // journal，不能让基线继续声称它们"已经同步成功"；下次重跑
+    // `hub::read_remote` 仍会看到旧的 journal 状态，`decide` 会重新给出
+    // `TombstoneRemote`，不构成数据风险。
+    if !tombstone_events.is_empty() {
+        let mut journal_batch = journal::AppendBatch::open(root).map_err(SyncError::Journal)?;
+        for (path, item_id, parent, at) in tombstone_events {
+            let seq = journal_batch.next_seq();
+            journal_batch
+                .push(arca_format::journal::JournalEvent {
+                    seq,
+                    op: arca_format::journal::Op::Tombstone,
+                    item_id,
+                    version_id: parent,
+                    path,
+                    from: None,
+                    actor: actor.clone(),
+                    at,
+                })
+                .map_err(SyncError::Journal)?;
+        }
+        journal_batch.commit().map_err(SyncError::Journal)?;
+    }
 
     baseline.save(dataset_root).map_err(SyncError::Baseline)?;
 
@@ -386,18 +469,22 @@ pub fn sync(
     Ok(report)
 }
 
-/// 执行一次 `Upload`：写 `files/` + 追加 `items/` + 更新 `index/`，返回新基线状态。
-#[allow(clippy::too_many_arguments)]
-fn execute_upload(
+/// 准备一次 `Upload`：读本地内容、分配/延续身份，构造好一条
+/// [`CommitRequest`] 与新的基线状态——**不触碰磁盘**（不写 `files/`/
+/// `items/`/`index/`/journal）。真正的落盘交给调用方（[`sync`]/
+/// [`sync_transport`]）收尾时的一次批量 `Transport::commit_batch`（评审
+/// C2/I7，见 [`sync`] 顶部「本轮全部 `Upload`」一节）：`commit_batch` 内部
+/// 已经是"内容先于指针发布"（`files/` → `items/` → `index/` → journal）
+/// 的完整实现（`transport::local::LocalTransport::commit_batch` 文档），
+/// 本函数不重新实现一遍写入顺序，只负责"这次提交该携带什么"。
+fn prepare_upload(
     dataset_root: &Path,
-    root: &StorageRoot,
-    batch: &mut Batch<'_>,
     path: &str,
     base: &BaseState,
     remote_state: &RemoteState,
     parent: Option<arca_format::model::VersionId>,
     actor: &SyncActor,
-) -> Result<BaseState, SyncError> {
+) -> Result<(CommitRequest, BaseState), SyncError> {
     let local_path = dataset_root.join(to_native(path));
     let bytes = fs::read(&local_path).map_err(|e| io_err(&local_path, e))?;
     let hash = arca_chunk::hash::ContentHash::from_bytes(&bytes);
@@ -420,39 +507,25 @@ fn execute_upload(
         .map(rfc3339_from_systemtime)
         .unwrap_or_else(|_| clock::now_rfc3339());
 
-    let version = Version {
-        version_id: version_id.clone(),
+    let req = CommitRequest {
+        path: path.to_string(),
         item_id,
+        version_id: version_id.clone(),
         parent,
-        hash,
-        size,
+        bytes,
         mtime,
         actor: actor.clone(),
-        committed_at: clock::now_rfc3339(),
     };
 
-    // 写入顺序：files/ → items/ → index/（评审 Critical #1）。`index/` 是
-    // "这个路径存在"的唯一指针——`hub::read_remote` 只遍历 `index/` 分片，
-    // 一个路径若还没有 index 记录，它对整个系统而言就是"没有这回事"，不会
-    // 被任何调用方观测到。所以指针必须最后发布：中途失败（ENOSPC、拔盘）
-    // 留下的是"字节已经在 files/，但没有指针指向它"——下次重跑会把它当成
-    // 全新上传重新写一遍（`ids::new_item_id()`），无害，只是多占一点存储；
-    // 旧顺序（items/ → index/ → files/）失败时留下的是"指针完整，字节缺失"，
-    // `hub::read_remote` 现在会把这识别为 `HubError::MissingContent`（见
-    // `hub.rs`），但绝不能靠"读的时候报错"兜底——能从源头避免制造这种状态
-    // 才是治本：写的时候就不产生指针先于字节的窗口。
-    let target = format!("{}/{}", layout::FILES_DIR, path);
-    batch.write(&target, &bytes).map_err(SyncError::Atomic)?;
-
-    append_item_version(root, batch, &version)?;
-    write_index_record(batch, path, item_id)?;
-
-    Ok(BaseState::Present {
-        item_id,
-        version_id,
-        hash,
-        size,
-    })
+    Ok((
+        req,
+        BaseState::Present {
+            item_id,
+            version_id,
+            hash,
+            size,
+        },
+    ))
 }
 
 /// 执行一次 `Download`：从存储根的 `files/`（I1：当前版本永远完整平放）读出
@@ -551,34 +624,26 @@ fn execute_download(
 /// index 记录残留（退回本改动之前的行为），由 `hub.rs` 的
 /// `is_pending_tombstone` 兜底诊断（评审 Important #1），不会更糟。
 ///
-/// `journal_batch`：本次调和累积的批量 journal 写入（评审 Important #3，见
-/// `sync()` 顶部与 `journal::AppendBatch` 的文档）——只在内存里追加、校验
-/// `seq` 连续性，真正落盘延后到 `sync()` 收尾的一次 `commit()`。
-fn execute_tombstone(
+/// **只做物理搬移**（`.arca/trash/` + index 清理），**不追加 journal 事件**
+/// ——journal 事件的追加推迟到 [`sync`] 收尾时统一进行（评审 C2 实机复现
+/// 修复，见 [`sync`] 内「两个独立的 `AppendBatch` 不能交错提交」一节）：
+/// 早先的实现在循环开始前就 `journal::AppendBatch::open` 一次（给
+/// tombstone 用），循环结束后再 `commit_batch`（给 Upload 用，内部自己也
+/// 会开、写、提交一个 `AppendBatch`）——`commit_batch` 的这次内部写入发生
+/// 在外层 `journal_batch` 早已拍好的快照**之后**，外层 `journal_batch` 收尾
+/// 时的 `commit()` 会把自己内存里那份（不含 Upload 事件的）快照整体重写回
+/// 磁盘，直接冲掉 `commit_batch` 刚写入的 upsert 事件——两个 `AppendBatch`
+/// 各自都是"open 时读一次、commit 时整体重写"，交错使用必然互相践踏。
+/// 返回这次 tombstone 使用的 `at` 时间戳，供调用方稍后统一构造 journal 事件。
+fn execute_tombstone_content(
     root: &StorageRoot,
-    journal_batch: &mut journal::AppendBatch<'_>,
     path: &str,
     item_id: ItemId,
-    parent: &arca_format::model::VersionId,
-    actor: &SyncActor,
-) -> Result<(), SyncError> {
+) -> Result<String, SyncError> {
     let at = clock::now_rfc3339();
     trash::move_to_trash(root, path, item_id, &at).map_err(SyncError::Trash)?;
     remove_index_record(root, path)?;
-
-    let seq = journal_batch.next_seq();
-    journal_batch
-        .push(arca_format::journal::JournalEvent {
-            seq,
-            op: arca_format::journal::Op::Tombstone,
-            item_id,
-            version_id: parent.clone(),
-            path: path.to_string(),
-            from: None,
-            actor: actor.clone(),
-            at,
-        })
-        .map_err(SyncError::Journal)
+    Ok(at)
 }
 
 /// 从 `.arca/index/<key>.json` 移除 `path` 的记录——`execute_tombstone` 的
@@ -596,51 +661,13 @@ fn remove_index_record(root: &StorageRoot, path: &str) -> Result<(), SyncError> 
     }
 }
 
-/// 追加一条版本记录到 `items/<xx>/<item_id>.jsonl`。`items/` 是 append-only
-/// 语义（FORMAT.md §7.1），但 `arca_store::atomic` 只提供整文件原子替换，
-/// 没有原子追加——因此这里是"读现有内容 + 拼接新行 + 整体原子重写"，读到的
-/// 现有内容本身已经是上一次原子写入的产物，不存在半截读到的风险。
-fn append_item_version(
-    root: &StorageRoot,
-    batch: &mut Batch<'_>,
-    version: &Version,
-) -> Result<(), SyncError> {
-    let rel = layout::item_path(&version.item_id);
-    let full = root.path().join(&rel);
-    let mut content = match fs::read_to_string(&full) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(io_err(&full, e)),
-    };
-    content.push_str(&items::to_line(version).map_err(SyncError::Format)?);
-    content.push('\n');
-    batch
-        .write(&rel, content.as_bytes())
-        .map_err(SyncError::Atomic)
-}
-
-/// 整体原子替换 `index/<xx>/<key>.json`（index 记录不是 append-only，见
-/// `arca_format::index` 模块文档）。
-fn write_index_record(batch: &mut Batch<'_>, path: &str, item_id: ItemId) -> Result<(), SyncError> {
-    let key = path_rules::index_key(path);
-    let rel = layout::index_path(&key);
-    let record = IndexRecord {
-        item_id,
-        path: path.to_string(),
-    };
-    let text = record.to_json().map_err(SyncError::Format)?;
-    batch
-        .write(&rel, text.as_bytes())
-        .map_err(SyncError::Atomic)
-}
-
 /// 从最终基线重新生成 `<dataset_root>/.arca/manifest`（评审 Important #4）：
 /// `sync` 收尾时的基线就是"这个数据集当前每个受管路径的哈希/大小的权威
 /// 快照"，清单只是它在 git 侧的行式镜像。**每次 `sync` 都要重新生成**，
 /// 不能只靠 `arca adopt` 生成一次——见本函数调用点的注释。
 ///
 /// `mtime` 取文件自身的 mtime（FORMAT.md 定义的字段语义），不是"写清单
-/// 这一刻"的墙上时钟——用 `execute_upload` 同一段 `rfc3339_from_systemtime`
+/// 这一刻"的墙上时钟——用 `prepare_upload` 同一段 `rfc3339_from_systemtime`
 /// 转换逻辑（评审 Minor：此前 `adopt.rs` 独立实现的 `write_manifest` 用的
 /// 是墙上时钟，导致一次空操作的重跑也会弄脏清单，侵蚀"adopt 后 git status
 /// 干净"这条 M1 验收性质——第二次跑就不成立了）。
@@ -1234,6 +1261,9 @@ mod tests {
     use super::*;
     use arca_core::reconcile::decide;
     use arca_format::hub_layout::FormatJson;
+    use arca_format::index::IndexRecord;
+    use arca_format::items;
+    use arca_format::model::Version;
     use arca_format::trace::NullSink;
     use std::fs;
 
@@ -1545,10 +1575,16 @@ mod tests {
             other => panic!("应为 Present，实得 {other:?}"),
         };
         crate::trash::move_to_trash(&root, "j.txt", item_id, "2026-08-08T09:20:00Z").unwrap();
+        // **评审 C2 修复后的必要更新**：第一次 `sync()`（上传 "j.txt"）现在
+        // 会经 `commit_batch` 追加一条 `seq=1` 的 `op=upsert` 事件（修复前
+        // journal 全程 0 字节，这里能硬编码 `seq: 1`；那正是 C2 要修的洞）——
+        // 这条手工拼的 tombstone 事件必须取真正的下一个 `seq`，不能再假设
+        // journal 是空的。
+        let next_seq = crate::journal::next_seq(&root).unwrap();
         crate::journal::append(
             &root,
             &arca_format::journal::JournalEvent {
-                seq: 1,
+                seq: next_seq,
                 op: arca_format::journal::Op::Tombstone,
                 item_id,
                 version_id,

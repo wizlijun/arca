@@ -176,15 +176,26 @@ fn validate_commit(
         }));
     }
 
-    // 校验 1：这个路径此刻真正的归属（若有）必须与调用方声称的 item_id
-    // 一致——HTTP 是不可信输入的入口，`Arca-Item-Id` 此前只经过语法解析，
-    // 从未核对它是不是真的拥有这个路径。
-    if let Some(owner) = owner_item_id(&current) {
-        if owner != item_id {
+    // 校验 1：这个路径此刻若真的**活着**（`Present`）被别的 item 占用，
+    // 调用方声称的 item_id 必须与它一致——HTTP 是不可信输入的入口，
+    // `Arca-Item-Id` 此前只经过语法解析，从未核对它是不是真的拥有这个
+    // 路径。**只看 `Present`，不看 `Tombstoned`**（评审 C2 实机复现修复：
+    // 路由 `sync()` 的 `Upload` 改走 `commit_batch` 后，「删除后原地重建
+    // 为全新身份」——spec §4.1 明文预期、`sync.rs::prepare_upload` 在
+    // `parent:None` 时就是这么做的——会被这里挡下来，因为旧实现把
+    // `Tombstoned` 也算作"有归属"，导致一个从未被使用过的全新 item_id
+    // 在一个已经被删除的路径上创建，被误判成"身份不符"）。`Tombstoned`
+    // 状态下真正需要挡住的攻击是"复用那个已经终结的旧 item_id 本身"，
+    // 校验 0（`hub::item_is_tombstoned`，判断的是调用方声称的 `item_id`
+    // 自己，与路径无关）已经完整覆盖了这一种，不需要校验 1 再重复挡一遍
+    // ——两条校验挡的是不同维度："这个身份还能不能用"（校验 0）与"这个
+    // 路径此刻活着占着的是不是这个身份"（校验 1，只对活着的占用有意义）。
+    if let RemoteState::Present { item_id: owner, .. } = &current {
+        if *owner != item_id {
             return Ok(Err(CommitOutcome::IdentityMismatch {
                 path: path.to_string(),
                 claimed_item_id: item_id,
-                actual_item_id: Some(owner),
+                actual_item_id: Some(*owner),
             }));
         }
     }
@@ -220,9 +231,14 @@ fn validate_commit(
 }
 
 /// 一个 `RemoteState` 此刻的归属 item_id——`Present` 与 `Tombstoned` 都算
-/// "有归属"（C1 身份校验：一个已经被 tombstone 的 item 仍然"占着"它最后
-/// 出现过的那个路径，不能被另一个 commit 悄悄接管，见 spec §4.1「删除后
-/// 重建 = 新身份」），只有 `Absent` 才是"没有归属"。
+/// "有归属"。**只用于 [`validate_commit`] 校验 2**（"这个 item_id 不能在
+/// 别的路径下已经有归属"）：那条校验挡的是"同一个全新 item_id 被两个不同
+/// 路径各自声明"，`Tombstoned` 状态下这个 item_id 早就在校验 0 被挡住过
+/// 一次（它自己已经终结，不可能是"全新"的），这里把 `Tombstoned` 也算作
+/// "有归属"不会改变结果，只是不必再假设"一定不会撞上"。**不要用于校验 1**
+/// （评审 C2 实机复现修复）：校验 1 判断的是"这个路径此刻是否被别的身份
+/// **活着**占用"，`Tombstoned` 不是"活着占用"——见 [`validate_commit`]
+/// 校验 1 的完整论证。
 fn owner_item_id(state: &RemoteState) -> Option<ItemId> {
     match state {
         RemoteState::Present { item_id, .. } => Some(*item_id),
@@ -432,14 +448,19 @@ impl Transport for LocalTransport<'_> {
                 .get(&req.path)
                 .cloned()
                 .unwrap_or(RemoteState::Absent);
-            if let Some(owner) = owner_item_id(&current) {
-                if owner != req.item_id {
+            // 评审 C2 实机复现修复：与 `validate_commit` 校验 1 同一条纪律——
+            // 只有路径此刻**活着**（`Present`）被别的身份占用才算冲突，
+            // `Tombstoned` 不挡「删除后重建为全新身份」（spec §4.1），那个
+            // 攻击面已经由上面的 `tombstoned.contains(&req.item_id)` 挡住
+            // （挡的是复用那个已经终结的旧 item_id 本身，与路径无关）。
+            if let RemoteState::Present { item_id: owner, .. } = &current {
+                if *owner != req.item_id {
                     return Ok(BatchOutcome::Rejected {
                         index,
                         outcome: CommitOutcome::IdentityMismatch {
                             path: req.path.clone(),
                             claimed_item_id: req.item_id,
-                            actual_item_id: Some(owner),
+                            actual_item_id: Some(*owner),
                         },
                     });
                 }
@@ -1034,6 +1055,144 @@ mod tests {
                 hash: ContentHash::from_bytes(b"content"),
                 size: 7,
             })
+        );
+    }
+
+    /// **评审 C2 实机复现**：`sync()` 改走 `commit_batch` 之后暴露的一个真实
+    /// bug——一条路径被 tombstone 之后，用**全新**（从未出现过）的 item_id
+    /// 在同一路径原地重建，必须成功（spec §4.1「删除后重建 = 新身份」，
+    /// `sync.rs::prepare_upload` 在 `parent:None` 时就是这么分配身份的）。
+    /// 修复前 `validate_commit` 校验 1 把 `Tombstoned` 也算作"有归属"，
+    /// 导致这个全新 item_id 被误判成"与路径此刻的归属不符"而报
+    /// `IdentityMismatch`——`arca_cli::sync::tests::restore覆盖当前占用者时先移入trash_评审critical1实机复现`
+    /// 曾经因此挂掉（该测试的第 3 步正是这个场景）。这里单独在 `Transport`
+    /// 这一层直接覆盖，不依赖 `sync()` 的整条调和链路。
+    #[test]
+    fn commit在路径被tombstone后用全新item_id原地重建必须成功() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+
+        let old_item = crate::ids::new_item_id();
+        let v1 = crate::ids::new_version_id();
+        transport
+            .commit(&CommitRequest {
+                path: "a.txt".to_string(),
+                item_id: old_item,
+                version_id: v1.clone(),
+                parent: None,
+                bytes: b"OLD".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+        transport
+            .tombstone(&TombstoneRequest {
+                path: "a.txt".to_string(),
+                item_id: old_item,
+                parent: v1,
+                actor: actor(),
+                at: "2026-08-08T09:10:00Z".to_string(),
+            })
+            .unwrap();
+
+        // 全新 item_id（从未出现过），parent:None（仅创建语义）——必须成功，
+        // 不能因为路径此刻的（tombstone）历史而被拒绝。
+        let new_item = crate::ids::new_item_id();
+        assert_ne!(new_item, old_item);
+        let outcome = transport
+            .commit(&CommitRequest {
+                path: "a.txt".to_string(),
+                item_id: new_item,
+                version_id: crate::ids::new_version_id(),
+                parent: None,
+                bytes: b"NEW".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+        assert!(
+            matches!(outcome, CommitOutcome::Committed { .. }),
+            "实得 {outcome:?}"
+        );
+        let remote = transport.read_remote().unwrap();
+        assert!(matches!(
+            remote.get("a.txt"),
+            Some(RemoteState::Present { item_id, .. }) if *item_id == new_item
+        ));
+
+        // 复用旧的（已终结的）item_id 仍然必须被拒绝——校验 0 不受这次修复
+        // 影响，攻击面没有被打开。
+        let resurrect = transport
+            .commit(&CommitRequest {
+                path: "b.txt".to_string(),
+                item_id: old_item,
+                version_id: crate::ids::new_version_id(),
+                parent: None,
+                bytes: b"attacker".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+        assert!(matches!(
+            resurrect,
+            CommitOutcome::IdentityMismatch {
+                actual_item_id: None,
+                ..
+            }
+        ));
+    }
+
+    /// 同一场景的 `commit_batch` 版本——`commit_batch` 有一份独立的内联校验
+    /// （不是复用 `validate_commit`），必须单独覆盖，否则两条路径会悄悄
+    /// 分叉（评审 C2 实机复现修复，见上一条测试与 `commit_batch` 内联校验
+    /// 处的注释）。
+    #[test]
+    fn commit_batch在路径被tombstone后用全新item_id原地重建必须成功() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+
+        let old_item = crate::ids::new_item_id();
+        let v1 = crate::ids::new_version_id();
+        transport
+            .commit(&CommitRequest {
+                path: "a.txt".to_string(),
+                item_id: old_item,
+                version_id: v1.clone(),
+                parent: None,
+                bytes: b"OLD".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+        transport
+            .tombstone(&TombstoneRequest {
+                path: "a.txt".to_string(),
+                item_id: old_item,
+                parent: v1,
+                actor: actor(),
+                at: "2026-08-08T09:10:00Z".to_string(),
+            })
+            .unwrap();
+
+        let new_item = crate::ids::new_item_id();
+        let outcome = transport
+            .commit_batch(&[CommitRequest {
+                path: "a.txt".to_string(),
+                item_id: new_item,
+                version_id: crate::ids::new_version_id(),
+                parent: None,
+                bytes: b"NEW".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            }])
+            .unwrap();
+        assert!(
+            matches!(outcome, BatchOutcome::Committed(ref v) if v.len() == 1),
+            "实得 {outcome:?}"
         );
     }
 
