@@ -32,6 +32,7 @@ use arca_cli::register::{self, RegisterOptions};
 use arca_cli::status as status_lib;
 use arca_cli::sync::{self as sync_lib, SyncActor};
 use arca_cli::trace_sink;
+use arca_cli::trash;
 use arca_cli::vault;
 use arca_format::trace::{NullSink, RingSink};
 use arca_store::root::StorageRoot;
@@ -176,12 +177,18 @@ pub fn adopt_cmd(path: &str, root: Option<&Path>, allow_create_root: bool) -> Ex
             for p in &outcome.report.adopted {
                 println!("adopt\t{p}");
             }
+            for p in &outcome.report.tombstone_submitted {
+                println!("tombstone\t{p}");
+            }
             for p in &outcome.untracked_from_git {
                 eprintln!("从 git index 逐出（工作树文件未改动）：{p}");
             }
             // I5：能力缺失/需要人工介入的情况绝不静默。
+            for (p, failure) in &outcome.report.delete_blocked {
+                eprintln!("删除闸门拦下，未移除本地副本：{p}：{failure}");
+            }
             for p in &outcome.report.tombstone_pending {
-                eprintln!("删除传播属 M2，本轮未执行：{p}");
+                eprintln!("本该提交为删除（tombstone）但本轮未能执行：{p}");
             }
             for p in &outcome.report.conflicts {
                 eprintln!("结构化冲突，未动数据：{p}");
@@ -319,8 +326,14 @@ pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
                 for p in &report.deleted_local {
                     println!("delete-local\t{p}");
                 }
+                for p in &report.tombstone_submitted {
+                    println!("tombstone\t{p}");
+                }
+                for (p, failure) in &report.delete_blocked {
+                    eprintln!("删除闸门拦下，未移除本地副本：{p}：{failure}");
+                }
                 for p in &report.tombstone_pending {
-                    eprintln!("删除传播属 M2，本轮未执行：{p}");
+                    eprintln!("本该提交为删除（tombstone）但本轮未能执行：{p}");
                 }
                 for p in &report.conflicts {
                     eprintln!("结构化冲突，未动数据：{p}");
@@ -388,7 +401,7 @@ pub fn status_cmd(path: &str, root: Option<&Path>) -> ExitCode {
                 eprintln!("待删除本地副本：{p}");
             }
             for p in &report.tombstone_pending {
-                eprintln!("删除传播属 M2，本轮不会执行：{p}");
+                eprintln!("待提交删除（tombstone）：{p}");
             }
             for p in &report.conflicts {
                 eprintln!("结构化冲突：{p}");
@@ -530,5 +543,95 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+/// `arca restore <dataset> <file> [--root <path>]`（M2a tombstone 计划
+/// Task 5，spec §7）：保留期内一条命令找回被删除的文件——从 hub 的
+/// `.arca/trash/` 取回内容写回 `files/`，在 journal 追加一条新版本
+/// （`item_id` 延续，理由见 `trash::restore` 的文档）。
+///
+/// 与 `status`/`verify` 同样先经 [`dataset::resolve`] 定位数据集与存储根，
+/// 再用 [`StorageRoot::open`] 严格校验身份（I11）——恢复是写操作，绝不能
+/// 在身份不明的挂载点上执行。
+pub fn restore_cmd(dataset_path: &str, file: &str, root: Option<&Path>) -> ExitCode {
+    let resolved = match dataset::resolve(&cwd(), dataset_path, root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let normalized_file = match arca_format::path_rules::check(file) {
+        Ok(p) => p,
+        Err(status) => {
+            eprintln!("路径 {file:?} 不合规：{}", status.as_str());
+            return ExitCode::from(1);
+        }
+    };
+    let store_root = match StorageRoot::open(&resolved.root_path, Some(&resolved.cfg.dataset_id)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match trash::restore(
+        &store_root,
+        &normalized_file,
+        &default_actor(),
+        &arca_cli::clock::now_rfc3339(),
+    ) {
+        Ok(version) => {
+            println!(
+                "restore\t{normalized_file}\t{}",
+                version.version_id.as_str()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `arca restore <dataset> --list [--root <path>]`：列出保留期内可恢复的
+/// 条目——数据永远走 stdout（plumbing 同一条 Rule of Silence 纪律：即便
+/// 结果是空列表也不算"安静"，因为这是用户明确请求的数据，不是诊断）。
+pub fn restore_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
+    let resolved = match dataset::resolve(&cwd(), dataset_path, root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let store_root = match StorageRoot::open(&resolved.root_path, Some(&resolved.cfg.dataset_id)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    match trash::list(&store_root) {
+        Ok(entries) => {
+            for entry in &entries {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    entry.meta.path,
+                    entry.meta.item_id.to_hex(),
+                    entry.meta.deleted_at,
+                    entry.trash_id
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
     }
 }

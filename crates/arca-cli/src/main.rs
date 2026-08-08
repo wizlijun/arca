@@ -96,6 +96,19 @@ enum Command {
         #[arg(long)]
         root: Option<std::path::PathBuf>,
     },
+    /// 保留期内一条命令找回被删除的文件（spec §7）
+    Restore {
+        /// 数据集路径，相对 vault 根
+        dataset: String,
+        /// 数据集内的文件路径——恢复目标；与 --list 二选一
+        file: Option<String>,
+        /// 只列出保留期内可恢复的条目，不实际恢复
+        #[arg(long)]
+        list: bool,
+        /// 覆盖从 .gitarca 解析出的存储根路径
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
     /// plumbing：hub 侧当前清单（--json 输出，格式见 PROTOCOL.md §5）
     Ls {
         /// 数据集路径，相对 vault 根
@@ -205,6 +218,24 @@ fn main() -> std::process::ExitCode {
         Command::Status { path, root } => commands::porcelain::status_cmd(&path, root.as_deref()),
         Command::Verify { path, root } => commands::porcelain::verify_cmd(&path, root.as_deref()),
         Command::Doctor { root } => commands::porcelain::doctor_cmd(root.as_deref()),
+        Command::Restore {
+            dataset,
+            file,
+            list,
+            root,
+        } => {
+            if list {
+                commands::porcelain::restore_list_cmd(&dataset, root.as_deref())
+            } else {
+                match file {
+                    Some(f) => commands::porcelain::restore_cmd(&dataset, &f, root.as_deref()),
+                    None => {
+                        eprintln!("`arca restore` 需要指定要找回的文件路径，或改用 --list");
+                        std::process::ExitCode::from(1)
+                    }
+                }
+            }
+        }
         Command::Ls {
             path,
             root,
