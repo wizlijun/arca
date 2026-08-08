@@ -208,6 +208,34 @@ impl Repo {
             .collect())
     }
 
+    /// `git rm --cached -- <paths>`：把已追踪的路径从 index 里移除，**只影响索引
+    /// 与未来提交，绝不触碰工作树里的文件**（I6：受管文件原地不动）。
+    ///
+    /// `arca adopt` 的用途：一份"既有附件"在 arca 接管之前可能已经被 `git add`
+    /// 过（`.gitignore` 反选块对已追踪路径无效），adopt 写好 `.gitignore` 块后
+    /// 还必须把这些路径逐出 index，否则它们会继续被 git 追踪、继续随每次
+    /// `git commit` 增长仓库体积——这正是 adopt 存在的意义（阻止未来膨胀）。
+    ///
+    /// `paths` 为空时直接返回 `Ok(())`，不 spawn 子进程——`git rm --cached --`
+    /// 后面不带任何路径会报参数错误，不是"什么都不用做"的静默成功。
+    pub fn rm_cached(&self, paths: &[String]) -> Result<(), GitError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let output = run(Command::new("git")
+            .args(["rm", "--cached", "-q", "--"])
+            .args(paths)
+            .current_dir(&self.root))?;
+        if !output.status.success() {
+            return Err(GitError::CommandFailed {
+                cmd: format!("git rm --cached -q -- {}", paths.join(" ")),
+                code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// 解析 `$GIT_DIR` 下的相对路径（`git rev-parse --git-path <rel>`），返回绝对路径。
     ///
     /// 这会考虑 `core.hooksPath` 一类的重定位——钩子安装/卸载（`hooks` 模块）据此定位
@@ -320,6 +348,48 @@ mod tests {
             "无论从仓库根还是从子目录 open，root() 都必须归一化到同一个工作树根，\
              否则 M1d 的 `arca doctor`/`adopt` 从子目录调用时会算出错误的相对路径"
         );
+    }
+
+    // --- rm_cached：只动 index，不碰工作树文件（I6） ---
+
+    #[test]
+    fn rm_cached_移除已追踪路径但不删工作树文件() {
+        let dir = tempfile::tempdir().unwrap();
+        建仓库(dir.path());
+        std::fs::write(dir.path().join("leaked.bin"), b"content").unwrap();
+        let ok = Command::new("git")
+            .args(["add", "leaked.bin"])
+            .current_dir(dir.path())
+            .status()
+            .expect("需要可用的 git")
+            .success();
+        assert!(ok, "git add 失败");
+
+        let repo = Repo::open(dir.path()).unwrap();
+        assert!(repo.ls_files().unwrap().contains(&"leaked.bin".to_string()));
+
+        repo.rm_cached(&["leaked.bin".to_string()]).unwrap();
+
+        assert!(
+            !repo.ls_files().unwrap().contains(&"leaked.bin".to_string()),
+            "rm_cached 后不应再被 git 追踪"
+        );
+        assert!(
+            dir.path().join("leaked.bin").is_file(),
+            "工作树里的文件必须原地保留，不受影响（I6）"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("leaked.bin")).unwrap(),
+            b"content"
+        );
+    }
+
+    #[test]
+    fn rm_cached_空列表是无操作不报错() {
+        let dir = tempfile::tempdir().unwrap();
+        建仓库(dir.path());
+        let repo = Repo::open(dir.path()).unwrap();
+        assert!(repo.rm_cached(&[]).is_ok());
     }
 
     // --- 评审 Important #6：check_ignore 默认是 index 感知的，doctor 需要 --no-index ---
