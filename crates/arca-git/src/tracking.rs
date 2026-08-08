@@ -44,8 +44,14 @@ pub enum Issue {
     /// 没问题"**。`check_vault` 的调用方看到这个变体，就必须知道本次巡检
     /// 不完整：不能把"结果里没有其它 Issue"当成"库是干净的"（I5；评审
     /// Important #2）。`check` 是触发失败的检查项标识（如
-    /// `"already_tracked"`），`reason` 是失败原因的人类可读描述。
+    /// `"already_tracked"`、`"orphan_scan"`），`reason` 是失败原因的人类可读描述。
     CheckIncomplete { check: &'static str, reason: String },
+    /// 数据集引用了一个 `.gitarca` 里没有登记的 hub 名。`Registry::validate` 会
+    /// 拒绝这种注册表，但 `check_vault` 不假设调用方总是先跑过 `validate()`——
+    /// 防御性巡检必须独立发现同一个问题，否则 §11 防误绑检查（`HubIdMismatch`）
+    /// 会因为找不到 hub 条目而被静默跳过，误报出方向完全错误的
+    /// `MissingDataset`/"需要 `arca setup`"（评审 Important #2）。
+    UnknownHub { path: String, hub: String },
 }
 
 impl fmt::Display for Issue {
@@ -85,6 +91,11 @@ impl fmt::Display for Issue {
                 f,
                 "巡检未完成（{check}）：{reason}——本次结果不完整，\
                  不能当作\"库是干净的\""
+            ),
+            Issue::UnknownHub { path, hub } => write!(
+                f,
+                "数据集 {path:?} 引用了未登记的 hub {hub:?}；.gitarca 本身不一致，\
+                 需要先修好注册表（spec §4.3.2）"
             ),
         }
     }
@@ -150,21 +161,51 @@ fn collect_duplicate_and_nested(registry: &Registry, issues: &mut Vec<Issue>) {
 /// 排序是必须的：`std::fs::read_dir` 的产出顺序不保证稳定，不排序会导致
 /// 同一磁盘状态两次调用产出不同顺序的 `Issue` 列表（评审 Minor #4，
 /// 与 `ignore_block::render` 显式排序的对称要求一致）。
-fn scan_dataset_roots(root: &Path) -> Vec<String> {
+///
+/// **任何一步 IO 失败都必须留痕**（评审 Important #1，doc comment 承诺过的
+/// 「为每一处跳过 push 一条 `CheckIncomplete`」）：不可读的目录、遍历中途读
+/// 目录项失败、`file_type()` 失败，都会各自 push 一条 `CheckIncomplete`，
+/// 而不是像旧实现那样 `Err(_) => return` / `entries.flatten()` /
+/// `let Ok(..) = .. else { continue }` 悄悄跳过——那样会把"目录不可读"
+/// 误报成"这里没有孤儿数据集"，返回一个看起来干净、实则不完整的结果。
+fn scan_dataset_roots(root: &Path, issues: &mut Vec<Issue>) -> Vec<String> {
     let mut found = Vec::new();
-    scan_dir(root, root, &mut found);
+    scan_dir(root, root, &mut found, issues);
     found.sort_unstable();
     found
 }
 
-fn scan_dir(base: &Path, dir: &Path, found: &mut Vec<String>) {
+fn scan_dir(base: &Path, dir: &Path, found: &mut Vec<String>, issues: &mut Vec<Issue>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => {
+            issues.push(Issue::CheckIncomplete {
+                check: "orphan_scan",
+                reason: format!("读取目录 {} 失败：{e}", dir.display()),
+            });
+            return;
+        }
     };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                issues.push(Issue::CheckIncomplete {
+                    check: "orphan_scan",
+                    reason: format!("遍历目录 {} 时读取目录项失败：{e}", dir.display()),
+                });
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                issues.push(Issue::CheckIncomplete {
+                    check: "orphan_scan",
+                    reason: format!("读取 {} 的文件类型失败：{e}", entry.path().display()),
+                });
+                continue;
+            }
         };
         if !file_type.is_dir() {
             continue;
@@ -174,12 +215,23 @@ fn scan_dir(base: &Path, dir: &Path, found: &mut Vec<String>) {
         }
         let path = entry.path();
         if path.join(".arca").join("dataset.toml").is_file() {
-            if let Ok(rel) = path.strip_prefix(base) {
-                found.push(to_slash(rel));
+            match path.strip_prefix(base) {
+                Ok(rel) => found.push(to_slash(rel)),
+                // 逻辑上不可达（`path` 恒是 `base` 的递归下钻结果），但绝不能
+                // 因此裸吞：一旦条件变化导致真的走到这里，宁可报出
+                // CheckIncomplete 也不要悄悄漏掉一个数据集根。
+                Err(_) => issues.push(Issue::CheckIncomplete {
+                    check: "orphan_scan",
+                    reason: format!(
+                        "{} 不在 {} 之下，无法计算相对路径",
+                        path.display(),
+                        base.display()
+                    ),
+                }),
             }
             continue;
         }
-        scan_dir(base, &path, found);
+        scan_dir(base, &path, found, issues);
     }
 }
 
@@ -192,7 +244,7 @@ fn to_slash(p: &Path) -> String {
 
 /// 孤儿数据集（磁盘上有、注册表没有）与缺失数据集（注册表有、磁盘上没有）。
 fn collect_orphan_and_missing(repo_root: &Path, registry: &Registry, issues: &mut Vec<Issue>) {
-    let on_disk = scan_dataset_roots(repo_root);
+    let on_disk = scan_dataset_roots(repo_root, issues);
     let on_disk_folded: Vec<String> = on_disk.iter().map(|p| normalized_casefold(p)).collect();
 
     for (found, folded) in on_disk.iter().zip(on_disk_folded.iter()) {
@@ -267,14 +319,24 @@ fn collect_hub_mismatch_and_tracking(repo: &Repo, registry: &Registry, issues: &
             }
         };
 
-        if let Some(hub) = registry.hub(&entry.hub) {
-            if hub.instance_id != cfg.hub_instance_id {
-                issues.push(Issue::HubIdMismatch {
-                    path: entry.path.clone(),
-                    expected: hub.instance_id.clone(),
-                    found: cfg.hub_instance_id.clone(),
-                });
+        match registry.hub(&entry.hub) {
+            Some(hub) => {
+                if hub.instance_id != cfg.hub_instance_id {
+                    issues.push(Issue::HubIdMismatch {
+                        path: entry.path.clone(),
+                        expected: hub.instance_id.clone(),
+                        found: cfg.hub_instance_id.clone(),
+                    });
+                }
             }
+            // hub 名本身不存在：这理应被 `Registry::validate` 挡住，但
+            // `check_vault` 不能假设调用方已经 validate 过——静默跳过会连带
+            // 吞掉这条数据集本可以做的 HubIdMismatch 检查，且不留任何痕迹
+            // （评审 Important #2）。
+            None => issues.push(Issue::UnknownHub {
+                path: entry.path.clone(),
+                hub: entry.hub.clone(),
+            }),
         }
 
         let ds_prefix = format!("{}/", entry.path.trim_matches('/'));
@@ -593,6 +655,85 @@ mod tests {
                 Issue::CheckIncomplete { check, .. } if check.contains("hub_id_mismatch")
             )),
             "dataset.toml 解析失败必须报告 CheckIncomplete：{issues:?}"
+        );
+    }
+
+    /// chmod 对 root 无效、部分文件系统也不支持权限位；先自证一次假设是否
+    /// 成立，不成立就跳过（打印说明，不静默跳过），不假设当前一定以非 root
+    /// 身份运行（与 arca-store `tests/fsck.rs` 同一纪律）。
+    #[test]
+    #[cfg(unix)]
+    fn 不可读目录里的孤儿数据集报告_check_incomplete_而不是当作库是干净的() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        建仓库(dir.path());
+        let locked = dir.path().join("locked");
+        写数据集(&locked, "orphan", DS_ID, HUB_ID);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("跳过：当前用户不受 chmod 0o000 限制（root 或文件系统不支持权限位）");
+            return;
+        }
+
+        let registry = 单_hub_注册表("home", HUB_ID, vec![]);
+        let repo = Repo::open(dir.path()).unwrap();
+        let issues_while_locked = check_vault(&repo, &registry);
+        // 恢复权限，否则 tempdir 在 Drop 时清理不掉这个目录；且要在断言之前做，
+        // 避免断言失败时把一个不可清理的目录留在临时目录里。
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 复现评审构造的场景：旧实现在这里会静默吞掉 read_dir 失败，返回空列表，
+        // 也就是"库是干净的"——这正是本条 Important 要堵住的假阴性。
+        assert!(
+            issues_while_locked.iter().any(|i| matches!(
+                i,
+                Issue::CheckIncomplete { check, .. } if *check == "orphan_scan"
+            )),
+            "目录不可读必须报告 CheckIncomplete(\"orphan_scan\")，绝不能让 check_vault \
+             返回看起来干净的空列表：{issues_while_locked:?}"
+        );
+
+        // 恢复权限后重新巡检：孤儿数据集必须被正确检出，证明差别只在于
+        // "本次巡检是否完整"有没有被如实报告，而不是扫描逻辑本身有问题。
+        let issues_after_restore = check_vault(&repo, &registry);
+        assert!(
+            issues_after_restore.contains(&Issue::OrphanDataset {
+                path: "locked/orphan".to_string()
+            }),
+            "恢复权限后必须正确报出孤儿数据集：{issues_after_restore:?}"
+        );
+    }
+
+    // --- 评审 Important #2：hub 名不存在时不能被静默跳过 ---
+
+    #[test]
+    fn 引用不存在的_hub_名报告_unknown_hub_而不是当作库是干净的() {
+        let dir = tempfile::tempdir().unwrap();
+        建仓库(dir.path());
+        写数据集(dir.path(), "assets", DS_ID, HUB_ID);
+
+        // 注册表本身就不一致：数据集引用了一个没有 [hub.*] 条目的 hub 名。
+        // `Registry::validate()` 会拒绝这种注册表，但 `check_vault` 不能假设
+        // 调用方已经先跑过 validate。
+        let registry = Registry::new(
+            BTreeMap::new(),
+            vec![DatasetEntry {
+                path: "assets".to_string(),
+                hub: "ghost-hub".to_string(),
+            }],
+        );
+        let repo = Repo::open(dir.path()).unwrap();
+        let issues = check_vault(&repo, &registry);
+
+        assert!(
+            issues.contains(&Issue::UnknownHub {
+                path: "assets".to_string(),
+                hub: "ghost-hub".to_string(),
+            }),
+            "引用不存在的 hub 名必须被明确报告，而不是让 check_vault 返回空列表：{issues:?}"
         );
     }
 }
