@@ -35,12 +35,13 @@
 //! `SyncReport::is_clean()` 把它算进"有问题"，`arca sync` 的退出码据此非零，
 //! 绝不能让用户误以为删除已经生效。
 
-use crate::{baseline, clock, hub, ids, scan};
+use crate::{baseline, clock, hub, ids, scan, vault};
 use arca_core::reconcile::{decide_traced, Action};
 use arca_core::state::{BaseState, LocalState, RemoteState};
 use arca_format::hub_layout::layout;
 use arca_format::index::IndexRecord;
 use arca_format::items;
+use arca_format::manifest::{Manifest, ManifestEntry};
 use arca_format::model::{Actor, ItemId, Version};
 use arca_format::path_rules;
 use arca_format::trace::TraceSink;
@@ -271,6 +272,13 @@ pub fn sync(
     batch.commit().map_err(SyncError::Atomic)?;
 
     baseline.save(dataset_root).map_err(SyncError::Baseline)?;
+
+    // 清单是基线在 git 侧的行式镜像（评审 Important #4）：每次 `sync` 收尾
+    // 都要重新生成，不能只靠 `adopt` 生成一次就不再更新——否则协作者从 git
+    // 拿到的清单会在日常 `sync` 里静默漏掉后续新增的路径（`git status` 却是
+    // 干净的，因为清单本身没被标记为脏）。
+    write_manifest(dataset_root, &baseline)?;
+
     Ok(report)
 }
 
@@ -319,11 +327,21 @@ fn execute_upload(
         committed_at: clock::now_rfc3339(),
     };
 
-    append_item_version(root, batch, &version)?;
-    write_index_record(batch, path, item_id)?;
-
+    // 写入顺序：files/ → items/ → index/（评审 Critical #1）。`index/` 是
+    // "这个路径存在"的唯一指针——`hub::read_remote` 只遍历 `index/` 分片，
+    // 一个路径若还没有 index 记录，它对整个系统而言就是"没有这回事"，不会
+    // 被任何调用方观测到。所以指针必须最后发布：中途失败（ENOSPC、拔盘）
+    // 留下的是"字节已经在 files/，但没有指针指向它"——下次重跑会把它当成
+    // 全新上传重新写一遍（`ids::new_item_id()`），无害，只是多占一点存储；
+    // 旧顺序（items/ → index/ → files/）失败时留下的是"指针完整，字节缺失"，
+    // `hub::read_remote` 现在会把这识别为 `HubError::MissingContent`（见
+    // `hub.rs`），但绝不能靠"读的时候报错"兜底——能从源头避免制造这种状态
+    // 才是治本：写的时候就不产生指针先于字节的窗口。
     let target = format!("{}/{}", layout::FILES_DIR, path);
     batch.write(&target, &bytes).map_err(SyncError::Atomic)?;
+
+    append_item_version(root, batch, &version)?;
+    write_index_record(batch, path, item_id)?;
 
     Ok(BaseState::Present {
         item_id,
@@ -408,6 +426,50 @@ fn write_index_record(batch: &mut Batch<'_>, path: &str, item_id: ItemId) -> Res
     batch
         .write(&rel, text.as_bytes())
         .map_err(SyncError::Atomic)
+}
+
+/// 从最终基线重新生成 `<dataset_root>/.arca/manifest`（评审 Important #4）：
+/// `sync` 收尾时的基线就是"这个数据集当前每个受管路径的哈希/大小的权威
+/// 快照"，清单只是它在 git 侧的行式镜像。**每次 `sync` 都要重新生成**，
+/// 不能只靠 `arca adopt` 生成一次——见本函数调用点的注释。
+///
+/// `mtime` 取文件自身的 mtime（FORMAT.md 定义的字段语义），不是"写清单
+/// 这一刻"的墙上时钟——用 `execute_upload` 同一段 `rfc3339_from_systemtime`
+/// 转换逻辑（评审 Minor：此前 `adopt.rs` 独立实现的 `write_manifest` 用的
+/// 是墙上时钟，导致一次空操作的重跑也会弄脏清单，侵蚀"adopt 后 git status
+/// 干净"这条 M1 验收性质——第二次跑就不成立了）。
+///
+/// **基线里有记录、但本地文件当前不存在的路径会被跳过，不报错**——这在
+/// M1 只有一条产生途径：`Action::TombstoneRemote`（本地已删除，但 M1 没有
+/// 落盘 tombstone 的地方，见 `hub.rs` 模块文档），基线因此保留了这条陈旧
+/// 记录。清单是"本地当前应该有这些文件"的 git 侧影子，本地已经没有的文件
+/// 继续列在清单里没有意义（也没有 mtime 可取，不能编造）；这个状态本身
+/// 已经通过 `SyncReport::tombstone_pending` 如实报告、让 `is_clean()` 为假，
+/// 不会被静默吞掉。其它原因导致的 `fs::metadata` 失败（权限等）仍然原样
+/// 报错（I5：不能把"读不出来"也当成"本地没有"）。
+fn write_manifest(dataset_root: &Path, baseline: &baseline::Baseline) -> Result<(), SyncError> {
+    let mut entries = Vec::new();
+    for (path, state) in baseline.iter() {
+        let BaseState::Present { hash, size, .. } = state else {
+            continue;
+        };
+        let local_path = dataset_root.join(to_native(path));
+        let mtime = match fs::metadata(&local_path).and_then(|m| m.modified()) {
+            Ok(t) => rfc3339_from_systemtime(t),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_err(&local_path, e)),
+        };
+        entries.push(ManifestEntry {
+            path: path.clone(),
+            hash: *hash,
+            size: *size,
+            mtime,
+        });
+    }
+    let manifest = Manifest::from_entries(entries).map_err(SyncError::Format)?;
+    let manifest_path = dataset_root.join(".arca").join("manifest");
+    vault::write_text_atomic(&manifest_path, &manifest.to_string())
+        .map_err(|e| io_err(&manifest_path, e))
 }
 
 /// 把索引/清单使用的 `/` 分隔路径转成当前平台的 [`PathBuf`]。
@@ -675,5 +737,198 @@ mod tests {
         let text = fs::read_to_string(store.path().join(rel)).unwrap();
         assert!(text.contains("萍萍"));
         assert!(text.contains("笔记本"));
+    }
+
+    /// 评审 Important #4 的复现测试：`sync` 上传新文件后，`.arca/manifest`
+    /// 必须把新文件也列进去——此前只有 `adopt` 生成清单一次，后续 `sync`
+    /// 从不更新，协作者据此拿到一份漏掉受管文件的清单。
+    #[test]
+    fn sync成功后清单被重新生成并包含新上传的文件() {
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        fs::write(dataset.path().join("a.txt"), b"hello").unwrap();
+
+        let root = open_root(store.path());
+        let mut sink = NullSink;
+        sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+
+        let manifest_path = dataset.path().join(".arca/manifest");
+        assert!(manifest_path.is_file(), "首次 sync 就应该生成清单");
+        let manifest =
+            arca_format::manifest::Manifest::parse(&fs::read_to_string(&manifest_path).unwrap())
+                .unwrap();
+        assert_eq!(manifest.entries().len(), 1);
+        assert_eq!(manifest.entries()[0].path, "a.txt");
+
+        // 第二次 sync 新增一个文件——清单必须把它也纳入，而不是停留在第一次
+        // 生成时的快照。
+        fs::write(dataset.path().join("c.bin"), b"second file").unwrap();
+        sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+
+        let manifest =
+            arca_format::manifest::Manifest::parse(&fs::read_to_string(&manifest_path).unwrap())
+                .unwrap();
+        let paths: Vec<&str> = manifest.entries().iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["a.txt", "c.bin"],
+            "第二次 sync 后清单必须同时包含旧文件与新上传的 c.bin"
+        );
+    }
+
+    /// 评审 Minor 项复现测试：清单的 mtime 必须取文件自身的 mtime，不是
+    /// "写清单这一刻"的墙上时钟——否则每次重跑 sync（哪怕是空操作）都会
+    /// 因为 mtime 变化而弄脏清单，侵蚀"同步收敛后 git status 干净"这条性质。
+    #[test]
+    fn 清单的mtime取文件自身mtime而不是写清单时的墙上时钟() {
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        let file_path = dataset.path().join("a.txt");
+        fs::write(&file_path, b"hello").unwrap();
+        let file_mtime =
+            rfc3339_from_systemtime(fs::metadata(&file_path).unwrap().modified().unwrap());
+
+        let root = open_root(store.path());
+        let mut sink = NullSink;
+        sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+
+        let manifest_path = dataset.path().join(".arca/manifest");
+        let manifest =
+            arca_format::manifest::Manifest::parse(&fs::read_to_string(&manifest_path).unwrap())
+                .unwrap();
+        assert_eq!(manifest.entries()[0].mtime, file_mtime);
+
+        // 空操作重跑：清单文本必须逐字节相同（不能因为重新生成而漂移出一个
+        // 新的 mtime，那样第二次跑就会把 git 工作树弄脏）。
+        let before = fs::read_to_string(&manifest_path).unwrap();
+        sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+        let after = fs::read_to_string(&manifest_path).unwrap();
+        assert_eq!(before, after, "空操作重跑不应该弄脏清单");
+    }
+
+    /// 评审 Critical #1 的写入顺序安全性复现：`execute_upload` 现在按
+    /// `files/` → `items/` → `index/` 的顺序写入（内容先于指针发布）。用手工
+    /// 模拟"崩溃发生在 index/ 写入之前"的中间态——直接删掉 index 记录，
+    /// 只留下 files/ 与 items/——验证这个中间态是**无害**的：`index` 是
+    /// `hub::read_remote` 唯一的入口，这个路径从 hub 视角"从未发布过"，
+    /// 不构成任何谎言；随后 `sync` 正确地把它识别为需要人工介入
+    /// （`remote_vanished_without_tombstone`——远端记录消失但本地并未改动，
+    /// `arca_core::reconcile` 决策表拒绝在这种模糊状态下自作主张地重新
+    /// 上传，见其文档），而不是静默声称"已同步"（旧顺序 items/→index/→files/
+    /// 失败会留下相反的中间态：指针完整、字节缺失，`hub::read_remote` 会把
+    /// 那种状态误读成 `Present`，进而可能被零传输 `AdoptBaseline` 认领）。
+    #[test]
+    fn 崩溃在index写入之前遗留的孤儿字节不会被误读为已同步() {
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        fs::write(dataset.path().join("c.bin"), b"orphan content").unwrap();
+
+        let root = open_root(store.path());
+        let mut sink = NullSink;
+        let first = sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+        assert_eq!(first.uploaded, vec!["c.bin".to_string()]);
+
+        // 模拟"写到 files/+items/ 但还没写 index/ 就崩溃"：手工删掉 index
+        // 分片下唯一的记录文件。
+        let index_dir = store.path().join(".arca/index");
+        let mut removed = false;
+        for shard in fs::read_dir(&index_dir).unwrap() {
+            let shard = shard.unwrap().path();
+            for entry in fs::read_dir(&shard).unwrap() {
+                fs::remove_file(entry.unwrap().path()).unwrap();
+                removed = true;
+            }
+        }
+        assert!(removed, "测试前置条件：应该能找到刚写入的 index 记录并删除");
+
+        // 内容与版本链仍在，但 hub 侧已经"看不见"这个路径了——不是谎言，
+        // 是从未发布过（index 才是唯一入口）。
+        let remote_after_removal = hub::read_remote(&root).unwrap();
+        assert!(
+            !remote_after_removal.contains_key("c.bin"),
+            "index 记录被移除后，这个路径不应再被 read_remote 观测到"
+        );
+
+        // 重新跑一次 sync：本地内容与基线一致（未改动），但远端记录"凭空
+        // 消失"——决策表判定为需要人工介入，绝不静默重新上传冒充"什么都
+        // 没发生过"，也绝不谎称"已同步"。
+        let second = sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+        assert_eq!(second.needs_human, vec!["c.bin".to_string()]);
+        assert!(second.uploaded.is_empty());
+        assert!(second.adopted.is_empty());
+        assert!(!second.is_clean(), "远端记录异常消失不应被判定为干净");
+        // 本地文件内容必须原样保留（I6：不动数据）。
+        assert_eq!(
+            fs::read(dataset.path().join("c.bin")).unwrap(),
+            b"orphan content"
+        );
+    }
+
+    /// 评审 Critical #1 的端到端复现：手工造出「index/items 完整、
+    /// `files/c.bin` 内容缺失」的存储根，本地又恰好有一份同名同内容的文件
+    /// （最危险的组合——不加防护时会走零传输 `AdoptBaseline` 认领路径，把
+    /// "已同步"的谎言写进基线）。修复后 `sync` 必须整体报错，绝不能安静
+    /// 认领、也绝不能把这个路径静默当成"从未存在过"。
+    #[test]
+    fn 索引完整但内容缺失时sync报错而不是零传输认领() {
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+
+        // 手工在存储根写一条"index/items 完整但 files/ 缺内容"的记录。
+        let content = b"same content";
+        let hash = arca_chunk::hash::ContentHash::from_bytes(content);
+        let item_id = ids::new_item_id();
+        let version = Version {
+            version_id: ids::new_version_id(),
+            item_id,
+            parent: None,
+            hash,
+            size: content.len() as u64,
+            mtime: "2026-08-08T09:00:00Z".to_string(),
+            actor: actor(),
+            committed_at: "2026-08-08T09:00:05Z".to_string(),
+        };
+        let item_rel = layout::item_path(&item_id);
+        let item_full = store.path().join(&item_rel);
+        fs::create_dir_all(item_full.parent().unwrap()).unwrap();
+        fs::write(
+            &item_full,
+            format!("{}\n", items::to_line(&version).unwrap()),
+        )
+        .unwrap();
+        let key = path_rules::index_key("c.bin");
+        let index_shard = store.path().join(".arca/index").join(&key.to_hex()[..2]);
+        fs::create_dir_all(&index_shard).unwrap();
+        let record = IndexRecord {
+            item_id,
+            path: "c.bin".to_string(),
+        };
+        fs::write(
+            index_shard.join(format!("{}.json", key.to_hex())),
+            record.to_json().unwrap(),
+        )
+        .unwrap();
+        // 刻意不写 files/c.bin。
+
+        let dataset = tempfile::tempdir().unwrap();
+        fs::write(dataset.path().join("c.bin"), content).unwrap();
+
+        let root = open_root(store.path());
+        let mut sink = NullSink;
+        let err = sync(dataset.path(), &root, &actor(), &mut sink).unwrap_err();
+        assert!(
+            matches!(err, SyncError::Hub(hub::HubError::MissingContent { .. })),
+            "应整体报错为 MissingContent，实得 {err:?}"
+        );
+
+        // 绝不能有任何一个字节被误当作"已同步"：基线必须仍是空的。
+        let baseline = crate::baseline::load(dataset.path()).unwrap();
+        assert!(
+            baseline.get("c.bin") == arca_core::state::BaseState::Absent,
+            "报错路径上绝不能把基线写成已同步"
+        );
     }
 }
