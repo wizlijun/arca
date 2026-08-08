@@ -186,36 +186,106 @@ pub fn next_seq(root: &StorageRoot) -> Result<u64, JournalError> {
 /// - 现有事件流中间行损坏 → 拒绝写入，原样报出解析失败（模块顶部「为什么
 ///   要先解析现有内容再整体重写」一节）。
 /// - `event.seq` 与"现有链下一个应该的 seq"不符 → 拒绝写入（[`JournalError::SeqMismatch`]）。
+///
+/// 单条事件的一次性写入——`arca restore` 这类一次只产生一条事件的命令用它。
+/// 一次调用要连续追加多条事件（如 `sync()` 一轮里的多个 `TombstoneRemote`）
+/// 应该用 [`AppendBatch`]：本函数每次调用都重新读一遍整段现有事件流，
+/// N 次调用是 O(N²)（评审 Important #3）。
 pub fn append(root: &StorageRoot, event: &JournalEvent) -> Result<(), JournalError> {
-    let epoch = match current_epoch(root)? {
-        Some(epoch) => epoch,
-        None => {
-            let epoch = crate::ids::random_hex32();
-            create_epoch_pointer(root, &epoch)?;
-            epoch
+    let mut batch = AppendBatch::open(root)?;
+    batch.push(event.clone())?;
+    batch.commit()
+}
+
+/// 批量追加 journal 事件：只读一次现有事件流，后续每次 [`AppendBatch::push`]
+/// 只在内存里追加 + 校验 `seq` 连续性，[`AppendBatch::commit`] 时才整体
+/// 序列化、原子写一次（评审 Important #3）。
+///
+/// # 为什么需要它：`append` 逐次调用是 O(n²)
+///
+/// [`append`] 每次调用都要"读现有内容 + 拼接新行 + 整体重写"（模块顶部「为
+/// 什么要先解析现有内容再整体重写」一节的纪律），这对**单条**事件的一次性
+/// 写入没有问题；但 `sync.rs::execute_tombstone` 在一次 `sync()` 里可能被
+/// 调用几十上百次，每次都重新读一遍**当时已有的全部**事件——这与 M1d 修复
+/// 过的"目录 fsync 一万次"同一个形状：实测 400 个文件的删除传播，发起端
+/// 耗时 12.1 秒，`journal::append` 的这个 O(n) 读写乘以 O(n) 次调用正是主因。
+///
+/// # 与单次 `write` 崩溃安全性的取舍（同 `arca_store::atomic::Batch` 的先例）
+///
+/// 批量提交把"每条事件各自落盘"的窗口，放宽成"整批一起落盘或都不落盘"。
+/// 崩溃如果发生在 `commit()` 之前，本批次内已经调用过
+/// [`crate::trash::move_to_trash`] 的那些路径会暂时处于"内容已进回收站、
+/// journal 里还没有对应事件"的中间态——但这正是 `hub.rs::is_pending_tombstone`
+/// （评审 Important #1）已经能诊断、可自愈的状态，不是静默丢失或误报"存储根
+/// 损坏"；崩溃窗口变宽，但没有引入新的失败形态。`sync.rs::sync` 必须在
+/// `commit()` 成功之后才保存基线，与内容侧的 `arca_store::atomic::Batch`
+/// 同一条纪律（I3）。
+pub struct AppendBatch<'a> {
+    root: &'a StorageRoot,
+    epoch: String,
+    events: Vec<JournalEvent>,
+    next_seq: u64,
+}
+
+impl<'a> AppendBatch<'a> {
+    /// 打开一个批次：读一次当前 epoch 的完整事件流（不存在则现场创建新
+    /// epoch），算出"下一条事件应该用的 seq"。之后的 [`push`](Self::push)
+    /// 全部只在内存里操作，不再碰磁盘。
+    pub fn open(root: &'a StorageRoot) -> Result<Self, JournalError> {
+        let epoch = match current_epoch(root)? {
+            Some(epoch) => epoch,
+            None => {
+                let epoch = crate::ids::random_hex32();
+                create_epoch_pointer(root, &epoch)?;
+                epoch
+            }
+        };
+        let text = read_epoch_text(root, &epoch)?;
+        let events = arca_format::journal::parse_stream(&text).map_err(JournalError::Format)?;
+        let next_seq = events.last().map(|e| e.seq + 1).unwrap_or(1);
+        Ok(Self {
+            root,
+            epoch,
+            events,
+            next_seq,
+        })
+    }
+
+    /// 下一条事件应该使用的 `seq`——调用方（`execute_tombstone`）用它构造
+    /// 待追加的 [`JournalEvent`]，语义与独立函数 [`next_seq`] 相同，只是这里
+    /// 全程只读内存里已经缓存的状态，不重新触发一次磁盘读取。
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// 在内存里追加一条事件——`event.seq` 必须等于 [`next_seq`](Self::next_seq)，
+    /// 否则拒绝（[`JournalError::SeqMismatch`]），与 [`append`] 同一条纪律，
+    /// 只是校验对象是内存里的批次状态，不是重新读一遍磁盘。
+    pub fn push(&mut self, event: JournalEvent) -> Result<(), JournalError> {
+        if event.seq != self.next_seq {
+            return Err(JournalError::SeqMismatch {
+                expected: self.next_seq,
+                actual: event.seq,
+            });
         }
-    };
-
-    let text = read_epoch_text(root, &epoch)?;
-    let existing = arca_format::journal::parse_stream(&text).map_err(JournalError::Format)?;
-
-    let expected_seq = existing.last().map(|e| e.seq + 1).unwrap_or(1);
-    if event.seq != expected_seq {
-        return Err(JournalError::SeqMismatch {
-            expected: expected_seq,
-            actual: event.seq,
-        });
+        self.next_seq += 1;
+        self.events.push(event);
+        Ok(())
     }
 
-    let mut content = String::new();
-    for line_event in &existing {
-        content.push_str(&line_event.to_line().map_err(JournalError::Format)?);
-        content.push('\n');
+    /// 收口：把批次内全部事件（含打开批次时已经存在的历史事件）整体序列化，
+    /// 原子写一次。调用方必须显式调用——不调用就丢弃 `AppendBatch`，本批次
+    /// 累积的事件不会落盘（与不调用 `arca_store::atomic::Batch::commit` 同一
+    /// 条纪律：未提交的批次视为没发生过，不会有部分写入）。
+    pub fn commit(self) -> Result<(), JournalError> {
+        let mut content = String::new();
+        for event in &self.events {
+            content.push_str(&event.to_line().map_err(JournalError::Format)?);
+            content.push('\n');
+        }
+        atomic::write(self.root, &journal_path(&self.epoch), content.as_bytes())
+            .map_err(JournalError::Atomic)
     }
-    content.push_str(&event.to_line().map_err(JournalError::Format)?);
-    content.push('\n');
-
-    atomic::write(root, &journal_path(&epoch), content.as_bytes()).map_err(JournalError::Atomic)
 }
 
 #[cfg(test)]

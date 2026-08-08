@@ -27,19 +27,26 @@
 //!
 //! # 两种「这个路径被 tombstone 了」的磁盘证据，一律优先信 journal
 //!
-//! - **`index/` 记录已经被清理**（tombstone 执行的一部分，本切片不实现
-//!   执行本身，由后续 M2a 切片补上）：这个路径压根不出现在 `index/` 里，
-//!   只能靠 journal 才知道它曾经存在过、现在被删了——本函数在遍历完
-//!   `index/` 之后，为每个「最后一条事件是 tombstone、且它记录的路径当前
-//!   没有存活 index 记录认领」的 item 补一条 `Tombstoned`。
+//! - **`index/` 记录已经被清理**（`sync.rs::execute_tombstone` 的第三步，
+//!   评审 Important #2：让"没有 index 记录"本身成为"这个路径已被删除"的
+//!   证据——即便 journal 未来丢失这段历史也不会把整个存储根的读取拖下水，
+//!   见该函数文档）：这个路径压根不出现在 `index/` 里，只能靠 journal 才
+//!   知道它曾经存在过、现在被删了——本函数在遍历完 `index/` 之后，为每个
+//!   「最后一条事件是 tombstone、且它记录的路径当前没有存活 index 记录
+//!   认领」的 item 补一条 `Tombstoned`；journal 若也丢失了这段历史，这个
+//!   路径就干净地退化成 `Absent`（信息降级，不是错误）。
 //! - **`index/` 记录还没被清理**（tombstone 执行落在清理 `index/` 之前的
-//!   崩溃窗口，或那一步压根还没实现）：这个路径仍有一条指向该 item 的
-//!   index 记录，若继续走旧逻辑（读 items 链 + 探测 `files/` 内容），会因为
-//!   内容已经被移进 `.arca/trash/`（`crate::trash::move_to_trash`）而报
+//!   崩溃窗口）：这个路径仍有一条指向该 item 的 index 记录，若继续走旧
+//!   逻辑（读 items 链 + 探测 `files/` 内容），会因为内容已经被移进
+//!   `.arca/trash/`（`crate::trash::move_to_trash`）而报
 //!   `HubError::MissingContent`——那是把"刚执行完 tombstone"误诊断成
 //!   "存储根损坏"。所以本函数现在**先查这条 index 记录的 `item_id` 是否
 //!   已被 journal 判定为 tombstone，查到就直接产出 `Tombstoned`，根本不去
 //!   碰 `files/`**；`index/` 记录本身是否已被清理不影响这个判断的正确性。
+//!   若连 journal 也没有这次 tombstone 的记录（`move_to_trash` 与
+//!   `journal::append` 之间的崩溃窗口），[`read_current_version`] 会先排除
+//!   "这其实是一次未完成的 tombstone 提交"（评审 Important #1，见
+//!   [`HubError::PendingTombstone`]）才报 `MissingContent`。
 //!
 //! 一个路径先后被多个 item 占用（删除后用同名路径新建、又再次删除）时，
 //! 以 journal 里 **`seq` 更大**（更晚）的那条 tombstone 为准——旧 item 的
@@ -93,12 +100,24 @@ pub enum HubError {
     /// `files/<path>` 下缺失——**这是损坏，不是"没有这个文件"**（评审
     /// Critical #1，见模块顶部 doc comment）。
     MissingContent { path: String, item_id: String },
+    /// 评审 Important #1：`files/<path>` 缺失、但 `.arca/trash/` 里确实躺着
+    /// 与这个 item 当前版本哈希一致的内容，journal 里却没有对应的
+    /// tombstone 事件——`sync.rs::execute_tombstone` 先 `move_to_trash`
+    /// 后 `journal::append`（见其文档），两步之间失败（journal 目录权限/
+    /// 磁盘写满等）会恰好留下这个中间态。这不是存储根损坏：内容没有丢，
+    /// 只是这次删除提交还没来得及在 journal 里记下来，与 [`HubError::MissingContent`]
+    /// 是完全不同性质、可诊断也大概率可自愈的失败，不能被折叠成同一种
+    /// "存储根损坏"报告给用户。
+    PendingTombstone { path: String, item_id: String },
     /// 读取 `.arca/index/`、`.arca/items/` 或 `files/` 目录本身失败，且不是
     /// "目录不存在"（真正的 IO 故障：权限、路径某一级类型不对等）。
     Io { path: String, reason: String },
     /// 读 journal（用于判断某个 item 是否已被 tombstone）失败——journal 是
     /// 真相源，读错等于伪造历史，见 `crate::journal` 的损坏处置纪律。
     Journal(crate::journal::JournalError),
+    /// 读 `.arca/trash/`（用于判断 [`HubError::MissingContent`] 是否其实是
+    /// 未完成的 tombstone 中间态）失败。
+    Trash(crate::trash::TrashError),
 }
 
 impl fmt::Display for HubError {
@@ -119,8 +138,16 @@ impl fmt::Display for HubError {
                 "index/items 记录 {path}（item_id {item_id}）完整一致，但 files/{path} 缺失——\
                  存储根损坏，绝不当作\"文件不存在\"静默处理"
             ),
+            HubError::PendingTombstone { path, item_id } => write!(
+                f,
+                "index/items 记录 {path}（item_id {item_id}）完整一致，files/{path} 缺失，\
+                 但 .arca/trash/ 里确实躺着与当前版本一致的内容、journal 里却没有对应的\
+                 tombstone 事件——上次删除提交未完成（并非存储根损坏），\
+                 运行 `arca restore {path}` 找回，或重新执行一次 `arca sync` 让它自愈"
+            ),
             HubError::Io { path, reason } => write!(f, "读取 {path} 失败：{reason}"),
             HubError::Journal(e) => write!(f, "读取 journal 失败：{e}"),
+            HubError::Trash(e) => write!(f, "读取 .arca/trash/ 失败：{e}"),
         }
     }
 }
@@ -129,6 +156,7 @@ impl std::error::Error for HubError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             HubError::Journal(e) => Some(e),
+            HubError::Trash(e) => Some(e),
             _ => None,
         }
     }
@@ -213,7 +241,7 @@ pub fn read_remote(root: &StorageRoot) -> Result<BTreeMap<String, RemoteState>, 
 
             let state = if let Some(info) = tombstoned.get(&record.item_id) {
                 // index/ 记录还没被清理（tombstone 执行落在清理之前的崩溃
-                // 窗口，或那一步还没实现）——journal 说了算，绝不去碰
+                // 窗口）——journal 说了算，绝不去碰
                 // files/（内容已经被移进 .arca/trash/，探测会误报
                 // MissingContent，见模块顶部 doc comment）。
                 RemoteState::Tombstoned {
@@ -292,6 +320,19 @@ fn read_current_version(root: &StorageRoot, record: &IndexRecord) -> Result<Remo
     match fs::symlink_metadata(&files_path) {
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // 评审 Important #1：内容缺失前，先排除"这其实是一次未完成的
+            // tombstone 提交"——`execute_tombstone` 先 `move_to_trash` 后
+            // `journal::append`，两步之间失败会恰好留下这个中间态（内容已经
+            // 在 `.arca/trash/`，只是 journal 还没记下来）。用 `.meta.hash`
+            // 与当前版本哈希比对（不是任意一条历史记录都算数——同一个
+            // item_id 可能有多条历史 trash 记录，只有哈希对得上"此刻应该
+            // 存在"的那个版本才是这次未完成提交的证据）。
+            if is_pending_tombstone(root, item_id, current.hash)? {
+                return Err(HubError::PendingTombstone {
+                    path: record.path.clone(),
+                    item_id: item_id.to_hex(),
+                });
+            }
             return Err(HubError::MissingContent {
                 path: record.path.clone(),
                 item_id: item_id.to_hex(),
@@ -306,6 +347,24 @@ fn read_current_version(root: &StorageRoot, record: &IndexRecord) -> Result<Remo
         hash: current.hash,
         size: current.size,
     })
+}
+
+/// `.arca/trash/` 里是否躺着一条 `item_id` 对应、内容哈希与 `expected_hash`
+/// 一致的记录——评审 Important #1 用它区分"未完成的 tombstone 提交"与
+/// 真正的存储根损坏（[`read_current_version`] 的调用点）。只比对
+/// `.meta.hash`，不像闸门第 4 道那样现场重算 `.data` 的哈希：这里是读时的
+/// 诊断分类，不是任何删除/恢复操作的安全闸门，即便 `.data` 之后又被进一步
+/// 损坏，"这里曾经有一次未完成的 tombstone 提交"这个诊断结论依然成立，
+/// 不需要为了分类信息而多付一次读整份内容的代价。
+fn is_pending_tombstone(
+    root: &StorageRoot,
+    item_id: ItemId,
+    expected_hash: arca_chunk::hash::ContentHash,
+) -> Result<bool, HubError> {
+    let entries = crate::trash::list(root).map_err(HubError::Trash)?;
+    Ok(entries
+        .iter()
+        .any(|e| e.meta.item_id == item_id && e.meta.hash == expected_hash))
 }
 
 /// 排序读目录：使 `read_remote` 的遍历顺序确定。**只把"目录不存在"当作合法的
@@ -812,5 +871,161 @@ mod tests {
             other => panic!("应为 DeleteLocal，实得 {other:?}"),
         }
         assert_eq!(decision.reason, "remote_tombstoned");
+    }
+
+    /// 评审 Important #1 的实机复现：`move_to_trash` 成功、`journal::append`
+    /// 随后失败（chmod `.arca/journal` 目录复现评审用的攻击手法）之间崩溃，
+    /// 留下"内容已在回收站、journal 却没有对应 tombstone 事件"的中间态。
+    /// 修复前 `read_remote` 会把它报成 `MissingContent`（"存储根损坏"），
+    /// 波及**整个**存储根（`read_remote` 遇到第一个错误就整体停止，其它
+    /// 路径也读不出来）；修复后必须报 `PendingTombstone`，消息里不能再出现
+    /// "存储根损坏"，要指向 `arca restore`/重跑 `arca sync` 这条自愈路径。
+    #[test]
+    #[cfg(unix)]
+    fn 未完成的tombstone中间态报pending_tombstone而不是存储根损坏_评审important1实机复现() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let id = ItemId::from_bytes([0x44; 16]);
+        write_indexed_item(dir.path(), "d.png", id, b"content");
+        let root = open(dir.path());
+
+        // 第一步：move_to_trash 成功——内容已经移进 .arca/trash/。
+        crate::trash::move_to_trash(&root, "d.png", id, "2026-08-08T09:10:00Z").unwrap();
+
+        // 第二步：journal::append 失败——chmod journal 目录，让 rename 进
+        // journal 目录的最后一步没有写权限。先自证一次 chmod 真的生效
+        // （root 用户或不支持权限位的文件系统会让它形同虚设，与本仓库
+        // 既有的同类测试同一条纪律），不成立就跳过而不是假装测过了。
+        let journal_dir = dir.path().join(".arca/journal");
+        fs::set_permissions(&journal_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = journal_dir.join("__probe__");
+        if fs::write(&probe, b"x").is_ok() {
+            let _ = fs::remove_file(&probe);
+            fs::set_permissions(&journal_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "跳过：当前用户不受 chmod 限制（root 或文件系统不支持权限位），\
+                 无法用权限手段模拟 journal 写入失败"
+            );
+            return;
+        }
+
+        let append_err = crate::journal::append(
+            &root,
+            &JournalEvent {
+                seq: 1,
+                op: Op::Tombstone,
+                item_id: id,
+                version_id: VersionId::new("20260805T093012Z", &"0".repeat(32)).unwrap(),
+                path: "d.png".to_string(),
+                from: None,
+                actor: actor(),
+                at: "2026-08-08T09:10:00Z".to_string(),
+            },
+        )
+        .unwrap_err();
+        fs::set_permissions(&journal_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = append_err; // 只需要它确实失败；具体错误形状不是本测试的重点。
+
+        // 此刻的存储根状态：index/items 完整、files/d.png 缺失、trash 里有
+        // 对应内容、journal 里没有 tombstone 事件——正是评审描述的中间态。
+        let err = read_remote(&root).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("并非存储根损坏"),
+            "未完成的 tombstone 不该被误诊断成（未加限定语的）存储根损坏：{msg}"
+        );
+        assert!(
+            msg.contains("restore") || msg.contains("重试") || msg.contains("sync"),
+            "消息应指出自愈路径（arca restore 或重跑 arca sync）：{msg}"
+        );
+        match err {
+            HubError::PendingTombstone { path, item_id: got } => {
+                assert_eq!(path, "d.png");
+                assert_eq!(got, id.to_hex());
+            }
+            other => panic!("应为 PendingTombstone，实得 {other:?}"),
+        }
+    }
+
+    /// 评审 Important #2 的实机复现：journal 被清空（人为误删，或未来 M2b
+    /// epoch 轮转/压缩的效果）后，已经完成的 tombstone 不应该让整个存储根
+    /// 的 `read_remote` 退化为报错。修复前（`execute_tombstone` 从不清理
+    /// index 记录）：把 journal 清空，每一个已 tombstone 的路径的 index
+    /// 记录都会突然变得无法解释（journal 找不到对应事件，只能去读
+    /// `files/<path>`，读到 `NotFound`），报出 `MissingContent`——`read_remote`
+    /// 遇到第一个错误就整体停止，波及同一存储根里**所有**路径，不只是
+    /// 那条已删除的。修复后（`execute_tombstone` 第三步清理 index 记录）：
+    /// 已删除路径的 index 记录本就不存在，journal 清空之后这个路径只是
+    /// 退化成 `Absent`（信息降级，不是错误），其它未受影响的路径必须完全
+    /// 不受牵连。全程只用真实的 `sync()`，不手工拼中间状态。
+    #[test]
+    fn journal被清空后已tombstone的路径退化为absent而不牵连其它路径_评审important2实机复现() {
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write_format_json(store.path());
+        fs::create_dir_all(store.path().join("files")).unwrap();
+        fs::create_dir_all(store.path().join(".arca/tmp")).unwrap();
+        fs::create_dir_all(store.path().join(".arca/trash")).unwrap();
+        fs::create_dir_all(store.path().join(".arca/journal")).unwrap();
+
+        let root = open(store.path());
+        let who = actor();
+        let mut sink = arca_format::trace::NullSink;
+
+        fs::write(dataset.path().join("a.png"), b"will be deleted").unwrap();
+        fs::write(dataset.path().join("b.png"), b"stays").unwrap();
+        crate::sync::sync(dataset.path(), &root, &who, &mut sink).unwrap();
+
+        fs::remove_file(dataset.path().join("a.png")).unwrap();
+        let report = crate::sync::sync(dataset.path(), &root, &who, &mut sink).unwrap();
+        assert_eq!(report.tombstone_submitted, vec!["a.png".to_string()]);
+
+        // tombstone 刚执行完：a.png 应为 Tombstoned，b.png 仍为 Present，且
+        // a.png 不应再有 index 记录（评审 Important #2 的核心改动）。
+        let remote = read_remote(&root).unwrap();
+        assert!(matches!(
+            remote.get("a.png"),
+            Some(RemoteState::Tombstoned { .. })
+        ));
+        assert!(matches!(
+            remote.get("b.png"),
+            Some(RemoteState::Present { .. })
+        ));
+        let key = path_rules::index_key("a.png");
+        let index_record_path = store
+            .path()
+            .join(".arca/index")
+            .join(&key.to_hex()[..2])
+            .join(format!("{}.json", key.to_hex()));
+        assert!(
+            !index_record_path.exists(),
+            "tombstone 执行后 a.png 不应再有 index 记录"
+        );
+
+        // 清空 journal——模拟 epoch 轮转/压缩后历史事件不再可读（M2b 尚未
+        // 实现真正的轮转，这里直接截断当前 epoch 文件模拟其效果）。
+        let epoch = crate::journal::current_epoch(&root).unwrap().unwrap();
+        fs::write(
+            store.path().join(format!(".arca/journal/{epoch}.jsonl")),
+            "",
+        )
+        .unwrap();
+
+        let remote_after_wipe = read_remote(&root).unwrap();
+        assert!(
+            !remote_after_wipe.contains_key("a.png"),
+            "journal 清空后 a.png 应该退化为 Absent（没有 index 记录），\
+             而不是让整个读取报错：{remote_after_wipe:?}"
+        );
+        assert!(
+            matches!(
+                remote_after_wipe.get("b.png"),
+                Some(RemoteState::Present { .. })
+            ),
+            "journal 清空不应牵连其它未受影响的路径：{:?}",
+            remote_after_wipe.get("b.png")
+        );
     }
 }

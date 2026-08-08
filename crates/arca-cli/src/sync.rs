@@ -14,7 +14,7 @@
 //! | `Download{version_id}` | 从存储根读出内容写到本地 |
 //! | `AdoptBaseline{hash, version_id}` | 零传输，只更新基线 |
 //! | `DeleteLocal{item_id}` | **过四道闸门（`gates::check_delete`，M2a Task 4）后**才移除本地副本；任一闸门不过则不删，计入 `delete_blocked` |
-//! | `TombstoneRemote{item_id, parent}` | 提交 tombstone：`files/` → `.arca/trash/` + 追加 journal `op=tombstone` 事件（M2a Task 4 收尾，复用 Task 3 交付的 `trash`/`journal` 原语） |
+//! | `TombstoneRemote{item_id, parent}` | 提交 tombstone：`files/` → `.arca/trash/` + 清理 index 记录 + 追加 journal `op=tombstone` 事件（M2a Task 4 收尾，复用 Task 3 交付的 `trash`/`journal` 原语；清理 index 记录见评审 Important #2） |
 //! | `Conflict{..}` | 不动数据，计入报告 |
 //! | `NeedsHuman{..}` | 停下，计入报告 |
 //!
@@ -225,6 +225,26 @@ pub fn sync(
 
     let mut batch = Batch::new(root);
 
+    // 评审 Important #3：闸门第 4 道与 `journal::append` 各自的 O(n·m)/O(n²)
+    // 都源于"同一份磁盘状态在循环里被重复读取/重写"——这里跟内容侧的
+    // `arca_store::atomic::Batch` 同一思路，把它们各自的"读一次、批量用"
+    // 提到循环之外。
+    //
+    // `trash_snapshot`：本次调和开始时 `.arca/trash/` 的一次性快照，喂给
+    // 每一次 `gates::check_delete` 的第 4 道，不再让它自己重新 `read_dir`
+    // 整个回收站目录（`gates.rs` 文档：预筛后仍逐条现场重算 `.data` 哈希，
+    // 省掉的只是目录遍历本身，C2 的安全性不受影响）。跟内容 `batch` 一样，
+    // 这份快照拍摄于循环开始前——本次调和不会有任何路径既是"提交新
+    // tombstone"又是"依赖那条新记录才能通过第 4 道"（同一个 item 的
+    // tombstone 若在本轮才提交，其它设备要看到它至少要等到下一轮
+    // `hub::read_remote`），过时不构成风险。
+    let trash_snapshot = trash::list(root).map_err(SyncError::Trash)?;
+
+    // `journal_batch`：本次调和可能提交多条 `TombstoneRemote`，每条都各自
+    // 重读+重写整段 journal 是 O(n²)（`journal::AppendBatch` 文档）；这里
+    // 只读一次现有事件流，循环内的每次追加都在内存里完成，最后统一收口。
+    let mut journal_batch = journal::AppendBatch::open(root).map_err(SyncError::Journal)?;
+
     for (idx, path) in paths.iter().enumerate() {
         let base = baseline.get(path);
         let local = scan_result
@@ -293,6 +313,7 @@ pub fn sync(
                     dataset_root,
                     base: &base,
                     root,
+                    trash_entries: &trash_snapshot,
                 };
                 match gates::check_delete(&check) {
                     Ok(()) => {
@@ -315,7 +336,7 @@ pub fn sync(
             }
 
             Action::TombstoneRemote { item_id, parent } => {
-                execute_tombstone(root, path, item_id, &parent, actor)?;
+                execute_tombstone(root, &mut journal_batch, path, item_id, &parent, actor)?;
                 baseline.remove(path);
                 report.tombstone_submitted.push(path.clone());
             }
@@ -334,6 +355,13 @@ pub fn sync(
     // `baseline.save` 之前完成——commit 失败就不能保存基线继续声称这些路径
     // 已经同步成功（见本函数顶部「存储根写入走批量提交」一节，I3）。
     batch.commit().map_err(SyncError::Atomic)?;
+
+    // journal 批次收口——同一条纪律（评审 Important #3）：本次调和累积的
+    // 全部 tombstone 事件在这里一次性落盘，必须先于 `baseline.save`。commit
+    // 失败意味着这些路径的删除提交还没有真正记进 journal，不能让基线继续
+    // 声称它们"已经同步成功"；下次重跑 `hub::read_remote` 仍会看到旧的
+    // journal 状态，`decide` 会重新给出 `TombstoneRemote`，不构成数据风险。
+    journal_batch.commit().map_err(SyncError::Journal)?;
 
     baseline.save(dataset_root).map_err(SyncError::Baseline)?;
 
@@ -484,8 +512,39 @@ fn execute_download(
 /// 正常运行下 `trash::move_to_trash` 总能找到源文件；万一磁盘在这两步之间
 /// 被外部改动导致源缺失，`move_to_trash` 会如实报出 `TrashError::Atomic`
 /// （包住底层的 `NotFound`），本函数整体报错、不吞掉。
+///
+/// # 第三步：清理 index 记录（评审 Important #2）
+///
+/// journal 目前是"这个路径被删除了"的**唯一**证据——把 journal 清空（人为
+/// 误删，或 M2b 未来的 epoch 轮转/压缩）会让每一个已 tombstone 的路径的
+/// index 记录（此前从不清理，永久指向一个已经不存在于 `files/` 的 item）
+/// 突然变得无法解释：`hub::read_remote` 找不到对应的 tombstone 事件，只能
+/// 去读 `files/<path>`，读到 `NotFound`，report 出 `MissingContent`——一次
+/// 局部的历史丢失，波及的却是**整个存储根**的读取（`read_remote` 遇到第一个
+/// 错误就整体停止）。
+///
+/// 选择的出路：让"没有 index 记录"本身成为"这个路径已被删除"的证据——
+/// `move_to_trash` 与 `journal::append` 之后，这里主动删掉 `path` 的 index
+/// 记录。之后即便 journal 彻底丢失这次删除的历史，`read_remote` 的主循环
+/// 压根不会再遍历到这个路径（它已经不在 `index/` 里），这个路径就干净地
+/// 退化成 `RemoteState::Absent`（"看起来从未存在过"，信息降级，不是错误），
+/// 不会把整个存储根的读取拖下水。相比"声明 journal 永不压缩"，这条路线
+/// 不需要许下一个随着数据量增长会越来越难兑现的承诺，也顺带避免了
+/// `index/` 里永久堆积每一次删除留下的死指针。
+///
+/// 用普通 `fs::remove_file`（不经 `arca_store::atomic`，那套机制目前只提供
+/// `write`/`rename`，没有对称的原子删除）：这不是 I3 意义上的"销毁数据"——
+/// index 记录只是指向已经安全移进 `.arca/trash/` 的内容的一个指针，删掉
+/// 指针不影响内容本身的可恢复性。若这一步与前两步之间崩溃，最坏情况是
+/// index 记录残留（退回本改动之前的行为），由 `hub.rs` 的
+/// `is_pending_tombstone` 兜底诊断（评审 Important #1），不会更糟。
+///
+/// `journal_batch`：本次调和累积的批量 journal 写入（评审 Important #3，见
+/// `sync()` 顶部与 `journal::AppendBatch` 的文档）——只在内存里追加、校验
+/// `seq` 连续性，真正落盘延后到 `sync()` 收尾的一次 `commit()`。
 fn execute_tombstone(
     root: &StorageRoot,
+    journal_batch: &mut journal::AppendBatch<'_>,
     path: &str,
     item_id: ItemId,
     parent: &arca_format::model::VersionId,
@@ -493,11 +552,11 @@ fn execute_tombstone(
 ) -> Result<(), SyncError> {
     let at = clock::now_rfc3339();
     trash::move_to_trash(root, path, item_id, &at).map_err(SyncError::Trash)?;
+    remove_index_record(root, path)?;
 
-    let seq = journal::next_seq(root).map_err(SyncError::Journal)?;
-    journal::append(
-        root,
-        &arca_format::journal::JournalEvent {
+    let seq = journal_batch.next_seq();
+    journal_batch
+        .push(arca_format::journal::JournalEvent {
             seq,
             op: arca_format::journal::Op::Tombstone,
             item_id,
@@ -506,9 +565,23 @@ fn execute_tombstone(
             from: None,
             actor: actor.clone(),
             at,
-        },
-    )
-    .map_err(SyncError::Journal)
+        })
+        .map_err(SyncError::Journal)
+}
+
+/// 从 `.arca/index/<key>.json` 移除 `path` 的记录——`execute_tombstone` 的
+/// 第三步（评审 Important #2，见其文档）。记录本就不存在（这条路径此前已经
+/// 被 tombstone 过、或从来就没有 index 记录）视为无操作，不是错误——与
+/// `fs::remove_file` 在其它地方的幂等处理一致。
+fn remove_index_record(root: &StorageRoot, path: &str) -> Result<(), SyncError> {
+    let key = path_rules::index_key(path);
+    let rel = layout::index_path(&key);
+    let full = root.path().join(&rel);
+    match fs::remove_file(&full) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err(&full, e)),
+    }
 }
 
 /// 追加一条版本记录到 `items/<xx>/<item_id>.jsonl`。`items/` 是 append-only
