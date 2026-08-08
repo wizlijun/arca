@@ -14,7 +14,17 @@
 ### 1.1 file:// 直连（M1）
 
 - dataset_root 所在卷本地挂载时，无 daemon 完成同步；排他由 `arca.lock` 保证。
-- TODO：锁协议、崩溃恢复（`.txn` 前滚/回滚）。
+- **`arca.lock` 落地于 M2b 切片评审 I3**：`<storage-root>/.arca/locks/arca.lock` 上的
+  OS 级整文件独占锁（`arca_store::lock`，经 `fs4` crate 的 `flock`/`LockFileEx`，
+  阻塞式获取，持有进程崩溃/被杀时由内核自动释放，不会遗留死锁）。
+  [`LocalTransport::commit`](../crates/arca-cli/src/transport/local.rs)/
+  `commit_streamed`/`tombstone`——`arcad` 的 HTTP 写入端点与 `arca-cli` 的
+  `file://` 直连同步全部经这三者落盘——在各自的"读当前状态 → CAS 校验 →
+  写入"临界区外层持有它，是这三者跨进程真正互斥的唯一机制；`Dataset::write_lock`
+  （`crates/arcad/src/storage.rs`）只序列化单个 `arcad` 进程内部的并发请求，
+  两把锁的职责不重叠（进程内 vs. 跨进程）。纯读操作（`GET`/`arca status`）
+  不获取它。
+- TODO：崩溃恢复（`.txn` 前滚/回滚）。
 
 ### 1.2 HTTP API（M2，arcad）
 
@@ -82,8 +92,8 @@
 | 端点 | 请求头 | 请求体 | 成功响应 | 失败响应 |
 | --- | --- | --- | --- | --- |
 | `GET /v1/datasets/{id}/files/{path}` | `If-None-Match: "<hash>"`（可选，缓存校验）；`Range: bytes=...`（可选，续传）；`If-Match: <version_id>`（Range 续传时应携带，钉住版本）；`Arca-Session` | 无 | `200`：全量字节，响应头 `ETag`/`Arca-Version-Id`/`Content-Length`；`206`：区间字节，另加 `Content-Range`；`304`：`If-None-Match` 命中，空体 | `404`：路径此刻没有可下载的内容（`Absent` 与 `Tombstoned` 统一折叠成 404，见下）；`412`：Range 续传时 `If-Match` 与当前版本不符（内容在续传期间被改写）；`503`：数据集离线 |
-| `PUT /v1/datasets/{id}/files/{path}` | **`If-Match: <version_id>` 或 `If-None-Match: *` 二选一必需**（I4：一切写入走 CAS，不允许无条件写）；`Arca-Item-Id: <item_id>` 必需（客户端生成，创建与推进都要带——`item_id` 的分配权在客户端，见 `arca-cli::ids::new_item_id`）；`Arca-Version-Id: <version_id>` 必需（本次要落地的新版本号，客户端生成）；`Arca-Mtime: <rfc3339>` 必需；`Arca-Session` | 原始字节（`application/octet-stream`） | `201`（`If-None-Match: *` 创建）/`200`（`If-Match` 推进）：响应头 `ETag`/`Arca-Version-Id`，体可为空或 `{item_id,version_id,hash,size}` | `400`：两个条件头都未提供（`code=request.if_match_required`），或 `Arca-Item-Id`/`Arca-Version-Id`/`Arca-Mtime` 缺失（`code=request.metadata_missing`）；`412`：CAS 冲突，结构化响应体见下；`503`：数据集离线 |
-| `DELETE /v1/datasets/{id}/files/{path}` | `If-Match: <version_id>` 必需（I4，删除同样是 CAS 提交，没有"仅创建"这种豁免）；`Arca-Item-Id: <item_id>` 必需（单点确认的线上对应：明确对哪个 item 提交 tombstone，闸门第 2 道同一条纪律的服务端版本）；`Arca-Session` | 无 | `204`：tombstone 已提交（`files/<path>` 移入 `.arca/trash/`，服务端同样不得物理销毁，见 M2b Task 5） | `400`：缺 `If-Match`（`code=request.if_match_required`）；`404`：路径此刻不存在，无事可删；`412`：CAS 冲突；`503`：数据集离线 |
+| `PUT /v1/datasets/{id}/files/{path}` | **`If-Match: <version_id>` 或 `If-None-Match: *` 二选一必需**（I4：一切写入走 CAS，不允许无条件写）；`Arca-Item-Id: <item_id>` 必需（客户端生成，创建与推进都要带——`item_id` 的分配权在客户端，见 `arca-cli::ids::new_item_id`）；`Arca-Version-Id: <version_id>` 必需（本次要落地的新版本号，客户端生成）；`Arca-Mtime: <rfc3339>` 必需；`Arca-Session` | 原始字节（`application/octet-stream`） | `201`（`If-None-Match: *` 创建）/`200`（`If-Match` 推进）：响应头 `ETag`/`Arca-Version-Id`，体可为空或 `{item_id,version_id,hash,size}` | `400`：两个条件头都未提供（`code=request.if_match_required`），或 `Arca-Item-Id`/`Arca-Version-Id`/`Arca-Mtime` 缺失（`code=request.metadata_missing`）；`409`：`Arca-Item-Id` 与目标路径 / 该 item 自身版本链实际归属的身份不符，或该 item_id 已被 tombstone 终结（`code=request.item_id_mismatch`，评审 C1）；`412`：CAS 冲突，结构化响应体见下；`503`：数据集离线 |
+| `DELETE /v1/datasets/{id}/files/{path}` | `If-Match: <version_id>` 必需（I4，删除同样是 CAS 提交，没有"仅创建"这种豁免）；`Arca-Item-Id: <item_id>` 必需（单点确认的线上对应：明确对哪个 item 提交 tombstone，闸门第 2 道同一条纪律的服务端版本）；`Arca-Session` | 无 | `204`：tombstone 已提交（`files/<path>` 移入 `.arca/trash/`，服务端同样不得物理销毁，见 M2b Task 5） | `400`：缺 `If-Match`（`code=request.if_match_required`）；`404`：路径此刻不存在，无事可删；`409`：`Arca-Item-Id` 与该路径实际归属不符（`code=request.item_id_mismatch`，评审 C1——挡住伪造 item_id 把 tombstone 记到错误身份名下）；`412`：CAS 冲突；`503`：数据集离线 |
 | `GET /v1/datasets/{id}/state` | `Arca-Session` | 无 | `200`：JSON 数组，每条 `{"path","item_id","version_id","hash","size","state"}`（`state` 为 `"present"` 或 `"tombstoned"`；`tombstoned` 条目没有 `hash`/`size`）——字段命名与 `arca ls --json`（§5.0a）同源，`state` 是新增字段（`ls` 的 M1 输出不含 tombstone，见其模块文档）；按路径 UTF-8 字节序排序，供客户端直接构造 `RemoteState` 集合 | `503`：数据集离线，**绝不返回 `200` 加空数组**（I11） |
 | `GET /v1/datasets/{id}/trash/{item_id}?hash=<blake3-hex>` | `Arca-Session` | 无 | `200`：`{"recoverable":true,"hash":"blake3:...","size":1234}`——`hash`/`size` 是现场重算的结果（三方核验：查询参数带的期望哈希 = `.meta` 记录 = 现场重算，与 `Transport::recoverable(item_id, expected_hash)` 同一签名，见 M2b Task 1） | `400`：`hash` 缺失或格式不合法（`code=request.hash_missing`）；`404`：`{"recoverable":false}`（没有匹配的可取回记录——用 JSON 体而不是空 404，闸门第 4 道的调用方不需要额外分支判断"是不是解析失败"）；`503`：数据集离线 |
 
@@ -148,21 +158,28 @@
 
 | HTTP 状态码 | `code` | 出现在 |
 | --- | --- | --- |
-| `400` | `request.if_match_required` | `PUT`/`DELETE` 缺少必需的条件头 |
+| `400` | `request.if_match_required` | `PUT`/`DELETE` 缺少必需的条件头，或 `If-Match` 语法解析不出合法 `version_id` |
 | `400` | `request.metadata_missing` | `PUT` 缺少 `Arca-Item-Id`/`Arca-Version-Id`/`Arca-Mtime` |
-| `400` | `path.rejected` | 路径未通过 `path_rules::check` |
-| `400` | `request.hash_missing` | `GET .../trash/{item_id}` 缺少或格式不合法的 `hash` 查询参数 |
+| `400` | `path.rejected` | 路径未通过 `path_rules::check`（含 `.arca` 保留段，`FORMAT.md` §2） |
+| `400` | `request.hash_missing` | `GET .../trash/{item_id}` 缺少或格式不合法的 `hash` 查询参数（含 `hash` 参数重复出现，评审 Minor 项：与"没提供"共用同一诊断） |
 | `400` | `request.item_id_invalid` | `GET .../trash/{item_id}` 的 `item_id` 不是合法的 32 位小写十六进制 |
+| `400` | `request.header_ambiguous` | `Range` 续传的 `If-Match` 重复出现且取值有歧义（评审 Minor 项：`PUT`/`DELETE` 的同类歧义复用 `request.if_match_required`，语义已经是"没有提供有效的单一条件"） |
 | `404` | （无 `code`，标准 HTTP 语义已自解释） | 路径/记录此刻不存在 |
+| `409` | `request.item_id_mismatch` | `Arca-Item-Id` 与目标路径/该 item 自身版本链实际归属的身份不符，或该 item_id 已被 tombstone 终结（评审 C1，见 §7 总表） |
 | `412` | `commit.stale_parent` | CAS 冲突，结构化响应体见上；`Range` 续传的 `If-Match` 与当前版本不符时同样用这个 `code`（响应体退化为只带 `theirs`，没有 `base`/`yours`——续传不是一次写入提交，没有这两者的概念） |
+| `413` | `request.body_too_large` | `PUT` 请求体超过体积上限（评审 C2：流式接收，累计超限即中止，不等请求体收完） |
+| `500` | `store.corrupt` | `arcad` 已通过挂载检查、请求本身也合法，但从存储层拿到失败——链断裂、内容缺失、索引/journal 解析失败等（评审 I2，见 §7 总表） |
 | `503` | `mount.absent` / `mount.identity_mismatch` | 数据集离线（I11） |
+| `504` | （无 `code`，标准 HTTP 语义已自解释） | 单次请求处理超时（评审 C2，传输层兜底，不是本节定义的业务失败） |
 
 `request.if_match_required`/`request.metadata_missing`/`request.hash_missing`/
-`request.item_id_invalid` 是本节新增的四个码，`class=needs_human`（调用方的
-客户端实现有 bug，需要人修，不是可以退避重试的瞬时故障，也不是协议层的
-正常冲突）——按 §7 的既有登记纪律补进那张总表。本表只覆盖本节定义的五个
-端点；longpoll/SSE/游标（M2c）与更多端点落地时继续增补，不改动已登记条目
-的语义（I10）。
+`request.item_id_invalid`/`request.header_ambiguous` 是本节新增的五个码，
+`class=needs_human`（调用方的客户端实现有 bug，需要人修，不是可以退避重试
+的瞬时故障，也不是协议层的正常冲突）——按 §7 的既有登记纪律补进那张总表；
+`request.item_id_mismatch`/`store.corrupt`/`request.body_too_large`/
+`request.body_read_failed` 随 M2b 切片评审的 C1/C2/I2 修复补入总表，同样
+`class=needs_human`。本表只覆盖本节定义的五个端点；longpoll/SSE/游标（M2c）
+与更多端点落地时继续增补，不改动已登记条目的语义（I10）。
 
 **实现落地时对本节文本未明确覆盖的两处分支做了最小一致延伸**
 （`crates/arcad/src/api.rs`，M2b Task 5）：
@@ -326,10 +343,15 @@ status`/`arca sync` 据此判断本轮是否会做全量对账）；`reset_reaso
 | `reconcile.needs_human` | `needs_human` | 三态调和判定为模糊终态（`reason=remote_vanished_without_tombstone`）——基线说某个 item 存在过，远端却既无记录也无 tombstone，按 I5 停下，绝不推断成「远端删了」 |
 | `reconcile.conflict` | `protocol` | 三态调和判定为结构化冲突（`reason` 为 `both_new_divergent`/`three_way_divergent`/`modify_vs_delete` 之一）——走 M2 冲突落地流程，不作为错误处理 |
 | `request.if_match_required` | `needs_human` | HTTP `PUT`/`DELETE` 缺少必需的条件头（`If-Match` 或 `If-None-Match: *`）——I4 不允许无条件写，§1.2 |
+| `request.item_id_mismatch` | `needs_human` | HTTP `PUT`/`DELETE` 的 `Arca-Item-Id` 与目标路径 / 该 item 自身版本链实际归属的身份不符，或该 item_id 已被 tombstone 终结、不允许任何后续提交复用（M2b 切片评审 C1，§1.2）——`409`，不是 CAS `412`：换 `parent` 重试也不会成功，必须先修正客户端对 `item_id` 的认知 |
 | `request.metadata_missing` | `needs_human` | HTTP `PUT` 缺少 `Arca-Item-Id`/`Arca-Version-Id`/`Arca-Mtime` 中的一个或多个，§1.2 |
 | `request.hash_missing` | `needs_human` | HTTP `GET .../trash/{item_id}` 缺少或格式不合法的 `hash` 查询参数，§1.2 |
 | `request.item_id_invalid` | `needs_human` | HTTP `GET .../trash/{item_id}` 的 `item_id` 不是合法的 32 位小写十六进制，§1.2 |
 | `internal.invariant_violated` | `bug` | 内部不变量被破坏 |
+| `store.corrupt` | `needs_human` | HTTP 端点在已经通过挂载检查、请求本身也合法之后，仍从 `Transport`（`arca-cli::transport`）拿到失败——链断裂、指针指向的内容缺失、索引/journal 解析失败、EACCES 等（M2b 切片评审 I2）：这些是存储根本身或其可访问性出了问题，不是 `arcad` 代码逻辑错误，绝不能报成 `class=bug` 那种"提 issue"的处置，运维应先跑 `arca fsck`/`arca doctor` 诊断 |
+| `request.body_too_large` | `needs_human` | HTTP `PUT` 请求体超过 `MAX_BODY_BYTES`（`crates/arcad/src/api.rs`）——评审 C2：流式接收，累计超限即中止清理，不等请求体收完才拒绝，`413` |
+| `request.body_read_failed` | `needs_human` | HTTP `PUT` 流式读取请求体本身失败（客户端提前断开、传输层错误），`400`——评审 C2 |
+| `request.header_ambiguous` | `needs_human` | HTTP `Range` 续传的 `If-Match` 重复出现且取值有歧义（评审 M2b 切片评审 Minor 项）——`400`；`PUT`/`DELETE` 的同类歧义复用 `request.if_match_required`，语义已经是"没有提供有效的单一条件" |
 
 TODO：退出码与 `code` 的映射表（M1）。HTTP 状态码与 `code` 的映射表——§1.2
 「HTTP 状态码 ↔ `code`」已覆盖 M2b 交付的五个端点；longpoll/SSE/游标（M2c）

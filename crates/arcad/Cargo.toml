@@ -19,10 +19,14 @@ arca-store = { path = "../arca-store" }
 # 不在 arcad 里重新实现一遍 CAS 落盘细节（M2b Task 5 brief 明文要求「复用」）。
 arca-cli = { path = "../arca-cli" }
 axum = "0.8.9"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toml = "1.1.4"
+# 只用 `StreamExt::next` 驱动请求体的流式读取（M2b 切片评审 C2：PUT 不再
+# 把整份请求体先缓冲进内存）——axum 自身已经传递依赖 futures-util，这里
+# 固定同一版本，不引入新的依赖树分支。
+futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

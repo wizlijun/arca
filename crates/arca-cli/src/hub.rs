@@ -213,6 +213,27 @@ fn tombstoned_by_item(events: &[JournalEvent]) -> BTreeMap<ItemId, TombstoneInfo
         .collect()
 }
 
+/// 某个 `item_id` 在 journal 里最后一条事件是否是 tombstone——一个 item_id
+/// 一旦被终结就不再复活（spec §4.1「删除后重建 = 新身份，走全新
+/// `item_id`」）。供 [`crate::transport::local::LocalTransport::commit`]/
+/// [`crate::transport::local::LocalTransport::tombstone`] 的身份校验使用
+/// （评审 C1：HTTP 层此前从不校验 `Arca-Item-Id` 是否真的拥有目标路径，
+/// 也从不检查它是不是一个已经终结的旧身份——两个请求就能让
+/// `items/<item_id>.jsonl` 断链，拖垮整个数据集）：无论客户端这次提交声称
+/// 的是"创建"（`parent:None`）还是"推进"（`If-Match` 带一个看起来合法的
+/// 旧 `version_id`），只要这个 `item_id` 曾经被 tombstone 过，就必须直接
+/// 拒绝，不能靠"链是否碰巧还能对上"来判断——`items/` 链在 tombstone 时不会
+/// 追加新记录（FORMAT.md §7.2），所以一个已终结身份的链尾看起来和"仍然
+/// 活着、只是这次要推进"完全一样，唯一能分辨的证据在 journal 里。
+///
+/// 与 [`read_remote`] 内部的 `tombstoned_by_item` 是同一份判断逻辑，这里
+/// 单独对外暴露一个"只问一个 `item_id`"的版本，避免调用方为了这一个布尔
+/// 值而自己重新解析整段 journal。
+pub fn item_is_tombstoned(root: &StorageRoot, item_id: ItemId) -> Result<bool, HubError> {
+    let (_cursor, journal_events) = crate::journal::read_all(root).map_err(HubError::Journal)?;
+    Ok(tombstoned_by_item(&journal_events).contains_key(&item_id))
+}
+
 /// 从一个已打开、身份已确认的存储根读出「每个当前受管路径的远端状态」。
 ///
 /// 只读：不修改、不创建任何文件。路径不在返回的 map 里，调用方按
@@ -282,6 +303,56 @@ pub fn read_remote(root: &StorageRoot) -> Result<BTreeMap<String, RemoteState>, 
     }
 
     Ok(result)
+}
+
+/// **评审 I4**：`read_remote` 返回的 map 是否"空得可疑"——`index/` 一条记录
+/// 都没读到（目录缺失或已被清空），但 `files/` 下确实躺着内容。
+///
+/// 刻意**不**内嵌进 [`read_remote`] 本身，是权衡过的取舍：`arca-cli::sync`
+/// 的调和流程本就有另一套独立机制识别同一种异常——本地基线记得"这个路径
+/// 曾经同步过"，远端却既没有记录也没有 tombstone，三态决策表判定为
+/// `reconcile.needs_human`（`reason=remote_vanished_without_tombstone`），
+/// **精确定位到具体路径**，`sync()` 的其它未受影响路径完全不受牵连（见
+/// `sync.rs` 「崩溃在 index 写入之前遗留的孤儿字节」一类测试）。若在
+/// `read_remote` 这一层就整体报错，反而会让这种场景在有基线可比对的调用方
+/// 眼里变得更粗糙——从"精确指出这一个路径需要人工介入"退化成"整个存储根
+/// 读取失败"，两者都不静默、但前者更可诊断（I5）。
+///
+/// 真正需要这层额外核验的是**没有基线可比对**的调用方——`arcad` 的
+/// `GET /state`：它直接把 `read_remote` 的结果原样呈现给网络另一端，没有
+/// "这个路径以前存在过"这个记忆，`index/` 被抹掉时只会看到一个空 map，
+/// 与"这本来就是个全新的空数据集"在字节上完全没有区别，正是 I11 要防的
+/// 形状经网络触发的变体。这类调用方应在 `read_remote` 返回空 map 时，
+/// 额外调用本函数核验一次。
+pub fn empty_remote_hides_content(root: &StorageRoot) -> Result<Option<String>, HubError> {
+    let files_dir = root.path().join(layout::FILES_DIR);
+    let found = find_any_file(&files_dir).map_err(|e| io_err(&files_dir, e))?;
+    Ok(found.map(|p| p.display().to_string()))
+}
+
+/// 递归寻找 `dir` 下第一个条目（文件或符号链接都算——只用于证明"这里确实
+/// 有东西"，不关心具体类型）。目录不存在或确实空 → `Ok(None)`（评审 I4 的
+/// 判断依据，见 [`empty_remote_hides_content`]）。`file_type()`（不跟随
+/// 符号链接）判断是否要继续下探子目录；符号链接与普通文件一样，一旦遇到
+/// 就直接算数，不需要解析它指向哪里。
+fn find_any_file(dir: &Path) -> io::Result<Option<PathBuf>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if let Some(found) = find_any_file(&path)? {
+                return Ok(Some(found));
+            }
+        } else {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 /// 读一个 item 的版本链，取最后一条作为当前版本。
@@ -502,6 +573,58 @@ mod tests {
         let root = open(dir.path());
         let remote = read_remote(&root).unwrap();
         assert!(remote.is_empty());
+    }
+
+    /// 评审 I4 的实机复现：内容还在、`.arca/index/` 整个被抹掉（人为误删，
+    /// 或存储损坏）——修复前 `read_remote` 会把这当成"全新的空数据集"，
+    /// 静默返回 `Ok(空map)`，`GET /state` 会报 `200 []`，正是 I11 要防的
+    /// "把挂载/索引缺失呈现成空库"经由索引层面触发的变体，可能诱发误导性
+    /// 的删除对账。修复后必须报错，不能悄悄退化成"没有任何记录"。
+    #[test]
+    fn index目录整个缺失但files非空时read_remote仍返回空map_但empty_remote_hides_content能识破() {
+        let dir = tempfile::tempdir().unwrap();
+        write_format_json(dir.path());
+        let id = ItemId::from_bytes([0x99; 16]);
+        write_indexed_item(dir.path(), "precious.bin", id, b"still here");
+
+        // 模拟索引被整个抹掉：删掉 .arca/index/ 目录本身，files/ 原封不动。
+        fs::remove_dir_all(dir.path().join(".arca/index")).unwrap();
+        assert!(dir.path().join("files/precious.bin").is_file());
+
+        let root = open(dir.path());
+        // read_remote 本身仍然只是"如实报告磁盘上能看到的指针"——这里
+        // 确实一条指针都读不到，返回空 map 不是 bug（`sync.rs` 的基线
+        // 对账机制依赖这个诚实的空 map 才能精确定位到具体路径，见模块顶部
+        // `empty_remote_hides_content` 文档）。
+        let remote = read_remote(&root).unwrap();
+        assert!(remote.is_empty());
+
+        // 没有基线可比对的调用方（评审 I4 针对的是 `arcad` 的
+        // `GET /state`）必须能额外核验出这个空 map 是可疑的。
+        match empty_remote_hides_content(&root) {
+            Ok(Some(example_path)) => {
+                assert!(
+                    example_path.contains("precious.bin"),
+                    "应该指向 files/ 下真实存在的内容：{example_path}"
+                );
+            }
+            other => panic!("应为 Ok(Some(..))，实得 {other:?}"),
+        }
+    }
+
+    /// 与上一条对照：`.arca/index/` 目录缺失、`files/` 也确实是空的——这是
+    /// 全新存储根的合法状态，`empty_remote_hides_content` 不应该报可疑
+    /// （不能矫枉过正，把"真的什么都没有"也当成损坏）。
+    #[test]
+    fn index目录缺失且files也为空时empty_remote_hides_content判定为none() {
+        let dir = tempfile::tempdir().unwrap();
+        write_format_json(dir.path());
+        fs::create_dir_all(dir.path().join("files")).unwrap();
+
+        let root = open(dir.path());
+        let remote = read_remote(&root).unwrap();
+        assert!(remote.is_empty());
+        assert_eq!(empty_remote_hides_content(&root).unwrap(), None);
     }
 
     #[test]

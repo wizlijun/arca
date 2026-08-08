@@ -266,6 +266,132 @@ pub fn write(root: &StorageRoot, relative_target: &str, bytes: &[u8]) -> Result<
     })
 }
 
+/// 流式写入句柄：[`write`] 要求调用方先把整份内容攒成 `&[u8]` 再一次性
+/// 交出——HTTP 服务端在把一个请求体的全部字节吃进内存之前，内存占用就已经
+/// 与请求体体积成正比，这与"一次请求不该占用与其体积成正比的内存"
+/// （M2b 切片评审 C2：600MB 的 PUT 让 RSS 从 6MB 涨到 1.86GB）直接矛盾。
+///
+/// `TmpWriter` 把 [`write`] 拆成两段：内容这一半改成调用方自己驱动的写入
+/// 循环（每次一个网络分片，边到达边写、边写边可以在调用方那侧增量算
+/// 哈希），落盘这一半（fsync 文件 → rename → fsync 目标目录链，约束 2 的
+/// 第 2–4 步）仍然由本类型负责，持久化保证与 [`write`] 完全一致——两者
+/// 共用同一份 `tmp_file_name` 生成规则与 `create_new` 语义（约束 1：不用
+/// 随机数；`EEXIST` 诚实报错，不跟随链接、不静默覆盖，见 [`write_and_sync`]
+/// 的文档）。
+pub struct TmpWriter {
+    tmp_path: PathBuf,
+    /// `finish`/`abandon` 会 `take()` 走它——之后 `Drop` 据此判断"这次写入
+    /// 有没有被明确收口过"，还留着就说明调用方提前 return 或 panic 了，
+    /// 兜底清理，绝不留孤儿临时文件（约束 4）。
+    file: Option<File>,
+}
+
+impl TmpWriter {
+    /// 在 `.arca/tmp/` 下新建一个临时文件，准备接收流式写入。
+    /// `relative_target` 只用于文件名里那段哈希（供崩溃后人工排查猜测
+    /// 归属），真正的落点由 [`TmpWriter::finish`] 的参数决定。
+    ///
+    /// **不持有 `&StorageRoot`**（评审 C2 的一处实现教训，值得记下来）：
+    /// 最初的版本把 `root: &'a StorageRoot` 存成字段，`create`/`finish`
+    /// 之间横跨若干次 `.await`（HTTP 服务端边接收网络分片边写）——这让
+    /// `TmpWriter<'a>` 成为一个自借用其宿主 `StorageRoot` 的类型，在
+    /// `arcad` 的 `PUT` handler 里跨 `.await` 持有它，会让 axum
+    /// `Handler` trait 要求的 `Future: Send + 'static` 推导失败（表现成
+    /// 一条不知所云的 `Handler<_, _> 未实现` 报错，而不是直接指向真正
+    /// 原因的借用检查错误）。`root` 因此改成只在需要的两个方法
+    /// （[`create`](Self::create)/[`finish`](Self::finish)）里按参数传入，
+    /// 不跨越任何 `await` 点持有。
+    pub fn create(root: &StorageRoot, relative_target: &str) -> Result<Self, AtomicError> {
+        let tmp_dir = root.path().join(layout::TMP_DIR);
+        let tmp_path = tmp_dir.join(tmp_file_name(relative_target));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|e| io_error(&tmp_path, &e))?;
+        Ok(Self {
+            tmp_path,
+            file: Some(file),
+        })
+    }
+
+    /// 追加一段字节——调用方按到达顺序多次调用即可，不需要预先知道总长度。
+    pub fn write_all(&mut self, chunk: &[u8]) -> Result<(), AtomicError> {
+        let file = self
+            .file
+            .as_mut()
+            .expect("TmpWriter::write_all 不应在 finish/abandon 之后调用");
+        file.write_all(chunk)
+            .map_err(|e| io_error(&self.tmp_path, &e))
+    }
+
+    /// 收口：fsync 文件本身、rename 到 `relative_target`、fsync 目标所在的
+    /// 目录链（约束 2 的第 2–4 步，与 [`write`] 逐字对应）。`root` 见
+    /// [`TmpWriter::create`] 文档「不持有 `&StorageRoot`」一节。
+    pub fn finish(mut self, root: &StorageRoot, relative_target: &str) -> Result<(), AtomicError> {
+        let file = self.file.take().expect("TmpWriter::finish 只应调用一次");
+        if let Err(e) = file.sync_all() {
+            drop(file);
+            cleanup_tmp(&self.tmp_path);
+            return Err(io_error(&self.tmp_path, &e));
+        }
+        // 显式关闭再 rename——与 write_and_sync 同一条纪律（rename 前不留
+        // 打开的句柄）。
+        drop(file);
+
+        let target = root.join(relative_target)?;
+        let target_parent = target
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.path().to_path_buf());
+        if let Err(e) = fs::create_dir_all(&target_parent) {
+            cleanup_tmp(&self.tmp_path);
+            return Err(io_error(&target_parent, &e));
+        }
+
+        if let Err(e) = fs::rename(&self.tmp_path, &target) {
+            let mapped = if e.kind() == io::ErrorKind::CrossesDevices {
+                AtomicError::CrossDevice {
+                    tmp: self.tmp_path.display().to_string(),
+                    target: target.display().to_string(),
+                }
+            } else {
+                io_error(&self.tmp_path, &e)
+            };
+            cleanup_tmp(&self.tmp_path);
+            return Err(mapped);
+        }
+
+        sync_dir_chain_to_root(root.path(), &target_parent).map_err(|e| {
+            AtomicError::CommittedUnsynced {
+                target: target.display().to_string(),
+                reason: e.to_string(),
+            }
+        })
+    }
+
+    /// 主动放弃这次写入并清理临时文件——调用方在写入循环中途发现错误
+    /// （例如请求体超出体积上限、客户端提前断开）时用它：与其依赖 `Drop`
+    /// 悄悄兜底，不如显式表达"这是一次已知的、主动的放弃"，调用点的意图
+    /// 更清楚。
+    pub fn abandon(mut self) {
+        self.file.take();
+        cleanup_tmp(&self.tmp_path);
+    }
+}
+
+impl Drop for TmpWriter {
+    fn drop(&mut self) {
+        // `finish`/`abandon` 都已经 `take()` 走 `file` 并各自处理过临时
+        // 文件；这里只兜底"调用方因为提前 return（`?`）或 panic 而两者都
+        // 没调用"的情形——本 crate 不允许留下不属于任何记录的孤儿文件
+        // （约束 4：失败时清理）。
+        if self.file.take().is_some() {
+            cleanup_tmp(&self.tmp_path);
+        }
+    }
+}
+
 /// `write` 与 [`Batch::write`] 共用的核心：tmp → fsync 文件 → rename（约束 2
 /// 的前三步）。返回 `(目标路径, 目标的父目录路径)`，供调用方决定「接下来是
 /// 立刻 fsync 目录链（单次 `write`）还是先记下来、延后到批量收尾一次性
@@ -831,6 +957,71 @@ mod tests {
             created_at: "2026-08-08T09:00:00Z".to_string(),
         };
         fs::write(dir.join(".arca/format.json"), format.to_json().unwrap()).unwrap();
+    }
+
+    /// `TmpWriter`：分多次 `write_all` 喂入的内容与一次性 `write()` 效果
+    /// 等价——落点、内容都一致（M2b 切片评审 C2：PUT 改流式写入的落地基础）。
+    #[test]
+    fn tmp_writer_分块写入后finish内容与一次性写入等价() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = StorageRoot::open(dir.path(), None).unwrap();
+
+        let mut writer = TmpWriter::create(&root, "files/streamed.txt").unwrap();
+        writer.write_all(b"hello, ").unwrap();
+        writer.write_all(b"streamed ").unwrap();
+        writer.write_all(b"world").unwrap();
+        writer.finish(&root, "files/streamed.txt").unwrap();
+
+        assert_eq!(
+            fs::read(dir.path().join("files/streamed.txt")).unwrap(),
+            b"hello, streamed world"
+        );
+        // finish 之后 tmp 目录不应该残留任何文件。
+        let leftovers: Vec<_> = fs::read_dir(dir.path().join(".arca/tmp"))
+            .unwrap()
+            .collect();
+        assert!(leftovers.is_empty(), "finish 之后不应有 tmp 残留");
+    }
+
+    /// `abandon`：中途放弃时临时文件必须被清理，目标路径不应该出现任何
+    /// 内容——调用方（HTTP PUT 处理器）在发现请求体超过体积上限时走这条
+    /// 路径，绝不能把半份内容留在磁盘上（约束 4）。
+    #[test]
+    fn tmp_writer_abandon清理临时文件且不产生目标() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = StorageRoot::open(dir.path(), None).unwrap();
+
+        let mut writer = TmpWriter::create(&root, "files/aborted.txt").unwrap();
+        writer.write_all(b"partial").unwrap();
+        writer.abandon();
+
+        assert!(!dir.path().join("files/aborted.txt").exists());
+        let leftovers: Vec<_> = fs::read_dir(dir.path().join(".arca/tmp"))
+            .unwrap()
+            .collect();
+        assert!(leftovers.is_empty(), "abandon 之后不应有 tmp 残留");
+    }
+
+    /// 未显式 `finish`/`abandon`（模拟调用方提前 `return`/`?` 传播）——`Drop`
+    /// 必须兜底清理，不留孤儿临时文件。
+    #[test]
+    fn tmp_writer_未收口时drop兜底清理() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = StorageRoot::open(dir.path(), None).unwrap();
+
+        {
+            let mut writer = TmpWriter::create(&root, "files/dropped.txt").unwrap();
+            writer.write_all(b"never finished").unwrap();
+            // writer 在这里离开作用域，既没有 finish 也没有 abandon。
+        }
+
+        let leftovers: Vec<_> = fs::read_dir(dir.path().join(".arca/tmp"))
+            .unwrap()
+            .collect();
+        assert!(leftovers.is_empty(), "Drop 应兜底清理，实得 {leftovers:?}");
     }
 
     /// `rename` 把内容从一个相对路径移到另一个，源不再存在、目标内容不变。

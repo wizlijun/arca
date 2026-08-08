@@ -121,6 +121,23 @@ pub enum CommitOutcome {
         expected_parent: Option<VersionId>,
         actual: RemoteState,
     },
+    /// 身份校验失败（评审 C1）：客户端声称的 `item_id` 与这次操作实际应
+    /// 归属的 item_id 不符——**不是**"版本过期"（那是 `Conflict`，换一个
+    /// 正确的 `parent` 重试就能成功）；这是"你打错了身份"，无论重试多少次、
+    /// 无论 `parent` 换成什么都不该成功，必须先修正客户端对 `item_id` 的
+    /// 认知，因此不能被折叠进 `Conflict`（那会让调用方以为这是可以通过
+    /// 重新调和解决的普通冲突）。三种触发场景见 `local.rs::commit`/
+    /// `tombstone` 的实现注释：路径已被另一个 item_id 占用、这个 item_id
+    /// 已经在别的路径下有归属、这个 item_id 已被 tombstone 终结。
+    IdentityMismatch {
+        /// 这次操作声明要落在的路径。
+        path: String,
+        /// 客户端声称的 item_id。
+        claimed_item_id: ItemId,
+        /// 冲突对象此刻真正的归属 item_id——`None` 表示冲突源不是"另一个
+        /// item_id 占着"，而是"这个 item_id 自己已经被 tombstone 终结"。
+        actual_item_id: Option<ItemId>,
+    },
 }
 
 /// 第 4 道闸门要问的：这个 item 的内容此刻是否可取回（附哈希与大小）。
@@ -144,6 +161,12 @@ pub enum TransportError {
     Journal(crate::journal::JournalError),
     Atomic(arca_store::atomic::AtomicError),
     Format(arca_format::error::FormatError),
+    /// **评审 I3**：获取 `.arca/locks/arca.lock`（跨进程排他锁，见
+    /// `arca_store::lock` 模块文档）本身失败——创建/打开锁文件失败，权限、
+    /// 磁盘满等。与"锁被占用"不是同一件事：本实现选的是阻塞式获取
+    /// （`arca_store::lock::acquire` 内部调用 `FileExt::lock`），拿不到锁会
+    /// 一直等，不会以"忙"为由提前失败；这个变体只覆盖锁本身的 IO 故障。
+    Lock(arca_store::lock::LockError),
     /// 常规 IO 故障，不属于以上任何一类已知形状（例如路径逃出存储根、读取
     /// `files/<path>` 本身失败）。
     Io {
@@ -160,6 +183,7 @@ impl fmt::Display for TransportError {
             TransportError::Journal(e) => write!(f, "{e}"),
             TransportError::Atomic(e) => write!(f, "{e}"),
             TransportError::Format(e) => write!(f, "{e}"),
+            TransportError::Lock(e) => write!(f, "{e}"),
             TransportError::Io { path, reason } => write!(f, "{path}：{reason}"),
         }
     }
@@ -173,6 +197,7 @@ impl std::error::Error for TransportError {
             TransportError::Journal(e) => Some(e),
             TransportError::Atomic(e) => Some(e),
             TransportError::Format(e) => Some(e),
+            TransportError::Lock(e) => Some(e),
             TransportError::Io { .. } => None,
         }
     }

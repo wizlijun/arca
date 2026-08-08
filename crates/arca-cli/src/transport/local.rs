@@ -20,7 +20,7 @@ use arca_core::state::RemoteState;
 use arca_format::hub_layout::layout;
 use arca_format::index::IndexRecord;
 use arca_format::items;
-use arca_format::model::{ItemId, Version};
+use arca_format::model::{Actor, ItemId, Version, VersionId};
 use arca_format::path_rules;
 use arca_store::atomic;
 use arca_store::root::StorageRoot;
@@ -67,18 +67,193 @@ impl<'a> LocalTransport<'a> {
         Ok(entries)
     }
 
-    fn current_version_of(
+    /// C2 修复：流式提交——调用方（`arcad` 的 `PUT` 处理器）已经把请求体
+    /// 边到达边写进一个 [`atomic::TmpWriter`]、边写边算好了哈希，不再把
+    /// 整份内容缓冲进内存（评审实测：改造前一次 600MB 的 `PUT` 会让 RSS
+    /// 从 6MB 涨到 1.86GB）。本方法接手"内容已经落在 tmp、身份/CAS 校验
+    /// 通过之后把它过户成正式版本"这一半，与 [`Transport::commit`]
+    /// （`bytes: Vec<u8>` 版，供 `file://` 同步使用）共享同一套身份/CAS
+    /// 判断（[`validate_commit`]）——两条路径的判断标准必须是同一份代码，
+    /// 不是分别维护的两份，否则迟早会悄悄分叉出不一致的安全边界。
+    ///
+    /// 不是 [`Transport`] trait 的一部分：`Transport::commit` 的签名要求
+    /// 整份 `bytes`，这是专门为"请求体不能整份缓冲进内存"这一个调用点
+    /// （HTTP `PUT`）开的口子——`Transport` trait 本身要不要长出一个通用的
+    /// 流式写入方法留给 M2c/M2e（见 `transport/mod.rs` 顶部记录的接口
+    /// 缺口），这里不越界改 trait 形状。
+    ///
+    /// 身份/CAS 校验不通过时会调用 `writer.abandon()` 清理 tmp 文件——
+    /// 调用方交出 `writer` 之后就不必、也不应该再管它的生命周期，无论
+    /// 结果是 `Committed`、`Conflict` 还是 `IdentityMismatch`。
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_streamed(
         &self,
         path: &str,
-    ) -> Result<(RemoteState, Option<arca_format::model::VersionId>), TransportError> {
+        item_id: ItemId,
+        version_id: VersionId,
+        parent: Option<VersionId>,
+        writer: atomic::TmpWriter,
+        hash: ContentHash,
+        size: u64,
+        mtime: String,
+        actor: Actor,
+    ) -> Result<CommitOutcome, TransportError> {
+        // 评审 I3：跨进程排他——见 `arca_store::lock` 模块文档。持有到函数
+        // 返回为止（含写入），涵盖整段"读当前状态 → CAS 校验 → 写入"临界区。
+        let _lock = arca_store::lock::acquire(self.root).map_err(TransportError::Lock)?;
         let remote = self.read_remote()?;
-        let current = remote.get(path).cloned().unwrap_or(RemoteState::Absent);
-        let version = match &current {
-            RemoteState::Present { version_id, .. } => Some(version_id.clone()),
-            RemoteState::Tombstoned { .. } | RemoteState::Absent => None,
+        let item_last_version = match validate_commit(self.root, &remote, path, item_id, &parent)? {
+            Ok(v) => v,
+            Err(outcome) => {
+                writer.abandon();
+                return Ok(outcome);
+            }
         };
-        Ok((current, version))
+
+        let target = format!("{}/{}", layout::FILES_DIR, path);
+        writer
+            .finish(self.root, &target)
+            .map_err(TransportError::Atomic)?;
+
+        let version = Version {
+            version_id: version_id.clone(),
+            item_id,
+            parent: item_last_version,
+            hash,
+            size,
+            mtime,
+            actor,
+            committed_at: crate::clock::now_rfc3339(),
+        };
+        append_item_version(self.root, &version)?;
+        write_index_record(self.root, path, item_id)?;
+
+        Ok(CommitOutcome::Committed {
+            item_id,
+            version_id,
+        })
     }
+}
+
+/// C1 身份/CAS 校验的共用核心——[`LocalTransport::commit`]（`bytes` 版）与
+/// [`LocalTransport::commit_streamed`]（C2 流式版，供 `arcad` 使用）共享
+/// 同一套判断，不各自实现一遍：两条路径独立演化、判断标准悄悄分叉，是
+/// 比"多传几个参数"更危险的维护负担（那正是能让 C1 这类漏洞重新长出来
+/// 的土壤）。
+///
+/// - `Ok(Ok(item_last_version))`：全部校验通过——`item_last_version` 是
+///   这个 item 自己版本链的链尾（C1 修法：新记录的 `parent` 从这里推导，
+///   不是直接信调用方传入的 `parent` 声明）。
+/// - `Ok(Err(outcome))`：`IdentityMismatch` 或 `Conflict`——调用方原样把
+///   它当作最终结果返回，不再继续任何写入。
+/// - `Err(_)`：读取过程本身失败（真损坏：journal/items 解析不了等），
+///   向上传播（I5：绝不吞掉真损坏去猜一个校验结果）。
+fn validate_commit(
+    root: &StorageRoot,
+    remote: &BTreeMap<String, RemoteState>,
+    path: &str,
+    item_id: ItemId,
+    parent: &Option<VersionId>,
+) -> Result<Result<Option<VersionId>, CommitOutcome>, TransportError> {
+    let current = remote.get(path).cloned().unwrap_or(RemoteState::Absent);
+
+    // 校验 0：这个 item_id 一旦被 tombstone 就此终结（spec §4.1「删除后
+    // 重建 = 新身份」），不允许任何后续提交复用它——不论这次声称的是
+    // "创建"（parent:None）还是"推进"（If-Match 带一个看起来合法的旧
+    // version_id，那正是它自己被终结前的最后一个版本，攻击者从
+    // GET /state 就能读到）。items/<item_id>.jsonl 的链本身不会因为
+    // tombstone 而改变（FORMAT.md §7.2 tombstone 不产生新版本），单靠
+    // "链尾对不对得上 parent" 分辨不出这一种，必须直接问 journal。
+    if hub::item_is_tombstoned(root, item_id).map_err(TransportError::Hub)? {
+        return Ok(Err(CommitOutcome::IdentityMismatch {
+            path: path.to_string(),
+            claimed_item_id: item_id,
+            actual_item_id: None,
+        }));
+    }
+
+    // 校验 1：这个路径此刻真正的归属（若有）必须与调用方声称的 item_id
+    // 一致——HTTP 是不可信输入的入口，`Arca-Item-Id` 此前只经过语法解析，
+    // 从未核对它是不是真的拥有这个路径。
+    if let Some(owner) = owner_item_id(&current) {
+        if owner != item_id {
+            return Ok(Err(CommitOutcome::IdentityMismatch {
+                path: path.to_string(),
+                claimed_item_id: item_id,
+                actual_item_id: Some(owner),
+            }));
+        }
+    }
+
+    // 校验 2：这个 item_id 不能在别的路径下已经有归属——否则两个不同路径
+    // 各自声明同一个全新 item_id，会把两条互不相干的"首版本"追加进同一个
+    // items/<item_id>.jsonl，那个文件的链从此断裂，之后任何触碰它的请求
+    // 都会失败（评审 C1 利用 1，数据集级 DoS）。
+    if let Some(other_path) = remote
+        .iter()
+        .find_map(|(p, s)| (p != path && owner_item_id(s) == Some(item_id)).then(|| p.clone()))
+    {
+        return Ok(Err(CommitOutcome::IdentityMismatch {
+            path: other_path,
+            claimed_item_id: item_id,
+            actual_item_id: Some(item_id),
+        }));
+    }
+
+    // 校验 3：真正的 CAS 比较对象是这个 item 自己的版本链尾，不是路径视角
+    // 的"当前版本"——两者在校验 1/2 都通过之后理应相等，这里直接问 item
+    // 自己的历史是纵深防御，也是"parent 从 item 自己的最后版本推导"这条
+    // 修法的落点。
+    let item_last_version = read_item_last_version(root, item_id)?.map(|v| v.version_id);
+    if &item_last_version != parent {
+        return Ok(Err(CommitOutcome::Conflict {
+            expected_parent: parent.clone(),
+            actual: current,
+        }));
+    }
+
+    Ok(Ok(item_last_version))
+}
+
+/// 一个 `RemoteState` 此刻的归属 item_id——`Present` 与 `Tombstoned` 都算
+/// "有归属"（C1 身份校验：一个已经被 tombstone 的 item 仍然"占着"它最后
+/// 出现过的那个路径，不能被另一个 commit 悄悄接管，见 spec §4.1「删除后
+/// 重建 = 新身份」），只有 `Absent` 才是"没有归属"。
+fn owner_item_id(state: &RemoteState) -> Option<ItemId> {
+    match state {
+        RemoteState::Present { item_id, .. } => Some(*item_id),
+        RemoteState::Tombstoned { item_id, .. } => Some(*item_id),
+        RemoteState::Absent => None,
+    }
+}
+
+/// 读某个 item_id 自己的版本链，取最后一条——C1 修法「parent 从 item 自己
+/// 的最后版本推导，而不是从路径的当前版本」的读取端：`commit`/`tombstone`
+/// 用它做真正的 CAS 比较对象，不再只信路径视角的"当前版本"（那正是 C1
+/// 的漏洞根源：路径视角与 item 视角在正常情况下一致，但对不可信输入
+/// 而言，两者可以被构造成不一致）。
+///
+/// 链文件不存在 → `Ok(None)`（item 从未被创建过，是"待创建"的合法状态，
+/// 不是错误）；链存在但解析失败 → 与 `hub::HubError::CorruptItems` 同一
+/// 严重性，包成 `TransportError::Format` 向上传播（I5：绝不吞掉真损坏）。
+fn read_item_last_version(
+    root: &StorageRoot,
+    item_id: ItemId,
+) -> Result<Option<Version>, TransportError> {
+    let rel = layout::item_path(&item_id);
+    let full = root.path().join(&rel);
+    let text = match fs::read_to_string(&full) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(TransportError::Io {
+                path: full.display().to_string(),
+                reason: e.to_string(),
+            })
+        }
+    };
+    let chain = items::parse_chain(&text).map_err(TransportError::Format)?;
+    Ok(chain.into_iter().next_back())
 }
 
 impl Transport for LocalTransport<'_> {
@@ -105,18 +280,20 @@ impl Transport for LocalTransport<'_> {
     }
 
     fn commit(&self, req: &CommitRequest) -> Result<CommitOutcome, TransportError> {
-        let (current, current_version) = self.current_version_of(&req.path)?;
-        if current_version != req.parent {
-            return Ok(CommitOutcome::Conflict {
-                expected_parent: req.parent.clone(),
-                actual: current,
-            });
-        }
+        // 评审 I3：跨进程排他——见 `arca_store::lock` 模块文档、
+        // `commit_streamed` 同一处注释。
+        let _lock = arca_store::lock::acquire(self.root).map_err(TransportError::Lock)?;
+        let remote = self.read_remote()?;
+        let item_last_version =
+            match validate_commit(self.root, &remote, &req.path, req.item_id, &req.parent)? {
+                Ok(v) => v,
+                Err(outcome) => return Ok(outcome),
+            };
 
         let version = Version {
             version_id: req.version_id.clone(),
             item_id: req.item_id,
-            parent: req.parent.clone(),
+            parent: item_last_version,
             hash: ContentHash::from_bytes(&req.bytes),
             size: req.bytes.len() as u64,
             mtime: req.mtime.clone(),
@@ -138,8 +315,34 @@ impl Transport for LocalTransport<'_> {
     }
 
     fn tombstone(&self, req: &TombstoneRequest) -> Result<CommitOutcome, TransportError> {
-        let (current, current_version) = self.current_version_of(&req.path)?;
-        if current_version.as_ref() != Some(&req.parent) {
+        // 评审 I3：跨进程排他——见 `arca_store::lock` 模块文档、
+        // `commit_streamed` 同一处注释。tombstone 同样是"读当前状态 → CAS
+        // 校验 → 写入（journal + trash + index 清理）"的临界区，需要与
+        // `commit` 互斥同一把锁。
+        let _lock = arca_store::lock::acquire(self.root).map_err(TransportError::Lock)?;
+        let remote = self.read_remote()?;
+        let current = remote
+            .get(&req.path)
+            .cloned()
+            .unwrap_or(RemoteState::Absent);
+
+        // C1 身份校验（评审利用 3：DELETE 带伪造 item_id）：这个路径此刻
+        // 真正的归属必须与客户端声称的 item_id 一致，否则 tombstone 会被
+        // 记到错误的身份名下——I8 的审计闭环要求 journal 里 tombstone 的
+        // item_id 是真的，不是客户端说了算。
+        if let Some(owner) = owner_item_id(&current) {
+            if owner != req.item_id {
+                return Ok(CommitOutcome::IdentityMismatch {
+                    path: req.path.clone(),
+                    claimed_item_id: req.item_id,
+                    actual_item_id: Some(owner),
+                });
+            }
+        }
+
+        let item_last_version =
+            read_item_last_version(self.root, req.item_id)?.map(|v| v.version_id);
+        if item_last_version.as_ref() != Some(&req.parent) {
             return Ok(CommitOutcome::Conflict {
                 expected_parent: Some(req.parent.clone()),
                 actual: current,
@@ -699,5 +902,98 @@ mod tests {
             .recoverable(item_b, ContentHash::from_bytes(b"b-content"))
             .unwrap()
             .is_some());
+    }
+
+    /// 评审 I3 的核心复现：`commit` 完全不依赖调用方额外加锁（`arcad` 的
+    /// `Dataset::write_lock` 是它自己的进程内保护，这里刻意不用——直接模拟
+    /// 两个各自独立打开同一存储根的进程/线程，只靠 `commit` 内部新获取的
+    /// `arca_store::lock` 互斥）。两个线程都相信当前 parent 是 v1、都尝试
+    /// 推进到各自的新版本；`commit` 内部的锁把"读当前状态 → CAS 校验 →
+    /// 写入"整段临界区收窄成互斥的，后进入的线程必然在锁释放后才开始读取，
+    /// 读到的已经是前一个线程写完的新状态——因此结果在调度上是**确定的**：
+    /// 精确一个 `Committed`、一个 `Conflict`，不是"大概率不冲突"。修复前
+    /// （`commit` 内部没有任何锁）这段读-比较-写之间存在真实的竞态窗口，
+    /// 两个线程都可能读到同一个旧 parent、都通过 CAS 比较、都各自写入，
+    /// 后写入的静默覆盖先写入的——这正是 `storage.rs`「`write_lock`」一节
+    /// 描述、但此前只在 `arcad` 单进程内被挡住的那类竞态，本测试证明
+    /// `LocalTransport` 自己（不借助任何调用方的额外锁）现在也挡得住。
+    #[test]
+    fn commit内部的跨进程锁使并发cas竞态结果确定而不静默覆盖() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+
+        let item_id = crate::ids::new_item_id();
+        let v1 = crate::ids::new_version_id();
+        transport
+            .commit(&CommitRequest {
+                path: "race.txt".to_string(),
+                item_id,
+                version_id: v1.clone(),
+                parent: None,
+                bytes: b"v1".to_vec(),
+                mtime: "2026-08-08T09:00:00Z".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+
+        let dir_path = dir.path().to_path_buf();
+        let v2 = crate::ids::new_version_id();
+        let v3 = crate::ids::new_version_id();
+
+        let spawn_racer = |version_id: arca_format::model::VersionId, content: &'static [u8]| {
+            let dir_path = dir_path.clone();
+            let parent = v1.clone();
+            std::thread::spawn(move || {
+                // 各自独立打开存储根——不共享任何进程内对象，模拟两个真正
+                // 独立的调用方（两个 arcad 实例，或 arcad 与并发的
+                // `arca sync`）。
+                let root = StorageRoot::open(&dir_path, None).unwrap();
+                let transport = LocalTransport::new(&root);
+                transport.commit(&CommitRequest {
+                    path: "race.txt".to_string(),
+                    item_id,
+                    version_id,
+                    parent: Some(parent),
+                    bytes: content.to_vec(),
+                    mtime: "2026-08-08T09:00:01Z".to_string(),
+                    actor: actor(),
+                })
+            })
+        };
+
+        let h1 = spawn_racer(v2.clone(), b"from thread 1");
+        let h2 = spawn_racer(v3.clone(), b"from thread 2");
+        let r1 = h1.join().unwrap().unwrap();
+        let r2 = h2.join().unwrap().unwrap();
+
+        let committed_count = [&r1, &r2]
+            .iter()
+            .filter(|o| matches!(o, CommitOutcome::Committed { .. }))
+            .count();
+        let conflict_count = [&r1, &r2]
+            .iter()
+            .filter(|o| matches!(o, CommitOutcome::Conflict { .. }))
+            .count();
+        assert_eq!(
+            committed_count, 1,
+            "并发 CAS 竞态必须恰好一个成功，实得 r1={r1:?} r2={r2:?}"
+        );
+        assert_eq!(
+            conflict_count, 1,
+            "另一个必须被识别为 CAS 冲突（读到了对方已经写完的新状态），\
+             不能两个都成功——那就是静默覆盖：r1={r1:?} r2={r2:?}"
+        );
+
+        // 内容与版本链本身也必须自洽：不管哪个线程赢，最终落地的内容与
+        // items 链尾必须是同一个版本，不能出现"链断裂"或"内容与记录不符"。
+        let final_remote = transport.read_remote().unwrap();
+        match final_remote.get("race.txt") {
+            Some(RemoteState::Present { version_id, .. }) => {
+                assert!(*version_id == v2 || *version_id == v3);
+            }
+            other => panic!("应为 Present，实得 {other:?}"),
+        }
     }
 }

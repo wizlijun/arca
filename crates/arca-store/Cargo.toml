@@ -10,6 +10,7 @@ homepage.workspace = true
 [dependencies]
 arca-format = { path = "../arca-format" }
 arca-chunk = { path = "../arca-chunk" }
+fs4 = "1.1.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"

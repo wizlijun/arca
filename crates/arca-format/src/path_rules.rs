@@ -30,6 +30,20 @@ pub enum PathStatus {
     SegmentTooLong,
     InvalidChar,
     ReservedName,
+    /// 首段是 `.arca`（大小写不敏感）——`<dataset>/.arca/`（vault 侧）与
+    /// `<storage-root>/.arca/`（hub 侧）都是这个名字保留给旁路元数据的
+    /// 目录（`arca_format::hub_layout::layout::ARCA_DIR`），不是受管内容的
+    /// 命名空间。评审 M2b 切片评审 Minor 项：`arcad` 的 `PUT` 此前只做
+    /// 语法解析，没有拒绝这一种，客户端可以用 `PUT files/.arca/x` 在 hub
+    /// 的逃生舱树（`files/`）里凭空造出一个名叫 `.arca` 的子目录——真正的
+    /// 元数据（`<storage-root>/.arca/`）没有被碰、经验证依然完好，但弄脏了
+    /// I1「`files/` 永远是普通文件树」这个承诺：日后若把 `files/` 整体
+    /// 当作逃生舱拷贝出去自行浏览/重新 `adopt`，这个偷渡进来的 `.arca/`
+    /// 会被误当成真正的元数据目录。客户端本地扫描（`arca-cli::scan`）从
+    /// 一开始就跳过 `.arca`，不会产出这种路径，这条规则因此是纯粹的
+    /// 纵深防御，只在"不可信输入"（HTTP `PUT`/`DELETE`）这条路径上真正
+    /// 触发。
+    ReservedArcaDir,
 }
 
 impl PathStatus {
@@ -46,6 +60,7 @@ impl PathStatus {
             PathStatus::SegmentTooLong => "segment_too_long",
             PathStatus::InvalidChar => "invalid_char",
             PathStatus::ReservedName => "reserved_name",
+            PathStatus::ReservedArcaDir => "reserved_arca_dir",
         }
     }
 }
@@ -84,6 +99,15 @@ pub fn check(raw: &str) -> Result<String, PathStatus> {
     let segments: Vec<&str> = normalized.split('/').collect();
     if segments.len() > MAX_PATH_DEPTH {
         return Err(PathStatus::TooDeep);
+    }
+
+    // 首段是保留给旁路元数据的 `.arca`（大小写不敏感，与 Windows/macOS
+    // 默认不区分大小写的文件系统对齐）——见 `PathStatus::ReservedArcaDir`
+    // 文档。只查首段：`.arca` 出现在更深层（用户自己某个工具巧合建的同名
+    // 缓存目录）不会与任何一层的存储根/数据集根元数据目录同名，不在本规则
+    // 覆盖范围内。
+    if segments[0].eq_ignore_ascii_case(".arca") {
+        return Err(PathStatus::ReservedArcaDir);
     }
 
     for segment in &segments {
@@ -195,6 +219,24 @@ mod tests {
         assert_eq!(check("a\nb"), Err(PathStatus::InvalidChar));
         assert_eq!(check("a<b"), Err(PathStatus::InvalidChar));
         assert_eq!(check("a?b"), Err(PathStatus::InvalidChar));
+    }
+
+    /// 评审 M2b 切片评审 Minor 项复现：`PUT files/.arca/x` 此前只经过语法
+    /// 解析就放行，会在 hub 的逃生舱树里凭空造出一个 `.arca` 子目录。
+    #[test]
+    fn 拒绝首段为_arca_大小写不敏感() {
+        assert_eq!(check(".arca/x"), Err(PathStatus::ReservedArcaDir));
+        assert_eq!(check(".ARCA/x"), Err(PathStatus::ReservedArcaDir));
+        assert_eq!(
+            check(".ArCa/nested/path.bin"),
+            Err(PathStatus::ReservedArcaDir)
+        );
+        // 反斜杠/前导 `./` 规范化之后同样命中——不能靠换个分隔符绕过。
+        assert_eq!(check(".arca\\x"), Err(PathStatus::ReservedArcaDir));
+        // 更深层出现同名段不受影响——只查首段。
+        assert_eq!(check("notes/.arca/x").unwrap(), "notes/.arca/x");
+        // 前缀匹配但不是完整段名的合法路径不受影响。
+        assert_eq!(check(".arcaneous/x").unwrap(), ".arcaneous/x");
     }
 
     #[test]

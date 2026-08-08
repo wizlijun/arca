@@ -19,6 +19,7 @@
 
 pub mod atomic;
 pub mod fsck;
+pub mod lock;
 pub mod root;
 
 // TODO(M2)：pub mod txn;      —— .txn 事务日志与前滚/回滚（继承 lazync §4）
