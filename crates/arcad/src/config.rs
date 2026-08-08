@@ -84,7 +84,16 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+// **评审 Minor 项**：`deny_unknown_fields`——修复前两个结构体都没有这道
+// 校验，`hub.toml` 里任何拼错的键（典型例子：把 `[[dataset]]` 误写成
+// `[[datasets]]`，多了一个 `s`）都会被 `toml`/`serde` 静默忽略：`dataset`
+// 字段的 `#[serde(default)]` 让它退化成空 `Vec`，`arcad --check` 因此零个
+// 数据集、零输出、exit 0——运维会以为"配置没问题、就是没数据集"，而不是
+// "配置写错了一个字母"。M2d 计划引入多卷映射后，这类静默面只会更危险
+// （更多字段、更多拼错的机会），这里先把它收紧：任何未识别的键在解析阶段
+// 就报错，不留到运行期才发现"数据集怎么没起来"。
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Wire {
     instance_id: String,
     #[serde(default)]
@@ -92,6 +101,7 @@ struct Wire {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DatasetWire {
     id: String,
     path: PathBuf,
@@ -217,6 +227,40 @@ path = "/srv/arca/notes-2"
             HubConfig::parse(text),
             Err(ConfigError::DuplicateDatasetId { .. })
         ));
+    }
+
+    /// **评审 Minor 攻击重跑**：`[[dataset]]` 误写成 `[[datasets]]`（多了
+    /// 一个 `s`）此前会被 `#[serde(default)]` 的空 `Vec` 静默吞掉——
+    /// `arcad --check` 零输出、exit 0，服务启动后零个数据集，运维毫无
+    /// 察觉。修复后（`deny_unknown_fields`）必须报错，不能悄悄当作"没有
+    /// 数据集"放行。
+    #[test]
+    fn 拒绝拼错的顶层键_datasets多了一个s() {
+        let text = r#"
+instance_id = "0123456789abcdef0123456789abcdef"
+[[datasets]]
+id = "9c41000000000000000000000000abcd"
+path = "/srv/arca/notes"
+"#;
+        let err = HubConfig::parse(text).unwrap_err();
+        assert!(matches!(err, ConfigError::Toml { .. }), "实得 {err:?}");
+    }
+
+    /// 同一纪律延伸到数据集记录内部的字段——`id` 拼成 `ids` 之类同样不该
+    /// 被静默忽略（那会让这条记录在实际语义上"路径没有 id"，但因为
+    /// `id: String` 是必填字段，这种情形本来就会因缺字段而报错；这里额外
+    /// 覆盖的是"多了一个不认识的字段"这种此前会被吞掉的输入）。
+    #[test]
+    fn 拒绝数据集记录里多出的未知字段() {
+        let text = r#"
+instance_id = "0123456789abcdef0123456789abcdef"
+[[dataset]]
+id = "9c41000000000000000000000000abcd"
+path = "/srv/arca/notes"
+extra_unknown_field = "surprise"
+"#;
+        let err = HubConfig::parse(text).unwrap_err();
+        assert!(matches!(err, ConfigError::Toml { .. }), "实得 {err:?}");
     }
 
     #[test]

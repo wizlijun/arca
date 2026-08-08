@@ -221,14 +221,56 @@ fn open_dataset<'a>(
 /// 路径必须先过 `path_rules::check` 才允许拼进文件系统——HTTP 是不可信输入
 /// 的入口（`code=path.rejected`，dispatch 纪律第 3 条 + PROTOCOL.md §1.2
 /// 通用约定）。`Box<Response>`：理由同 [`open_dataset`]。
+/// **评审 Minor 项**：`arca_format::path_rules::check` 放行的相对路径
+/// 上限（`MAX_RELATIVE_PATH_BYTES`，FORMAT.md §2，2048 字节）是格式契约
+/// 数字，改它属于 I10「格式先于代码」管辖，不是本文件能单方面决定的事——
+/// 这里不碰那个常量。但 HTTP 是唯一一个"运维不知道对端存储根挂在多深"
+/// 的入口：一个语法上完全合规的 1699 字节相对路径，与
+/// `<storage-root>/files/` 拼接后，在 macOS 上很容易超过内核的
+/// `PATH_MAX`（1024 字节，`sys/syslimits.h`）——超过之后 `open`/`rename`
+/// 等系统调用直接返回 `ENAMETOOLONG`，这类失败此前被 [`transport_error_response`]/
+/// [`store_write_error_response`] 统一折叠成 `store.corrupt`/500
+/// （`class=needs_human`，暗示"存储根坏了，需要人去修"），但真正的原因是
+/// "这个请求本身在这台机器上物理装不下"——诊断信息完全误导，agent 会去
+/// 跑 `arca fsck`，而不是意识到这个路径需要缩短。
+///
+/// 这里加一道保守的、**只在 HTTP 这一侧生效**的额外闸门：把物理路径最深
+/// 的已知后缀（`.arca/trash/<64 位十六进制>.data`，`trash.rs` 里最长的
+/// 一种）预留出来，只要相对路径本身加上这段预留就超过 `PATH_MAX`，直接
+/// 在触碰文件系统之前拒绝——不去猜测这台机器上存储根具体挂载在多深（那
+/// 是本函数无法知道的部署细节），只保证"即便存储根路径长度是 0，这个
+/// 相对路径本身也已经装不下"这种最坏情况能在语法阶段就被挡住，把
+/// `500 store.corrupt` 变成 `400 path.rejected`——两者判据都是"这个路径
+/// 不可用"，只是这里判断得更早、报告得更准确。`file://`/CLI 直接使用的
+/// `arca_format::path_rules::check`（本函数之外的调用点）不受影响，仍然
+/// 沿用格式契约的 2048 字节上限——本地部署由用户自己控制存储根路径长度，
+/// 不需要 HTTP 这层的保守预留。
+const HTTP_PATH_MAX_CONSERVATIVE: usize = 1024;
+
+/// 已知最长的物理路径后缀模板长度——`.arca/trash/<64 hex>.data`
+/// （`trash.rs::layout` 相关路径中最深的一种），供 [`checked_path`] 预留。
+const LONGEST_PHYSICAL_SUFFIX_BYTES: usize = "/.arca/trash/".len() + 64 + ".data".len();
+
 fn checked_path(raw: &str) -> Result<String, Box<Response>> {
-    path_rules::check(raw).map_err(|status| {
+    let normalized = path_rules::check(raw).map_err(|status| {
         Box::new(error_body(
             StatusCode::BAD_REQUEST,
             "path.rejected",
             format!("路径 {raw:?} 被拒绝：{}", status.as_str()),
         ))
-    })
+    })?;
+    if normalized.len() + LONGEST_PHYSICAL_SUFFIX_BYTES > HTTP_PATH_MAX_CONSERVATIVE {
+        return Err(Box::new(error_body(
+            StatusCode::BAD_REQUEST,
+            "path.rejected",
+            format!(
+                "路径 {raw:?}（{} 字节）超过 HTTP 传输的保守上限——与存储根拼接后\
+                 很可能超出常见文件系统的 PATH_MAX（评审 Minor 项，见 checked_path 文档）",
+                normalized.len()
+            ),
+        )));
+    }
+    Ok(normalized)
 }
 
 /// 取同名头部**恰好一次**出现的值——Minor 修复：`headers.get()` 只返回第一
@@ -1101,7 +1143,24 @@ fn metadata_missing(header: &str) -> Response {
 /// `account`/`device` 留空：设备/账号令牌握手是 §4 的 TODO（`auth.rs`），
 /// M2b 尚未接入认证，这里不伪造身份。
 fn actor_from_headers(headers: &HeaderMap) -> Result<Actor, Box<Response>> {
-    let raw = headers.get("arca-session").and_then(|v| v.to_str().ok());
+    // Minor 修复（评审两条并作一次修）：改用 [`single_header`]，不再用
+    // `headers.get()`——原实现有两处与本文件别处反复强调的"不猜测该信哪个"
+    // 纪律不一致：
+    // 1. 两条矛盾的 `Arca-Session`：`headers.get()` 静默只信第一条，200
+    //    放行；`single_header` 统一当作"未提供有效值"报错。
+    // 2. 非 UTF-8 的 `Arca-Session`：`headers.get(...).and_then(|v|
+    //    v.to_str().ok())` 把 `to_str()` 失败也折叠进 `None`，等价于"当作
+    //    没提供"，记空串放行——但 PROTOCOL.md §1.2 的分类是"提供了但读不懂
+    //    = 非法 = 拒绝"，不是"缺失"；`single_header` 对单条但非 UTF-8 的
+    //    取值同样返回 `Err(())`，这里统一映射成 400，不再悄悄降级成"缺失"。
+    let raw = single_header(headers, "arca-session").map_err(|()| {
+        Box::new(error_body(
+            StatusCode::BAD_REQUEST,
+            "request.session_invalid",
+            "Arca-Session 头出现了多次、或不是合法的 UTF-8——这是单一不透明令牌，\
+             不是可折叠的列表语法，也不能把「读不懂」悄悄当成「没提供」，不猜测该信哪个",
+        ))
+    })?;
     let session = match raw {
         None => String::new(),
         Some("") => String::new(),
@@ -1843,11 +1902,55 @@ fn rename_conflict_response(
 #[derive(Deserialize)]
 struct ChangesQuery {
     since: Option<String>,
-    wait: Option<u64>,
+    /// Minor 修复：字段类型故意是 `String` 不是 `u64`——`axum::extract::Query`
+    /// 对反序列化失败的字段（语法不是数字、或数字超出 `u64` 表示范围）会让
+    /// **整个** `Query<ChangesQuery>` 提取失败，返回 axum 兜底的纯文本 400
+    /// （无 `code` 字段，`HttpTransport` 无从按码分支），而且这个失败发生在
+    /// 本 handler 的任何代码运行之前——连 `since` 自己完全合法都会被
+    /// `wait` 这一个字段的解析失败连累拒绝。用 `String` 接住原始文本，
+    /// 校验/钳制挪到 handler 内部自己做，才能：(1) 统一走本文件的结构化
+    /// `error_body`；(2) 对"数字合法但超过 `u64` 能表示的范围"这种情形
+    /// 按 `PROTOCOL.md` §1.2 的承诺"静默取 90"，而不是报错——`u64::parse`
+    /// 本身分不清"语法根本不是数字"与"是数字但太大装不下"，需要
+    /// `IntErrorKind` 才能区分，见 [`parse_wait`]。
+    wait: Option<String>,
     /// **评审 C1**：省略、非正整数、或超过 [`MAX_CHANGES_LIMIT`] 都静默钳到
     /// [`MAX_CHANGES_LIMIT`]——与 `wait` 越界同一处置纪律（资源上限不是
-    /// 客户端能商量的参数，`PROTOCOL.md` §1.2「`GET .../changes`」）。
-    limit: Option<u64>,
+    /// 客户端能商量的参数，`PROTOCOL.md` §1.2「`GET .../changes`」）。同
+    /// 上一条字段注释的理由，同样用 `String` 接住，不让 `axum::extract::Query`
+    /// 在校验前就整体拒绝。
+    limit: Option<String>,
+}
+
+/// 解析 `wait` 查询参数——**Minor 修复**：区分"语法根本不是非负整数"（400，
+/// `code=request.wait_invalid`）与"是合法的非负整数，只是超出
+/// `u64::MAX`"（`PosOverflow`，按 `PROTOCOL.md` §1.2 的承诺静默取
+/// [`MAX_WAIT_SECS`]，不是错误——数值实在太大本身就等价于"far exceeds the
+/// cap"，两者对后续的 `.min(MAX_WAIT_SECS)` 处置而言结果相同，这里不必真
+/// 构造那个天文数字，直接给一个确定会被钳到上限的哨兵值）。
+fn parse_wait(raw: &Option<String>) -> Result<u64, Box<Response>> {
+    let Some(text) = raw else {
+        return Ok(0);
+    };
+    match text.parse::<u64>() {
+        Ok(v) => Ok(v),
+        Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => Ok(u64::MAX),
+        Err(e) => Err(Box::new(error_body(
+            StatusCode::BAD_REQUEST,
+            "request.wait_invalid",
+            format!("wait {text:?} 不是合法的非负整数：{e}"),
+        ))),
+    }
+}
+
+/// 解析 `limit` 查询参数——**评审 C1** 已经定好的处置纪律「省略、非正
+/// 整数、超过上限都静默钳到默认上限」在这里统一延伸到"语法根本不是数字"
+/// 与"数字大到溢出 `u64`"：两者与"非正整数"同一性质（都不是一个能直接
+/// 采纳的合法取值），没有必要为 `limit` 另外区分出一个 400——它不像
+/// `wait` 那样在 `PROTOCOL.md` 里有"钳制不报错"之外的强调，直接归入
+/// 现有的"钳到默认值"处置最简单，也最不给客户端出乎意料的行为。
+fn parse_limit(raw: &Option<String>) -> Option<u64> {
+    raw.as_ref().and_then(|s| s.parse::<u64>().ok())
 }
 
 /// `GET .../changes` 响应体——**评审 C1**：直接把
@@ -1917,8 +2020,12 @@ async fn get_changes(
     };
 
     // `wait` 钳制到 [0, MAX_WAIT_SECS]——超过上限静默取上限，不报错
-    // （评审 C2 教训的新维度，见 `MAX_WAIT_SECS` 文档）。
-    let requested_wait = query.wait.unwrap_or(0).min(MAX_WAIT_SECS);
+    // （评审 C2 教训的新维度，见 `MAX_WAIT_SECS` 文档；语法不是数字仍是
+    // 400，见 [`parse_wait`] 的处置分野）。
+    let requested_wait = match parse_wait(&query.wait) {
+        Ok(w) => w.min(MAX_WAIT_SECS),
+        Err(resp) => return *resp,
+    };
 
     // longpoll 专属并发上限：只有真正打算挂起等待（`requested_wait > 0`）
     // 才需要占配额；配额已满时不排队等待（排队本身也会长时间占住外层的
@@ -1940,8 +2047,7 @@ async fn get_changes(
     // 文档、`PROTOCOL.md` §1.2「`GET .../changes`」端点表新增的 `limit`
     // 参数。省略、非正整数、超过上限都静默钳到上限，与 `wait` 越界同一
     // 处置纪律。
-    let limit = query
-        .limit
+    let limit = parse_limit(&query.limit)
         .filter(|&l| l > 0)
         .map(|l| l as usize)
         .unwrap_or(MAX_CHANGES_LIMIT)
@@ -2106,6 +2212,19 @@ fn probe_changes(
             None => true,
         };
         if mismatch {
+            return ChangesProbeOutcome::Respond(reset_required_response(cursor_now.as_ref()));
+        }
+
+        // **评审 Minor**：epoch 对得上，但 `seq` 超出数据集此刻实际的末尾——
+        // 这个游标声称见过比服务端当前所知**更多**的事件，服务端没有能力
+        // 诚实地回答"这之后还有什么"，与 epoch 不符是同一种"这个游标服务端
+        // 不认得"的性质，理应走同一处置（410 + `journal.reset_required`）。
+        // 修复前这种情形会 200 返回一个空 `events` 数组、`cursor` 却是
+        // 数据集当前真实的（比客户端声称的 `since.seq` **更小**）游标——
+        // 客户端据此以为"游标该退回到这个更小的值"，与"游标只应该单调
+        // 前进"的调用约定矛盾，也可能诱发反复重拉同一段区间的死循环。
+        let tip_seq = cursor_now.as_ref().map(|c| c.seq).unwrap_or(0);
+        if want.seq > tip_seq {
             return ChangesProbeOutcome::Respond(reset_required_response(cursor_now.as_ref()));
         }
     }
@@ -2350,6 +2469,39 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "path.rejected");
+    }
+
+    /// **评审 Minor 攻击重跑**：一条 1699 字节的相对路径完全符合
+    /// `arca_format::path_rules::check` 的格式契约（2048 字节上限，
+    /// FORMAT.md §2），但与存储根拼接后极容易超出 macOS 内核的
+    /// `PATH_MAX`（1024 字节）——修复前这类请求会一路走到文件系统调用才
+    /// 失败，报 `500 store.corrupt`（暗示"存储根坏了"，实际只是"这个路径
+    /// 在这台机器上装不下"）；修复后必须在触碰文件系统之前就被
+    /// `checked_path` 的保守闸门挡下，报 `400 path.rejected`。
+    #[tokio::test]
+    async fn 超长但格式合规的路径在触碰文件系统前报400而不是500() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        // 8 段、每段 210 字节（低于 MAX_SEGMENT_BYTES=240），总长度约
+        // 1687+7=1694 字节——格式契约允许（< 2048），但远超 HTTP 保守闸门。
+        let long_path = std::iter::repeat_n("a".repeat(210), 8)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(
+            arca_format::path_rules::check(&long_path).is_ok(),
+            "这条路径必须先确认格式层面合法，测的才是 HTTP 这一层额外的保守闸门"
+        );
+
+        let item_id = arca_cli::ids::new_item_id();
+        let version_id = arca_cli::ids::new_version_id();
+        let req = create_request(id, &long_path, item_id, &version_id, b"hello");
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "实得 {resp:?}");
         let body = body_json(resp).await;
         assert_eq!(body["code"], "path.rejected");
     }
@@ -3673,6 +3825,70 @@ mod tests {
         assert!(events.is_empty());
     }
 
+    /// **评审 Minor 攻击重跑**：两条矛盾的 `Arca-Session` 此前会被
+    /// `headers.get()` 静默只信第一条、200 放行——I8 的审计闭环因此可能把
+    /// 一次提交错误地归因到一个客户端声称、但服务端从未真正核验过"这是
+    /// 唯一取值"的会话上。修复后必须整体拒绝，不猜测该信哪一条。
+    #[tokio::test]
+    async fn put重复的arca_session头返回400且不落盘任何内容() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_id = arca_cli::ids::new_item_id();
+        let version_id = arca_cli::ids::new_version_id();
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/v1/datasets/{id}/files/a.txt"))
+            .header("if-none-match", "*")
+            .header("arca-item-id", item_id.to_hex())
+            .header("arca-version-id", version_id.as_str())
+            .header("arca-mtime", "2026-08-08T09:00:00Z")
+            .header("arca-session", "20260808T090000Z-0123456789abcdef")
+            .header("arca-session", "20260808T090000Z-fedcba9876543210")
+            .body(Body::from(b"hello".to_vec()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.session_invalid");
+        assert!(!dir.path().join("files/a.txt").exists());
+    }
+
+    /// **评审 Minor 攻击重跑**：非 UTF-8 的 `Arca-Session` 此前被
+    /// `to_str().ok()` 的 `None` 与"头缺失"折叠成同一种处置（记空串放行）
+    /// ——但 PROTOCOL.md §1.2 的分类是"提供了但读不懂 = 非法 = 拒绝"，不是
+    /// "缺失"。用非法字节序列构造一个无法解析为 UTF-8 字符串的头值。
+    #[tokio::test]
+    async fn put非utf8的arca_session头返回400而不是当作缺失放行() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_id = arca_cli::ids::new_item_id();
+        let version_id = arca_cli::ids::new_version_id();
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/v1/datasets/{id}/files/a.txt"))
+            .header("if-none-match", "*")
+            .header("arca-item-id", item_id.to_hex())
+            .header("arca-version-id", version_id.as_str())
+            .header("arca-mtime", "2026-08-08T09:00:00Z")
+            .body(Body::from(b"hello".to_vec()))
+            .unwrap();
+        req.headers_mut().insert(
+            "arca-session",
+            axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.session_invalid");
+        assert!(!dir.path().join("files/a.txt").exists());
+    }
+
     #[tokio::test]
     async fn delete携带非法arca_session返回400() {
         let dir = tempfile::tempdir().unwrap();
@@ -4159,6 +4375,39 @@ mod tests {
         assert!(body["cursor"].as_str().is_some(), "应给出当前有效游标");
     }
 
+    /// **评审 Minor 攻击重跑**：`since` 的 epoch 正确，但 `seq` 超出数据集
+    /// 此刻实际的末尾（客户端声称见过比服务端还多的事件）——修复前这种
+    /// 情形 200 返回空 `events`，`cursor` 却是一个比客户端已有的 `since`
+    /// **更小**的值（游标"倒退"），与"游标只应单调前进"的调用约定矛盾。
+    /// 修复后必须与 epoch 不符同一处置：410 + `journal.reset_required`。
+    #[tokio::test]
+    async fn changes游标seq超出末尾时返回410而不是倒退的游标() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+        put_once(&app, id, "a.txt", b"a").await;
+
+        // 拿到真实 epoch，但把 seq 声称成远超当前末尾（真实末尾是 1）。
+        let resp = app.clone().oneshot(changes_request(id, "")).await.unwrap();
+        let body = body_json(resp).await;
+        let real_cursor = body["cursor"].as_str().unwrap().to_string();
+        let (epoch, _) = real_cursor.split_once(':').unwrap();
+        let ahead_cursor = format!("{epoch}:999");
+
+        let resp = app
+            .clone()
+            .oneshot(changes_request(id, &format!("since={ahead_cursor}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE, "实得 {resp:?}");
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "journal.reset_required");
+        // 响应体给出的 cursor 必须是数据集当前真实的游标，不是别的什么值——
+        // 客户端据此重新对账后，从这个 cursor 继续增量拉取。
+        assert_eq!(body["cursor"].as_str().unwrap(), real_cursor);
+    }
+
     #[tokio::test]
     async fn changes游标语法非法返回400而不是当成从头开始() {
         let dir = tempfile::tempdir().unwrap();
@@ -4370,6 +4619,57 @@ mod tests {
         let requested = 999_999u64;
         assert_eq!(requested.min(MAX_WAIT_SECS), MAX_WAIT_SECS);
         assert_eq!(MAX_WAIT_SECS, 90, "spec §5.2 挂起区间上界");
+    }
+
+    /// **评审 Minor 攻击重跑**：`wait` 数值合法但超出 `u64::MAX` 表示范围
+    /// 时，此前 `axum::extract::Query<ChangesQuery>`（`wait: Option<u64>`）
+    /// 会在进入本 handler 之前就整体拒绝，返回 axum 兜底的纯文本 400（无
+    /// `code` 字段）——与 `PROTOCOL.md` §1.2 明文承诺的"超过上限不报错、
+    /// 静默取 90"矛盾。修复后必须正常处理为 longpoll（立即返回，因为没有
+    /// 新事件也没有真的等待 90 秒——这里只验证请求本身没有被 400 拒绝，
+    /// 不去真的等 90 秒)。
+    #[tokio::test]
+    async fn changes_wait数值超出u64表示范围时静默钳到上限而不是400() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+        // 先造一条事件——省略 `since` 时诊断的是"这次查询本身有没有被
+        // 400"，不去真的触发一次挂到 90 秒上限的 longpoll（有新事件时
+        // `wait` 取值多大都会立即返回，不影响这里要验证的行为）。
+        put_once(&app, id, "a.txt", b"a").await;
+
+        // 比 u64::MAX 大得多的数字字面量——合法的十进制数字语法，但装不下
+        // u64。
+        let huge = "999999999999999999999999999999999999999999";
+        let resp = app
+            .oneshot(changes_request(id, &format!("wait={huge}")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "数值合法只是溢出，不应该是 400"
+        );
+    }
+
+    /// 与上一条对称：`wait` 语法根本不是数字时，必须是本文件自己的结构化
+    /// 400（带 `code` 字段），不是 axum 兜底的纯文本 400——`HttpTransport`
+    /// 需要 `code` 字段才能按码分支（评审 Minor）。
+    #[tokio::test]
+    async fn changes_wait不是合法数字时返回结构化400而不是axum兜底文本() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let resp = app
+            .oneshot(changes_request(id, "wait=不是数字"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.wait_invalid");
     }
 
     /// longpoll 专属并发上限：超过上限的请求不排队，直接降级为立即返回
