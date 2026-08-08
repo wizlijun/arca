@@ -33,5 +33,6 @@ pub mod scan;
 pub mod status;
 pub mod sync;
 pub mod trace_sink;
+pub mod transport;
 pub mod trash;
 pub mod vault;

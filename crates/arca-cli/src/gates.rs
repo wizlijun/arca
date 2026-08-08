@@ -45,6 +45,7 @@
 //! 运维能看到具体是哪一道拦下的——`GateFailure` 的每个变体逐条可区分，不折叠
 //! 成一个笼统的"删除失败"。
 
+use crate::transport::Transport;
 use crate::trash;
 use arca_chunk::hash::ContentHash;
 use arca_core::state::{BaseState, RemoteState};
@@ -156,33 +157,54 @@ pub fn check_delete(ctx: &DeleteCheck) -> Result<(), GateFailure> {
 }
 
 /// 第 1 道：read_roots 范围。
+///
+/// 委托给 [`read_roots_ok`]——与 [`check_delete_transport`] 共用同一份检查
+/// （M2b Task 1：这三道闸门本就不碰 `&StorageRoot`，评审要求抽掉的只是
+/// 第 4 道，见模块顶部与 `DeleteCheckTransport` 的文档），只是把逻辑本体
+/// 挪成一个不依赖 `DeleteCheck` 具体类型的自由函数，`check_delete` 的既有
+/// 测试不受影响（这里的改动纯是"挪地方"，输入输出行为逐字不变）。
 fn check_read_roots(ctx: &DeleteCheck) -> Result<(), GateFailure> {
-    if ctx.scanned_paths.contains(ctx.path) {
+    read_roots_ok(ctx.path, ctx.scanned_paths)
+}
+
+fn read_roots_ok(path: &str, scanned_paths: &BTreeSet<String>) -> Result<(), GateFailure> {
+    if scanned_paths.contains(path) {
         Ok(())
     } else {
         Err(GateFailure::OutOfReadRoots {
-            path: ctx.path.to_string(),
+            path: path.to_string(),
         })
     }
 }
 
 /// 第 2 道：单点确认——远端必须明确是对这个 `item_id` 的 tombstone。
 fn check_single_point_confirmation(ctx: &DeleteCheck) -> Result<(), GateFailure> {
-    match ctx.remote_state {
-        RemoteState::Tombstoned { item_id, .. } if *item_id == ctx.item_id => Ok(()),
+    single_point_confirmed(ctx.path, ctx.item_id, ctx.remote_state)
+}
+
+fn single_point_confirmed(
+    path: &str,
+    item_id: ItemId,
+    remote_state: &RemoteState,
+) -> Result<(), GateFailure> {
+    match remote_state {
+        RemoteState::Tombstoned {
+            item_id: tombstoned_item,
+            ..
+        } if *tombstoned_item == item_id => Ok(()),
         RemoteState::Tombstoned { .. } => Err(GateFailure::NotSinglePointConfirmed {
-            path: ctx.path.to_string(),
-            item_id: ctx.item_id,
+            path: path.to_string(),
+            item_id,
             remote: "tombstoned_other_item",
         }),
         RemoteState::Absent => Err(GateFailure::NotSinglePointConfirmed {
-            path: ctx.path.to_string(),
-            item_id: ctx.item_id,
+            path: path.to_string(),
+            item_id,
             remote: "absent",
         }),
         RemoteState::Present { .. } => Err(GateFailure::NotSinglePointConfirmed {
-            path: ctx.path.to_string(),
-            item_id: ctx.item_id,
+            path: path.to_string(),
+            item_id,
             remote: "present",
         }),
     }
@@ -194,19 +216,27 @@ fn check_single_point_confirmation(ctx: &DeleteCheck) -> Result<(), GateFailure>
 /// 处理过，"现在没有未同步的修改"这件事本身是成立的，交给调用方的
 /// `fs::remove_file` 去幂等地处理"已经不在"（它本就把 `NotFound` 当无操作）。
 fn check_baseline_consistency(ctx: &DeleteCheck) -> Result<(), GateFailure> {
-    let expected_hash = match ctx.base {
+    baseline_consistent(ctx.path, ctx.dataset_root, ctx.base)
+}
+
+fn baseline_consistent(
+    path: &str,
+    dataset_root: &Path,
+    base: &BaseState,
+) -> Result<(), GateFailure> {
+    let expected_hash = match base {
         BaseState::Present { hash, .. } => *hash,
         BaseState::Absent => {
             // 结构上不应该出现：DeleteLocal 只在 `base=Present` 的格子产生
             // （见 arca_core::reconcile 决策表）。防御性拒绝而不是 panic（I5）。
             return Err(GateFailure::BaselineDrift {
-                path: ctx.path.to_string(),
+                path: path.to_string(),
                 reason: "内部不变量被破坏：DeleteLocal 的执行前提是基线存在".to_string(),
             });
         }
     };
 
-    let local_path = ctx.dataset_root.join(crate::sync::to_native(ctx.path));
+    let local_path = dataset_root.join(crate::sync::to_native(path));
     match fs::read(&local_path) {
         Ok(bytes) => {
             let hash = ContentHash::from_bytes(&bytes);
@@ -214,7 +244,7 @@ fn check_baseline_consistency(ctx: &DeleteCheck) -> Result<(), GateFailure> {
                 Ok(())
             } else {
                 Err(GateFailure::BaselineDrift {
-                    path: ctx.path.to_string(),
+                    path: path.to_string(),
                     reason: "本地内容自调和以来已被修改，与基线哈希不一致".to_string(),
                 })
             }
@@ -264,6 +294,74 @@ fn check_retention(ctx: &DeleteCheck) -> Result<(), GateFailure> {
             path: ctx.path.to_string(),
             item_id: ctx.item_id,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M2b Task 1：第 4 道闸门经 `Transport::recoverable`，不再需要 `&StorageRoot`。
+// ---------------------------------------------------------------------------
+
+/// 一次删除执行前闸门检查所需的全部上下文——[`DeleteCheck`] 的 `Transport`
+/// 版本：`root`/`trash_entries` 两个字段（HTTP 传输下前者没有意义、后者需要
+/// 变成一次远端查询，M2a 切片评审原话）被替换成一个 `transport: &'a dyn
+/// Transport`，第 4 道闸门改问 [`Transport::recoverable`]。
+///
+/// 前三道闸门不碰 `&StorageRoot`，逻辑与 [`DeleteCheck`] 完全共用（见
+/// [`read_roots_ok`]/[`single_point_confirmed`]/[`baseline_consistent`]）——
+/// 这个类型只是给它们换一套字段来源。[`DeleteCheck`]/[`check_delete`] 保持
+/// 原样不动：`gates.rs` 自己的既有测试继续针对它们验证四道闸门的完整行为
+/// （含全部拒绝路径）；本类型是 `sync.rs` 的生产代码路径实际使用的入口
+/// （见其 `Action::DeleteLocal` 分支），两者共享同一份检查逻辑，不会分叉。
+pub struct DeleteCheckTransport<'a> {
+    pub path: &'a str,
+    pub item_id: ItemId,
+    pub scanned_paths: &'a BTreeSet<String>,
+    pub remote_state: &'a RemoteState,
+    pub dataset_root: &'a Path,
+    pub base: &'a BaseState,
+    pub transport: &'a dyn Transport,
+}
+
+/// 依次跑四道闸门的 `Transport` 版本——语义、顺序、拒绝优先级与 [`check_delete`]
+/// 完全一致，唯一区别是第 4 道靠 [`Transport::recoverable`] 而不是直接扫
+/// `.arca/trash/`。
+pub fn check_delete_transport(ctx: &DeleteCheckTransport) -> Result<(), GateFailure> {
+    read_roots_ok(ctx.path, ctx.scanned_paths)?;
+    single_point_confirmed(ctx.path, ctx.item_id, ctx.remote_state)?;
+    baseline_consistent(ctx.path, ctx.dataset_root, ctx.base)?;
+    check_retention_transport(ctx.path, ctx.item_id, ctx.base, ctx.transport)?;
+    Ok(())
+}
+
+/// 第 4 道的 `Transport` 版本：三方哈希核验现在由 [`Transport::recoverable`]
+/// 完成（`local::LocalTransport` 里是同一份"预筛 + 现场重算"逻辑，见其文档），
+/// 这里只负责取期望哈希、解读结果、翻译成 [`GateFailure`]。
+fn check_retention_transport(
+    path: &str,
+    item_id: ItemId,
+    base: &BaseState,
+    transport: &dyn Transport,
+) -> Result<(), GateFailure> {
+    let expected_hash = match base {
+        BaseState::Present { hash, .. } => *hash,
+        BaseState::Absent => {
+            return Err(GateFailure::RetentionMissing {
+                path: path.to_string(),
+                item_id,
+            });
+        }
+    };
+
+    match transport.recoverable(item_id, expected_hash) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(GateFailure::RetentionMissing {
+            path: path.to_string(),
+            item_id,
+        }),
+        Err(e) => Err(GateFailure::Io {
+            path: path.to_string(),
+            reason: e.to_string(),
+        }),
     }
 }
 
@@ -664,6 +762,95 @@ mod tests {
             trash_entries: &trash_entries,
         })
         .unwrap_err();
+        assert!(
+            matches!(err, GateFailure::OutOfReadRoots { .. }),
+            "实得 {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // M2b Task 1：`check_delete_transport`/`DeleteCheckTransport`——同一份
+    // 四道闸门，第 4 道改经 `Transport::recoverable`，不再需要 `&StorageRoot`。
+    // 复用 `搭建全过场景`/`Scene`，只是改用 `LocalTransport` 走查询。
+    // -----------------------------------------------------------------
+
+    impl Scene {
+        fn check_transport(&self) -> Result<(), GateFailure> {
+            let transport = crate::transport::local::LocalTransport::new(&self.root);
+            check_delete_transport(&DeleteCheckTransport {
+                path: "a.png",
+                item_id: self.item_id,
+                scanned_paths: &self.scanned_paths,
+                remote_state: &self.remote_state,
+                dataset_root: &self.dataset_root,
+                base: &self.base,
+                transport: &transport,
+            })
+        }
+    }
+
+    #[test]
+    fn transport版本四道全过时放行删除() {
+        let scene = 搭建全过场景();
+        assert!(scene.check_transport().is_ok());
+    }
+
+    #[test]
+    fn transport版本与直接版本对同一场景给出相同的判定() {
+        // 两条实现路径（`check_delete` 直接扫 `.arca/trash/`、
+        // `check_delete_transport` 经 `Transport::recoverable`）对同一个
+        // "全过"场景必须给出一致的结论——它们本该是同一份逻辑的两种接线。
+        let scene = 搭建全过场景();
+        assert_eq!(scene.check().is_ok(), scene.check_transport().is_ok());
+    }
+
+    #[test]
+    fn transport版本第4道_trash里没有对应内容时拦住() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let dataset_root = dir.path().join("dataset");
+        fs::create_dir_all(&dataset_root).unwrap();
+        fs::write(dataset_root.join("a.png"), b"content").unwrap();
+        // 刻意不调用 move_to_trash——hub 侧从未真正执行过 tombstone 的内容
+        // 移动，只是（假设地）声称远端已经 tombstone。
+
+        let root = open(dir.path());
+        let item_id = ItemId::from_bytes([0x3f; 16]);
+        let base = BaseState::Present {
+            item_id,
+            version_id: version_id(),
+            hash: ContentHash::from_bytes(b"content"),
+            size: 7,
+        };
+        let remote_state = RemoteState::Tombstoned {
+            item_id,
+            version_id: version_id(),
+        };
+        let mut scanned_paths = BTreeSet::new();
+        scanned_paths.insert("a.png".to_string());
+        let transport = crate::transport::local::LocalTransport::new(&root);
+
+        let err = check_delete_transport(&DeleteCheckTransport {
+            path: "a.png",
+            item_id,
+            scanned_paths: &scanned_paths,
+            remote_state: &remote_state,
+            dataset_root: &dataset_root,
+            base: &base,
+            transport: &transport,
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, GateFailure::RetentionMissing { .. }),
+            "实得 {err:?}"
+        );
+    }
+
+    #[test]
+    fn transport版本第1道_路径不在扫描范围内则拦住() {
+        let mut scene = 搭建全过场景();
+        scene.scanned_paths.clear();
+        let err = scene.check_transport().unwrap_err();
         assert!(
             matches!(err, GateFailure::OutOfReadRoots { .. }),
             "实得 {err:?}"

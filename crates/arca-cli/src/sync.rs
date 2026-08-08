@@ -230,15 +230,14 @@ pub fn sync(
     // `arca_store::atomic::Batch` 同一思路，把它们各自的"读一次、批量用"
     // 提到循环之外。
     //
-    // `trash_snapshot`：本次调和开始时 `.arca/trash/` 的一次性快照，喂给
-    // 每一次 `gates::check_delete` 的第 4 道，不再让它自己重新 `read_dir`
-    // 整个回收站目录（`gates.rs` 文档：预筛后仍逐条现场重算 `.data` 哈希，
-    // 省掉的只是目录遍历本身，C2 的安全性不受影响）。跟内容 `batch` 一样，
-    // 这份快照拍摄于循环开始前——本次调和不会有任何路径既是"提交新
-    // tombstone"又是"依赖那条新记录才能通过第 4 道"（同一个 item 的
-    // tombstone 若在本轮才提交，其它设备要看到它至少要等到下一轮
-    // `hub::read_remote`），过时不构成风险。
-    let trash_snapshot = trash::list(root).map_err(SyncError::Trash)?;
+    // `transport`：M2b Task 1 起，第 4 道闸门经 `Transport::recoverable`
+    // （`gates::check_delete_transport`），不再需要 `DeleteCheck` 那种直接
+    // 拿 `&StorageRoot`+`trash_entries` 快照的签名——评审原话：那个签名在
+    // HTTP 传输下会挡路。`transport::local::LocalTransport` 内部把"`.arca/
+    // trash/` 只读一次、循环内复用"这份纪律接管过去（惰性缓存，见其文档），
+    // 效果与旧的 `trash_snapshot` 完全一致，只是职责搬进了 `Transport`
+    // 实现内部，`sync()` 不用再自己操心这件事。
+    let transport = crate::transport::local::LocalTransport::new(root);
 
     // `journal_batch`：本次调和可能提交多条 `TombstoneRemote`，每条都各自
     // 重读+重写整段 journal 是 O(n²)（`journal::AppendBatch` 文档）；这里
@@ -305,17 +304,16 @@ pub fn sync(
             }
 
             Action::DeleteLocal { item_id } => {
-                let check = gates::DeleteCheck {
+                let check = gates::DeleteCheckTransport {
                     path,
                     item_id,
                     scanned_paths: &scanned_paths,
                     remote_state: &remote_state,
                     dataset_root,
                     base: &base,
-                    root,
-                    trash_entries: &trash_snapshot,
+                    transport: &transport,
                 };
-                match gates::check_delete(&check) {
+                match gates::check_delete_transport(&check) {
                     Ok(()) => {
                         let local_path = dataset_root.join(to_native(path));
                         match fs::remove_file(&local_path) {
