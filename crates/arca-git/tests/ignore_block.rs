@@ -33,7 +33,7 @@ fn 受管二进制被忽略而_arca_元数据被追踪() {
     std::fs::create_dir_all(dir.path().join("assets/.arca/client")).unwrap();
     std::fs::write(
         dir.path().join(".gitignore"),
-        arca_git::ignore_block::render(&["assets"]),
+        arca_git::ignore_block::render(&["assets"]).unwrap(),
     )
     .unwrap();
 
@@ -67,7 +67,7 @@ fn 多数据集各自独立生效() {
     std::fs::create_dir_all(dir.path().join("photo/.arca/client")).unwrap();
     std::fs::write(
         dir.path().join(".gitignore"),
-        arca_git::ignore_block::render(&["assets", "photo"]),
+        arca_git::ignore_block::render(&["assets", "photo"]).unwrap(),
     )
     .unwrap();
 
@@ -138,7 +138,7 @@ fn 数据集路径含非_ascii_时反选仍正确() {
     std::fs::create_dir_all(dir.path().join("资料/.arca/client")).unwrap();
     std::fs::write(
         dir.path().join(".gitignore"),
-        arca_git::ignore_block::render(&["资料"]),
+        arca_git::ignore_block::render(&["资料"]).unwrap(),
     )
     .unwrap();
 
@@ -173,7 +173,7 @@ fn check_ignore_写对了不等于_vault_一致_已追踪文件仍被_check_vaul
     // 反选块写对了：这一步先用 task-1 的断言方式确认。
     std::fs::write(
         dir.path().join(".gitignore"),
-        arca_git::ignore_block::render(&["assets"]),
+        arca_git::ignore_block::render(&["assets"]).unwrap(),
     )
     .unwrap();
     let repo = arca_git::repo::Repo::open(dir.path()).unwrap();

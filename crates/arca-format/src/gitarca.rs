@@ -91,6 +91,35 @@ impl Registry {
         &self.dataset
     }
 
+    /// 归一化视图：路径先经 [`crate::path_rules::check`]（与 `validate()` 同一段代码）
+    /// 后再返回，绝不是 `datasets()` 里原样保留的用户书写形式。
+    ///
+    /// **评审 Critical #1 的另一半成因**：`validate()` 算出的归一化路径只用于比较，
+    /// 从不写回 `entry.path`——所以一个 `validate()` 判定合规的路径（例如 Windows
+    /// 上 `path = "assets\sub"`，`path_rules::normalize` 明确把 `\` 当分隔符接受）
+    /// 如果被下游直接当字符串使用（典型场景：拼进 `.gitignore` 反选块），会产出一段
+    /// 实际不生效的规则。调用方（如 `arca-git::ignore_block` 生成反选块）应当优先
+    /// 用这里的输出而不是 `datasets()`。
+    ///
+    /// 这不是唯一防线——`ignore_block::render` 自己也会独立校验（生成器只此一处，
+    /// 不能指望调用方总是先调用这里）；这个方法存在的意义是让"拿到的路径已经是
+    /// 归一化过的"成为默认路径，而不需要每个调用方都重新走一遍 `path_rules::check`。
+    ///
+    /// 路径本身不合规时返回 `Err`（理应已被 `validate()` 挡在更早的阶段；这里独立
+    /// 校验是防御性的，不假设调用方已经 `validate()` 过）。
+    pub fn normalized_datasets(&self) -> Result<Vec<DatasetEntry>, FormatError> {
+        self.dataset
+            .iter()
+            .map(|entry| {
+                let normalized = crate::path_rules::check(&entry.path)?;
+                Ok(DatasetEntry {
+                    path: normalized,
+                    hub: entry.hub.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// spec §4.3.2 的一致性规则：路径本身合规、引用存在、路径唯一、不得嵌套。
     /// 违反即拒绝，绝不静默激活（I5）。
     ///
@@ -268,6 +297,23 @@ hub  = "home"
                     [[dataset]]\npath = \"/etc\"\nhub = \"h\"\n";
         let reg = Registry::parse(text).unwrap();
         assert!(reg.validate().is_err(), "绝对路径必须拒绝");
+    }
+
+    #[test]
+    fn normalized_datasets_把反斜杠归一化而不是原样返回() {
+        // 评审 Critical #1：`validate()` 接受 "assets\sub"（`\` 被当分隔符），
+        // 但只把归一化结果用于比较，不写回 `entry.path`。`normalized_datasets()`
+        // 就是为了让调用方不再需要自己重新走一遍 `path_rules::check`。
+        let text = "schema = 1\n[hub.h]\ninstance_id = \"a\"\nurl = \"u\"\n\
+                    [[dataset]]\npath = \"assets\\\\sub\"\nhub = \"h\"\n";
+        let reg = Registry::parse(text).unwrap();
+        assert!(
+            reg.validate().is_ok(),
+            "反斜杠路径本身合规，应通过 validate"
+        );
+        assert_eq!(reg.datasets()[0].path, "assets\\sub", "原始形式保持不变");
+        let normalized = reg.normalized_datasets().unwrap();
+        assert_eq!(normalized[0].path, "assets/sub", "归一化视图必须用 / 分隔");
     }
 
     #[test]

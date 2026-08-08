@@ -55,7 +55,7 @@ fn 布置受管仓库(dir: &Path) -> (PathBuf, Vec<u8>) {
     std::fs::create_dir_all(dir.join("assets/.arca/client")).unwrap();
     std::fs::write(
         dir.join(".gitignore"),
-        arca_git::ignore_block::render(&["assets"]),
+        arca_git::ignore_block::render(&["assets"]).unwrap(),
     )
     .unwrap();
     std::fs::write(
