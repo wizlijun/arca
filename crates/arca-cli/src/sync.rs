@@ -44,7 +44,7 @@ use arca_format::items;
 use arca_format::model::{Actor, ItemId, Version};
 use arca_format::path_rules;
 use arca_format::trace::TraceSink;
-use arca_store::atomic::{self, AtomicError};
+use arca_store::atomic::{AtomicError, Batch};
 use arca_store::root::StorageRoot;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -139,6 +139,22 @@ pub type SyncActor = Actor;
 /// 若中途失败提前返回，本次运行的基线不落盘，下次重跑会对已经成功上传/下载
 /// 的路径重新决策，但那时远端已经是新内容，`decide` 会给出 `Noop`/
 /// `AdoptBaseline` 而不是重复执行，不构成数据风险，只是多一轮判断。
+///
+/// # 存储根写入走批量提交（M1d 批量归档性能修复）
+///
+/// 一次 `sync` 可能对存储根做成千上万次写入（每个 `Upload` 各自要写
+/// `files/<path>` + 追加 `items/<item_id>.jsonl` + 更新 `index/<key>.json`
+/// 三个文件）。这些写入全部经由同一个 [`arca_store::atomic::Batch`]：文件级
+/// fsync 逐次立即执行（内容持久性不打折扣），目录 fsync 延后到本函数末尾
+/// 的一次 `commit()`——`Batch` 自己按目录去重，去掉的是"同一个目录被
+/// fsync 一万次"这种冗余，不是任何一次真正需要的 fsync（论证见
+/// `arca_store::atomic::Batch` 文档）。
+///
+/// `commit()` 必须在 `baseline.save()` 之前完成并检查结果：`commit` 失败
+/// 意味着本次批次至少有一个目录的落盘确认失败，此时不能保存基线继续声称
+/// "这些路径已经同步成功"（I3）——整个 `sync` 调用按失败上报，下次重跑会
+/// 重新判定这些路径（此时内容已经在存储根，`decide` 会给出 `Noop`/
+/// `AdoptBaseline` 而不是重复上传，不构成数据风险）。
 pub fn sync(
     dataset_root: &Path,
     root: &StorageRoot,
@@ -161,6 +177,8 @@ pub fn sync(
     paths.extend(baseline.iter().map(|(p, _)| p.clone()));
     paths.extend(remote.keys().cloned());
 
+    let mut batch = Batch::new(root);
+
     for (idx, path) in paths.iter().enumerate() {
         let base = baseline.get(path);
         let local = scan_result
@@ -179,6 +197,7 @@ pub fn sync(
                 let new_state = execute_upload(
                     dataset_root,
                     root,
+                    &mut batch,
                     path,
                     &base,
                     &remote_state,
@@ -246,6 +265,11 @@ pub fn sync(
         }
     }
 
+    // 批次收口：本次 sync 触碰过的每个目录 fsync 一次，确认落盘。必须在
+    // `baseline.save` 之前完成——commit 失败就不能保存基线继续声称这些路径
+    // 已经同步成功（见本函数顶部「存储根写入走批量提交」一节，I3）。
+    batch.commit().map_err(SyncError::Atomic)?;
+
     baseline.save(dataset_root).map_err(SyncError::Baseline)?;
     Ok(report)
 }
@@ -255,6 +279,7 @@ pub fn sync(
 fn execute_upload(
     dataset_root: &Path,
     root: &StorageRoot,
+    batch: &mut Batch<'_>,
     path: &str,
     base: &BaseState,
     remote_state: &RemoteState,
@@ -294,11 +319,11 @@ fn execute_upload(
         committed_at: clock::now_rfc3339(),
     };
 
-    append_item_version(root, &version)?;
-    write_index_record(root, path, item_id)?;
+    append_item_version(root, batch, &version)?;
+    write_index_record(batch, path, item_id)?;
 
     let target = format!("{}/{}", layout::FILES_DIR, path);
-    atomic::write(root, &target, &bytes).map_err(SyncError::Atomic)?;
+    batch.write(&target, &bytes).map_err(SyncError::Atomic)?;
 
     Ok(BaseState::Present {
         item_id,
@@ -351,7 +376,11 @@ fn execute_download(
 /// 语义（FORMAT.md §7.1），但 `arca_store::atomic` 只提供整文件原子替换，
 /// 没有原子追加——因此这里是"读现有内容 + 拼接新行 + 整体原子重写"，读到的
 /// 现有内容本身已经是上一次原子写入的产物，不存在半截读到的风险。
-fn append_item_version(root: &StorageRoot, version: &Version) -> Result<(), SyncError> {
+fn append_item_version(
+    root: &StorageRoot,
+    batch: &mut Batch<'_>,
+    version: &Version,
+) -> Result<(), SyncError> {
     let rel = layout::item_path(&version.item_id);
     let full = root.path().join(&rel);
     let mut content = match fs::read_to_string(&full) {
@@ -361,12 +390,14 @@ fn append_item_version(root: &StorageRoot, version: &Version) -> Result<(), Sync
     };
     content.push_str(&items::to_line(version).map_err(SyncError::Format)?);
     content.push('\n');
-    atomic::write(root, &rel, content.as_bytes()).map_err(SyncError::Atomic)
+    batch
+        .write(&rel, content.as_bytes())
+        .map_err(SyncError::Atomic)
 }
 
 /// 整体原子替换 `index/<xx>/<key>.json`（index 记录不是 append-only，见
 /// `arca_format::index` 模块文档）。
-fn write_index_record(root: &StorageRoot, path: &str, item_id: ItemId) -> Result<(), SyncError> {
+fn write_index_record(batch: &mut Batch<'_>, path: &str, item_id: ItemId) -> Result<(), SyncError> {
     let key = path_rules::index_key(path);
     let rel = layout::index_path(&key);
     let record = IndexRecord {
@@ -374,7 +405,9 @@ fn write_index_record(root: &StorageRoot, path: &str, item_id: ItemId) -> Result
         path: path.to_string(),
     };
     let text = record.to_json().map_err(SyncError::Format)?;
-    atomic::write(root, &rel, text.as_bytes()).map_err(SyncError::Atomic)
+    batch
+        .write(&rel, text.as_bytes())
+        .map_err(SyncError::Atomic)
 }
 
 /// 把索引/清单使用的 `/` 分隔路径转成当前平台的 [`PathBuf`]。
