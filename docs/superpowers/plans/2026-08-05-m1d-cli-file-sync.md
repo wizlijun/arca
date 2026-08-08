@@ -126,7 +126,9 @@ trace 失败落盘 · 验收演示。
 **Interfaces:** `hub::{read_remote(root: &StorageRoot) -> Result<BTreeMap<String, RemoteState>, HubError>}`
 
 - 读 `.arca/index/` 得到路径 → item_id，读 `.arca/items/` 得到版本链的当前版本
-- tombstone 的表达：当前版本是 tombstone 记录时产出 `RemoteState::Tombstoned`
+- **tombstone 不在 M1 范围**（执行期修订）：`items/` 的版本链结构上只放 upsert 形状的记录，
+  FORMAT.md §7.2 明文规定 tombstone 只活在 `journal/` 里，而 spec §12.3 把 journal 与 tombstone
+  划进 M2。所以 `read_remote` 只产出 `Present`，`RemoteState::Tombstoned` 保留类型支持但构造不出来
 - **损坏的记录按 I5 报错，不跳过**——这与 fsck 的纪律一致
 - [ ] 测试：健康存储根 · 空存储根 · 损坏的 items · index 与 items 不一致
 
@@ -162,7 +164,7 @@ trace 失败落盘 · 验收演示。
 | `Download{version_id}` | 从存储根读出内容写到本地（`atomic::write`） |
 | `AdoptBaseline{hash, version_id}` | **零传输**，只更新基线 |
 | `DeleteLocal{item_id}` | 移除本地副本（权威副本在 hub） |
-| `TombstoneRemote{item_id, parent}` | 在 `items/` 追加 tombstone 记录 |
+| `TombstoneRemote{item_id, parent}` | **M1 无处落盘**（tombstone 属 M2）——按 I5 如实报告「删除传播属 M2，本轮未执行」，并让退出码反映有未完成的工作。**绝不静默当 no-op** |
 | `Conflict{..}` | **不动数据**，计入报告，退出码非 0 |
 | `NeedsHuman{..}` | **停下**，计入报告，退出码非 0 |
 
