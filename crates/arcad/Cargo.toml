@@ -27,6 +27,7 @@ toml = "1.1.4"
 # 把整份请求体先缓冲进内存）——axum 自身已经传递依赖 futures-util，这里
 # 固定同一版本，不引入新的依赖树分支。
 futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
+base64 = "0.23.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

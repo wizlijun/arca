@@ -37,6 +37,7 @@ use arca_store::root::{MountError, StorageRoot};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use tokio::sync::Notify;
 
 /// 一个数据集在本机的挂载配置 + 写入序列化锁。
 pub struct Dataset {
@@ -47,6 +48,20 @@ pub struct Dataset {
     /// 本就不需要与写入互斥到这个粒度，`arca_store::atomic` 的 rename 本身
     /// 对并发读者是原子可见的）。
     pub write_lock: Mutex<()>,
+    /// M2c Task 3：`GET .../changes` 的 longpoll 唤醒信号——`PUT`/`DELETE`/
+    /// `PUT .../batch` 每次成功写入（真正落盘的 `CommitOutcome::Committed`，
+    /// 不含 `Conflict`/`IdentityMismatch`）后调用
+    /// [`Dataset::notify_changed`]，唤醒所有正挂起在这个数据集上的
+    /// longpoll 请求——不必等它们各自的轮询间隔到期才发现新事件。
+    ///
+    /// 只是"加速发现"，不是唯一的正确性来源：longpoll 循环每次醒来都会
+    /// 重新打开存储根、重新读一遍 journal（`api.rs::get_changes`），所以
+    /// 即便通知丢失（例如变更来自另一个 `arcad` 进程或直接的 `file://`
+    /// 写入，根本不会调用这个方法）、或在没有任何等待者时调用（`Notify`
+    /// 不为此保留信号），挂起的请求最终仍会在下一次轮询周期里发现新事件
+    /// ——`Notify` 只是让"同一个 arcad 实例内的 PUT 唤醒挂起的 GET"这条
+    /// 路径不必等到轮询间隔，不是这个端点正确性的唯一保障。
+    pub changes_notify: Notify,
 }
 
 impl Dataset {
@@ -56,12 +71,31 @@ impl Dataset {
     pub fn open(&self) -> Result<StorageRoot, MountError> {
         StorageRoot::open(&self.root_path, Some(&self.id))
     }
+
+    /// 见 [`Dataset::changes_notify`] 文档——写入成功后调用，唤醒全部当前
+    /// 挂起的 longpoll 等待者。`notify_waiters`（不是 `notify_one`）：一次
+    /// 写入可能与多个客户端各自挂起的 `GET .../changes` 相关，全部唤醒，
+    /// 由它们各自重新判断"对我的游标而言是否真的有新事件"。
+    pub fn notify_changed(&self) {
+        self.changes_notify.notify_waiters();
+    }
 }
 
 /// 全部已配置数据集的只读登记表，按 `dataset_id` 索引。
 pub struct Registry {
     by_id: BTreeMap<String, Dataset>,
+    /// M2c Task 3：longpoll 专属并发上限——独立于 `api.rs::MAX_CONCURRENT_REQUESTS`
+    /// 那个全局请求并发上限，见 `api.rs::get_changes` 与
+    /// `PROTOCOL.md` §1.2「`GET .../changes`：游标失效与 longpoll 的资源
+    /// 上限」。跨全部数据集共享同一份配额（不是每数据集各自一份）——
+    /// 一台 `arcad` 进程的总资源是共享的，隔离目标是"longpoll 不能耗尽
+    /// 全局配额"，不是"每个数据集各自留一份配额"。
+    pub longpoll_semaphore: tokio::sync::Semaphore,
 }
+
+/// 见 [`Registry::longpoll_semaphore`] 文档；数值本身在 `api.rs` 里还有一份
+/// 供响应体/文档引用，这里作为唯一真相源。
+pub const MAX_CONCURRENT_LONGPOLL: usize = 16;
 
 impl Registry {
     /// 从 [`HubConfig`] 构建——不在这里做任何挂载检查（那是每请求 /
@@ -78,11 +112,15 @@ impl Registry {
                         id: d.id.clone(),
                         root_path: d.path.clone(),
                         write_lock: Mutex::new(()),
+                        changes_notify: Notify::new(),
                     },
                 )
             })
             .collect();
-        Registry { by_id }
+        Registry {
+            by_id,
+            longpoll_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_LONGPOLL),
+        }
     }
 
     /// 按 `dataset_id` 查询——`None` 表示这个 id 根本没在 `hub.toml` 里配置过

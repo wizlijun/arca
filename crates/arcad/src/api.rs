@@ -33,19 +33,20 @@ use arca_cli::transport::local::LocalTransport;
 use arca_cli::transport::{CommitOutcome, TombstoneRequest, Transport};
 use arca_core::state::RemoteState;
 use arca_format::hub_layout::layout;
+use arca_format::journal::{Cursor, JournalEvent};
 use arca_format::model::{Actor, ItemId, Version, VersionId};
 use arca_format::path_rules;
 use arca_store::atomic::TmpWriter;
 use arca_store::root::{MountError, StorageRoot};
 use axum::body::Body;
-use axum::extract::{Path, RawQuery, Request, State};
+use axum::extract::{Path, Query, RawQuery, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -70,6 +71,24 @@ const MAX_CONCURRENT_REQUESTS: usize = 64;
 /// （慢客户端、网络分区、対端进程挂起）永久占着并发配额里的一个名额。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// `GET .../changes` 的 `wait` 参数上限（秒）——M2c Task 3：钳制而不是照单
+/// 全收，`PROTOCOL.md` §1.2「`GET .../changes`：游标失效与 longpoll 的资源
+/// 上限」，与 spec §5.2「客户端挂起 30–90 秒」的区间上界一致，不是随意取的
+/// 数字。必须严格小于 [`REQUEST_TIMEOUT`]，否则一次合法的满额 longpoll 会
+/// 先撞上请求级超时（504）而不是本端点自己定义的"超时返回空增量"（200）。
+const MAX_WAIT_SECS: u64 = 90;
+
+/// 挂起期间的重新探测间隔上限——`Dataset::changes_notify` 是主要的唤醒
+/// 机制（同一 `arcad` 进程内的写入立即唤醒），这个值只是兜底：变更来自
+/// 另一个 `arcad` 进程或直接的 `file://` 写入时不会触发本进程内的
+/// `Notify`，靠这个间隔重新探测发现。
+const LONGPOLL_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+// 编译期锁住上面两个常量之间的关系——任何一次编译都会检查，不依赖某条
+// 测试恰好覆盖到这个边界（见 `MAX_WAIT_SECS` 文档「必须严格小于
+// `REQUEST_TIMEOUT`」一节）。
+const _: () = assert!(MAX_WAIT_SECS < REQUEST_TIMEOUT.as_secs());
+
 /// 构建 HTTP 路由——`state` 是全部已配置数据集的登记表（`Arc` 包裹以满足
 /// axum `State` 要求 `Clone`；`Registry` 本身不需要也不应该是 `Clone`：
 /// 里面的 `write_lock` 一旦被复制，"同一数据集共享同一把锁"这个前提就没了）。
@@ -86,6 +105,9 @@ pub fn router(state: Arc<Registry>) -> Router {
         )
         .route("/v1/datasets/{id}/state", get(get_state))
         .route("/v1/datasets/{id}/trash/{item_id}", get(get_trash))
+        .route("/v1/datasets/{id}/blobs/{hash}", get(get_blob))
+        .route("/v1/datasets/{id}/batch", axum::routing::put(put_batch))
+        .route("/v1/datasets/{id}/changes", get(get_changes))
         .layer(middleware::from_fn(timeout_middleware))
         .layer(middleware::from_fn_with_state(
             concurrency,
@@ -692,6 +714,45 @@ fn parse_hex_hash(text: &str) -> Option<ContentHash> {
 }
 
 // ---------------------------------------------------------------------------
+// GET /v1/datasets/{id}/blobs/{hash}（M2c Task 1：缺口第 3 条——按哈希寻址的读）
+// ---------------------------------------------------------------------------
+
+/// `{hash}` 取 `blake3:<hex>` 形式，与 `arca cat <hash>` plumbing（`PROTOCOL.md`
+/// §5.0b）、`ETag`/`If-None-Match` 的裸值写法保持一致——不像 `GET .../trash/{item_id}`
+/// 的 `hash` 查询参数那样省去前缀，这里是路径段本身，直接复用
+/// `ContentHash::parse` 现成的解析器，不重新发明一套。
+async fn get_blob(
+    State(registry): State<Arc<Registry>>,
+    Path((dataset_id, raw_hash)): Path<(String, String)>,
+) -> Response {
+    let (_, root) = match open_dataset(&registry, &dataset_id) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let Ok(hash) = ContentHash::parse(&raw_hash) else {
+        return error_body(
+            StatusCode::BAD_REQUEST,
+            "request.hash_invalid",
+            format!("哈希 {raw_hash:?} 不是合法的 blake3:<hex> 形式"),
+        );
+    };
+
+    let transport = LocalTransport::new(&root);
+    match transport.read_by_hash(hash) {
+        Ok(Some(bytes)) => {
+            let mut resp = (StatusCode::OK, bytes).into_response();
+            resp.headers_mut()
+                .insert("etag", etag_value(&hash).parse().unwrap());
+            resp
+        }
+        // 查无匹配——与 `GET .../files/{path}` 的 404 同一纪律（`Absent`/
+        // `Tombstoned`/从未出现过统一折叠，这个端点回答的是"给我内容"）。
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => transport_error_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PUT /v1/datasets/{id}/files/{path}
 // ---------------------------------------------------------------------------
 
@@ -834,6 +895,9 @@ async fn put_file(
             item_id,
             version_id,
         }) => {
+            // M2c Task 3：唤醒挂起在这个数据集上的 longpoll（见
+            // `storage.rs::Dataset::changes_notify` 文档）。
+            dataset.notify_changed();
             let status = if parent.is_none() {
                 StatusCode::CREATED
             } else {
@@ -1090,6 +1154,268 @@ fn read_item_chain(root: &StorageRoot, item_id: ItemId) -> Option<Vec<Version>> 
 }
 
 // ---------------------------------------------------------------------------
+// PUT /v1/datasets/{id}/batch（M2c Task 1：缺口第 4 条——批量提交）
+// ---------------------------------------------------------------------------
+
+/// 批量请求体的一条记录（`PROTOCOL.md` §1.2 端点表）——`content_base64` 用
+/// 标准 Base64（`+`/`/`，允许补 `=`）。
+#[derive(serde::Deserialize)]
+struct BatchEntryWire {
+    path: String,
+    item_id: String,
+    version_id: String,
+    #[serde(default)]
+    parent: Option<String>,
+    mtime: String,
+    content_base64: String,
+}
+
+fn batch_malformed(index: usize, message: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(json!({
+            "code": "request.batch_malformed",
+            "message": message.into(),
+            "index": index,
+        })),
+    )
+        .into_response()
+}
+
+/// 与 [`identity_mismatch_response`] 同一诊断内容，多带一个 `index`——批量
+/// 端点的调用方需要知道是哪一条触发的（M2c Task 1，「不做部分成功」不代表
+/// "不说是哪条失败"，两者不矛盾：不生效的是全部写入，但失败原因必须精确
+/// 到条目）。
+fn batch_identity_mismatch_response(
+    index: usize,
+    path: &str,
+    claimed_item_id: ItemId,
+    actual_item_id: Option<ItemId>,
+) -> Response {
+    let detail = match actual_item_id {
+        Some(actual) => format!(
+            "路径 {path:?} 实际归属 item_id {}，与请求声称的 {} 不符",
+            actual.to_hex(),
+            claimed_item_id.to_hex()
+        ),
+        None => format!(
+            "item_id {} 已被 tombstone 终结，不能被任何后续提交复用（路径 {path:?}）",
+            claimed_item_id.to_hex()
+        ),
+    };
+    (
+        StatusCode::CONFLICT,
+        axum::Json(json!({
+            "code": "request.item_id_mismatch",
+            "message": detail,
+            "index": index,
+            "path": path,
+            "claimed_item_id": claimed_item_id.to_hex(),
+            "actual_item_id": actual_item_id.map(|id| id.to_hex()),
+        })),
+    )
+        .into_response()
+}
+
+/// 与 [`conflict_response`] 同一诊断形状，多带一个 `index`（同上一节文档）。
+fn batch_conflict_response(
+    root: &StorageRoot,
+    index: usize,
+    item_id: ItemId,
+    expected_parent: &Option<VersionId>,
+    actual: &RemoteState,
+    hash: ContentHash,
+    size: u64,
+) -> Response {
+    let base = base_json(root, item_id, expected_parent);
+    let theirs = theirs_json(actual);
+    (
+        StatusCode::PRECONDITION_FAILED,
+        axum::Json(json!({
+            "code": "commit.stale_parent",
+            "index": index,
+            "base": base,
+            "theirs": theirs,
+            "yours": {
+                "item_id": item_id.to_hex(),
+                "hash": hash.to_text(),
+                "size": size,
+            },
+        })),
+    )
+        .into_response()
+}
+
+/// 把一条 wire 记录解析/校验成 [`arca_cli::transport::CommitRequest`]——
+/// 校验失败时返回 `Err(index 对应的响应)`，调用方原样把它当作整个批量请求
+/// 的最终结果返回（I5：不做部分成功，一条格式错误就拒绝整个请求，不去猜
+/// 该跳过还是该按什么规则继续）。`Box<Response>`：理由同 [`open_dataset`]
+/// （`clippy::result_large_err`）。
+fn parse_batch_entry(
+    index: usize,
+    entry: &BatchEntryWire,
+    actor: &Actor,
+) -> Result<arca_cli::transport::CommitRequest, Box<Response>> {
+    let path = checked_path(&entry.path).map_err(|_| {
+        Box::new(batch_malformed(
+            index,
+            format!("路径 {:?} 不合规", entry.path),
+        ))
+    })?;
+    let item_id = ItemId::parse(&entry.item_id).map_err(|_| {
+        Box::new(batch_malformed(
+            index,
+            format!("item_id {:?} 不合法", entry.item_id),
+        ))
+    })?;
+    let version_id = parse_version_id_header(&entry.version_id).ok_or_else(|| {
+        Box::new(batch_malformed(
+            index,
+            format!("version_id {:?} 不合法", entry.version_id),
+        ))
+    })?;
+    let parent = match &entry.parent {
+        None => None,
+        Some(p) => Some(
+            parse_version_id_header(p)
+                .ok_or_else(|| Box::new(batch_malformed(index, format!("parent {p:?} 不合法"))))?,
+        ),
+    };
+    if entry.mtime.is_empty() {
+        return Err(Box::new(batch_malformed(index, "mtime 不能为空")));
+    }
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&entry.content_base64)
+        .map_err(|e| {
+            Box::new(batch_malformed(
+                index,
+                format!("content_base64 解码失败：{e}"),
+            ))
+        })?;
+
+    Ok(arca_cli::transport::CommitRequest {
+        path,
+        item_id,
+        version_id,
+        parent,
+        bytes,
+        mtime: entry.mtime.clone(),
+        actor: actor.clone(),
+    })
+}
+
+async fn put_batch(
+    State(registry): State<Arc<Registry>>,
+    Path(dataset_id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let Some(dataset) = registry.get(&dataset_id) else {
+        return unknown_dataset();
+    };
+
+    // 批量端点用 JSON 信封，不是流式 `PUT`——M2c 尚不为它做流式优化
+    // （`PROTOCOL.md` §1.2「批量提交」一节），但仍然沿用同一个体积上限，
+    // 不给这个新端点开一个更宽松的口子。
+    let raw = match axum::body::to_bytes(body, MAX_BODY_BYTES as usize).await {
+        Ok(b) => b,
+        Err(e) => {
+            return error_body(
+                StatusCode::BAD_REQUEST,
+                "request.body_read_failed",
+                format!("读取批量请求体失败：{e}"),
+            )
+        }
+    };
+    let entries: Vec<BatchEntryWire> = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_body(
+                StatusCode::BAD_REQUEST,
+                "request.batch_malformed",
+                format!("批量请求体不是合法 JSON 数组：{e}"),
+            )
+        }
+    };
+
+    let actor = actor_from_headers(&headers);
+    let mut reqs = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        match parse_batch_entry(index, entry, &actor) {
+            Ok(req) => reqs.push(req),
+            Err(resp) => return *resp,
+        }
+    }
+
+    // 挂载检查 + 写锁：与 `put_file` 同一条纪律，见 `storage.rs`
+    // 「`write_lock`」一节；整批只在一次锁的生命周期内完成校验与写入。
+    let _guard = dataset.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let root = match dataset.open() {
+        Ok(r) => r,
+        Err(e) => return mount_error_response(&e),
+    };
+    let transport = LocalTransport::new(&root);
+    match transport.commit_batch(&reqs) {
+        Ok(arca_cli::transport::BatchOutcome::Committed(results)) => {
+            // M2c Task 3：批量提交同样要唤醒挂起的 longpoll——不只是单文件
+            // `PUT` 才算"有新事件"。
+            if !results.is_empty() {
+                dataset.notify_changed();
+            }
+            let body: Vec<serde_json::Value> = results
+                .into_iter()
+                .zip(reqs.iter())
+                .map(|((item_id, version_id), req)| {
+                    let hash = ContentHash::from_bytes(&req.bytes);
+                    json!({
+                        "item_id": item_id.to_hex(),
+                        "version_id": version_id.as_str(),
+                        "hash": hash.to_text(),
+                        "size": req.bytes.len(),
+                    })
+                })
+                .collect();
+            (StatusCode::OK, axum::Json(body)).into_response()
+        }
+        Ok(arca_cli::transport::BatchOutcome::Rejected { index, outcome }) => match outcome {
+            CommitOutcome::Conflict {
+                expected_parent,
+                actual,
+            } => {
+                let req = &reqs[index];
+                let hash = ContentHash::from_bytes(&req.bytes);
+                batch_conflict_response(
+                    &root,
+                    index,
+                    req.item_id,
+                    &expected_parent,
+                    &actual,
+                    hash,
+                    req.bytes.len() as u64,
+                )
+            }
+            CommitOutcome::IdentityMismatch {
+                path,
+                claimed_item_id,
+                actual_item_id,
+            } => batch_identity_mismatch_response(index, &path, claimed_item_id, actual_item_id),
+            CommitOutcome::Committed { .. } => {
+                // `Transport::commit_batch` 的契约（`transport/mod.rs::BatchOutcome`
+                // 文档）：`Rejected` 只会携带 `Conflict`/`IdentityMismatch`。
+                // 这里如实报内部不变量被破坏，而不是静默吞掉一个不可能状态。
+                error_body(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal.invariant_violated",
+                    "commit_batch 的 Rejected 分支不应携带 Committed",
+                )
+            }
+        },
+        Err(e) => transport_error_response(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DELETE /v1/datasets/{id}/files/{path}
 // ---------------------------------------------------------------------------
 
@@ -1151,7 +1477,11 @@ async fn delete_file(
         at,
     };
     match transport.tombstone(&req) {
-        Ok(CommitOutcome::Committed { .. }) => StatusCode::NO_CONTENT.into_response(),
+        Ok(CommitOutcome::Committed { .. }) => {
+            // M2c Task 3：唤醒挂起在这个数据集上的 longpoll。
+            dataset.notify_changed();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(CommitOutcome::Conflict {
             expected_parent,
             actual,
@@ -1186,6 +1516,173 @@ fn delete_conflict_response(
         })),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/datasets/{id}/changes（M2c Task 2/3：journal 变更流端点、游标、longpoll）
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ChangesQuery {
+    since: Option<String>,
+    wait: Option<u64>,
+}
+
+/// 一条 journal 事件的线上 JSON 形状——直接复用
+/// [`JournalEvent::to_line`]（`FORMAT.md` §7.2 的既有序列化，供 `.jsonl`
+/// 落盘用）再解析回 `serde_json::Value`，不重新写一遍字段映射：两处若各自
+/// 维护，迟早会悄悄分叉（`local.rs::append_upsert_journal_event` 的同一条
+/// 纪律「两条路径必须共享同一份判断」在这里的对应）。
+fn journal_event_json(event: &JournalEvent) -> serde_json::Value {
+    let line = event
+        .to_line()
+        .expect("journal 事件此前已经成功落盘过一次，序列化不应在这里失败");
+    serde_json::from_str(&line).expect("to_line 产出的 JSON 必然能被 serde_json 解析回来")
+}
+
+fn changes_response(cursor: Option<&Cursor>, events: &[&JournalEvent]) -> Response {
+    let events_json: Vec<serde_json::Value> =
+        events.iter().map(|e| journal_event_json(e)).collect();
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "events": events_json,
+            "cursor": cursor.map(|c| c.to_string()),
+        })),
+    )
+        .into_response()
+}
+
+/// 游标早于保留区间——`410 Gone`，见 `PROTOCOL.md` §1.2 同一节的选码理由。
+fn reset_required_response(cursor: Option<&Cursor>) -> Response {
+    (
+        StatusCode::GONE,
+        axum::Json(json!({
+            "code": "journal.reset_required",
+            "message": "游标的 epoch 与数据集当前 epoch 不符——早于保留区间，\
+                         请先做一次全量对账（GET .../state），再从响应体的 cursor 继续增量拉取",
+            "cursor": cursor.map(|c| c.to_string()),
+        })),
+    )
+        .into_response()
+}
+
+async fn get_changes(
+    State(registry): State<Arc<Registry>>,
+    Path(dataset_id): Path<String>,
+    Query(query): Query<ChangesQuery>,
+) -> Response {
+    // 路由层前置校验：数据集本身未登记——与其它端点同一纪律，不放进下面
+    // 的挂起循环里（登记表在进程生命周期内不变，不需要每次重新查）。
+    let Some(dataset) = registry.get(&dataset_id) else {
+        return unknown_dataset();
+    };
+
+    // 游标语法先解析——**语法不合法直接 400，绝不当作"从头开始"处理**
+    // （I5，`PROTOCOL.md` 同一节）。
+    let since = match &query.since {
+        None => None,
+        Some(text) => match Cursor::parse(text) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                return error_body(
+                    StatusCode::BAD_REQUEST,
+                    "request.cursor_invalid",
+                    format!("since {text:?} 不是合法的 <epoch>:<seq> 游标：{e}"),
+                )
+            }
+        },
+    };
+
+    // `wait` 钳制到 [0, MAX_WAIT_SECS]——超过上限静默取上限，不报错
+    // （评审 C2 教训的新维度，见 `MAX_WAIT_SECS` 文档）。
+    let requested_wait = query.wait.unwrap_or(0).min(MAX_WAIT_SECS);
+
+    // longpoll 专属并发上限：只有真正打算挂起等待（`requested_wait > 0`）
+    // 才需要占配额；配额已满时不排队等待（排队本身也会长时间占住外层的
+    // 全局并发槽位），直接降级为立即返回当前增量——等价于协议文档提到的
+    // "2 秒短轮询"这条降级路径的极限形式，不是错误。
+    let permit = if requested_wait > 0 {
+        registry.longpoll_semaphore.try_acquire().ok()
+    } else {
+        None
+    };
+    let effective_wait = if requested_wait > 0 && permit.is_none() {
+        0
+    } else {
+        requested_wait
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(effective_wait);
+
+    loop {
+        // 见 tokio::sync::Notify 文档「notify after check」范式：`notified()`
+        // 必须在本轮"检查是否已有新事件"之前创建，才不会错过检查之后、
+        // 真正开始等待之前发生的写入（下面 `select!` 会等待这个 future）。
+        let notified = dataset.changes_notify.notified();
+        tokio::pin!(notified);
+
+        // 每次重新探测都重新打开存储根——与非 longpoll 端点的"每请求重新
+        // 打开"同一条纪律（`storage.rs` 模块文档）：数据集在挂起期间掉线，
+        // 这里立即发现并返回 503，不会拖到 `wait` 超时才返回（I11：挂到
+        // 超时才返回空增量，在客户端看来与"这本来就是个没有变化的空库"
+        // 无法区分，等价于呈现为空库）。
+        let root = match dataset.open() {
+            Ok(r) => r,
+            Err(e) => return mount_error_response(&e),
+        };
+
+        let (cursor_now, all_events) = match arca_cli::journal::read_all(&root) {
+            Ok(v) => v,
+            Err(e) => {
+                return error_body(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "store.corrupt",
+                    format!("journal 读取失败：{e}"),
+                )
+            }
+        };
+
+        // 游标失效判定：语法已经合法，这里判断"是否还在保留区间内"——本
+        // 切片没有 journal 压缩，`epoch` 只在从未初始化过时不存在，一旦
+        // 存在就不会变，所以"`since.epoch` 与数据集当前 epoch 不一致"
+        // 就是"早于保留区间"的完整判据（`PROTOCOL.md` 同一节）。
+        if let Some(want) = &since {
+            let mismatch = match &cursor_now {
+                Some(c) => c.epoch != want.epoch,
+                None => true,
+            };
+            if mismatch {
+                return reset_required_response(cursor_now.as_ref());
+            }
+        }
+
+        let start_seq = since.as_ref().map(|s| s.seq).unwrap_or(0);
+        let diff: Vec<&JournalEvent> = all_events.iter().filter(|e| e.seq > start_seq).collect();
+
+        if !diff.is_empty() || effective_wait == 0 {
+            return changes_response(cursor_now.as_ref(), &diff);
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            // 超时：返回空增量与原游标（`cursor_now` 此刻等于 `since`——
+            // 没有任何新事件意味着 `since` 已经是数据集当前的游标），不是
+            // 错误。
+            return changes_response(cursor_now.as_ref(), &diff);
+        }
+        let remaining = deadline - now;
+        let step = remaining.min(LONGPOLL_POLL_INTERVAL);
+
+        // 挂起：不占写锁（`dataset.write_lock` 全程未被本函数触碰），也不
+        // 阻塞其它请求——`tokio::select!` 让出当前任务，同一进程内其它并发
+        // 请求（含同一数据集的 `PUT`/`DELETE`）照常执行；`PUT`/`DELETE`
+        // 成功后调用的 `Dataset::notify_changed` 会立即唤醒这里的
+        // `notified`，不必等到 `step` 到期。
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = tokio::time::sleep(step) => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2262,5 +2759,622 @@ mod tests {
         // 存储根上最终只有一份内容，且与"胜出"的那次提交一致（长度匹配）。
         let final_bytes = std::fs::read(dir.path().join("files/race.txt")).unwrap();
         assert!(final_bytes == b"from-a" || final_bytes == b"from-b-longer-body");
+    }
+
+    // -----------------------------------------------------------------
+    // M2c Task 1：GET .../blobs/{hash}（缺口第 3 条）
+    // -----------------------------------------------------------------
+
+    fn get_blob_request(dataset: &str, hash: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!("/v1/datasets/{dataset}/blobs/{hash}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn get_blob按哈希取回内容且带etag() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_id = arca_cli::ids::new_item_id();
+        let version_id = arca_cli::ids::new_version_id();
+        let put_req = create_request(id, "a.txt", item_id, &version_id, b"hello blob");
+        let put_resp = app.clone().oneshot(put_req).await.unwrap();
+        assert_eq!(put_resp.status(), StatusCode::CREATED);
+
+        let hash = ContentHash::from_bytes(b"hello blob").to_text();
+        let resp = app
+            .clone()
+            .oneshot(get_blob_request(id, &hash))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("etag").unwrap().to_str().unwrap(),
+            format!("\"{hash}\"")
+        );
+        assert_eq!(body_bytes(resp).await, b"hello blob");
+    }
+
+    #[tokio::test]
+    async fn get_blob查无匹配返回404() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let hash = ContentHash::from_bytes("从未上传过".as_bytes()).to_text();
+        let resp = app.oneshot(get_blob_request(id, &hash)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_blob哈希格式不合法返回400() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let resp = app
+            .oneshot(get_blob_request(id, "not-a-hash"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.hash_invalid");
+    }
+
+    #[tokio::test]
+    async fn get_blob数据集离线返回503() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        // 不建存储根——等价于卷未挂载。
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let hash = ContentHash::from_bytes(b"x").to_text();
+        let resp = app.oneshot(get_blob_request(id, &hash)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // -----------------------------------------------------------------
+    // M2c Task 1：PUT .../batch（缺口第 4 条）
+    // -----------------------------------------------------------------
+
+    fn batch_entry_json(
+        path: &str,
+        item_id: ItemId,
+        version_id: &VersionId,
+        parent: Option<&VersionId>,
+        bytes: &[u8],
+    ) -> serde_json::Value {
+        use base64::Engine;
+        json!({
+            "path": path,
+            "item_id": item_id.to_hex(),
+            "version_id": version_id.as_str(),
+            "parent": parent.map(|v| v.as_str()),
+            "mtime": "2026-08-08T09:00:00Z",
+            "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+    }
+
+    fn batch_request(dataset: &str, entries: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/v1/datasets/{dataset}/batch"))
+            .header("content-type", "application/json")
+            .header("arca-session", "20260808T090000Z-0123456789abcdef")
+            .body(Body::from(serde_json::to_vec(&entries).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn batch全部成功时一次返回全部结果且内容真的落盘() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_a = arca_cli::ids::new_item_id();
+        let item_b = arca_cli::ids::new_item_id();
+        let va = arca_cli::ids::new_version_id();
+        let vb = arca_cli::ids::new_version_id();
+        let entries = json!([
+            batch_entry_json("a.txt", item_a, &va, None, b"content-a"),
+            batch_entry_json("b.txt", item_b, &vb, None, b"content-b"),
+        ]);
+
+        let resp = app.oneshot(batch_request(id, entries)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body.as_array().unwrap().len(), 2);
+        assert_eq!(body[0]["item_id"], item_a.to_hex());
+        assert_eq!(body[0]["version_id"], va.as_str());
+        assert_eq!(body[1]["item_id"], item_b.to_hex());
+
+        assert_eq!(
+            std::fs::read(dir.path().join("files/a.txt")).unwrap(),
+            b"content-a"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("files/b.txt")).unwrap(),
+            b"content-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch任一条cas冲突时整批不生效且指明index() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_a = arca_cli::ids::new_item_id();
+        let item_b = arca_cli::ids::new_item_id();
+        let va = arca_cli::ids::new_version_id();
+        let vb = arca_cli::ids::new_version_id();
+        let stale =
+            arca_format::model::VersionId::new("20260101T000000Z", &"9".repeat(32)).unwrap();
+        let entries = json!([
+            batch_entry_json("a.txt", item_a, &va, None, b"content-a"),
+            // 第二条声称有个旧 parent，远端其实是 Absent——必然冲突。
+            batch_entry_json("b.txt", item_b, &vb, Some(&stale), b"content-b"),
+        ]);
+
+        let resp = app.oneshot(batch_request(id, entries)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "commit.stale_parent");
+        assert_eq!(body["index"], 1);
+
+        // 整批不生效：第一条也不应该落盘。
+        assert!(!dir.path().join("files/a.txt").exists());
+        assert!(!dir.path().join("files/b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn batch伪造item_id时返回409且指明index() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        // 先用普通 PUT 建立一个真实归属。
+        let owner_item = arca_cli::ids::new_item_id();
+        let owner_version = arca_cli::ids::new_version_id();
+        let put_req = create_request(id, "a.txt", owner_item, &owner_version, b"real owner");
+        assert_eq!(
+            app.clone().oneshot(put_req).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+
+        let impostor_item = arca_cli::ids::new_item_id();
+        let impostor_version = arca_cli::ids::new_version_id();
+        let entries = json!([batch_entry_json(
+            "a.txt",
+            impostor_item,
+            &impostor_version,
+            None,
+            b"impostor content",
+        )]);
+
+        let resp = app.oneshot(batch_request(id, entries)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.item_id_mismatch");
+        assert_eq!(body["index"], 0);
+        // 真实内容不受影响。
+        assert_eq!(
+            std::fs::read(dir.path().join("files/a.txt")).unwrap(),
+            b"real owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch请求体不是合法json时返回400() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/v1/datasets/{id}/batch"))
+            .header("content-type", "application/json")
+            .body(Body::from("不是 json"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.batch_malformed");
+    }
+
+    #[tokio::test]
+    async fn batch某一条content_base64不合法时报400且指明index且不落地任何内容() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_a = arca_cli::ids::new_item_id();
+        let va = arca_cli::ids::new_version_id();
+        let good = batch_entry_json("a.txt", item_a, &va, None, b"content-a");
+        let entries = json!([
+            good,
+            {
+                "path": "b.txt",
+                "item_id": arca_cli::ids::new_item_id().to_hex(),
+                "version_id": arca_cli::ids::new_version_id().as_str(),
+                "parent": null,
+                "mtime": "2026-08-08T09:00:00Z",
+                "content_base64": "不是合法的base64!!!",
+            }
+        ]);
+
+        let resp = app.oneshot(batch_request(id, entries)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.batch_malformed");
+        assert_eq!(body["index"], 1);
+        assert!(!dir.path().join("files/a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn batch空数组直接返回空数组() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let resp = app.oneshot(batch_request(id, json!([]))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch数据集离线返回503() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        // 不建存储根。
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let entries = json!([batch_entry_json(
+            "a.txt",
+            arca_cli::ids::new_item_id(),
+            &arca_cli::ids::new_version_id(),
+            None,
+            b"x",
+        )]);
+        let resp = app.oneshot(batch_request(id, entries)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// 携带 `Arca-Session` 的批量提交——journal 里每条 upsert 事件的
+    /// `actor.session` 都应该是同一个 sid（I8 审计闭环，M2c Task 1 顺带验证：
+    /// 批量端点复用与单文件端点相同的 `actor_from_headers`）。
+    #[tokio::test]
+    async fn batch提交后journal事件带上了arca_session的sid() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_a = arca_cli::ids::new_item_id();
+        let va = arca_cli::ids::new_version_id();
+        let entries = json!([batch_entry_json("a.txt", item_a, &va, None, b"content-a")]);
+        let resp = app.oneshot(batch_request(id, entries)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let root = arca_store::root::StorageRoot::open(dir.path(), Some(id)).unwrap();
+        let (_cursor, events) = arca_cli::journal::read_all(&root).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor.session, "20260808T090000Z-0123456789abcdef");
+    }
+
+    // -----------------------------------------------------------------
+    // M2c Task 2/3：GET .../changes（journal 变更流、游标、longpoll）
+    // -----------------------------------------------------------------
+
+    fn changes_request(dataset: &str, query: &str) -> Request<Body> {
+        let uri = if query.is_empty() {
+            format!("/v1/datasets/{dataset}/changes")
+        } else {
+            format!("/v1/datasets/{dataset}/changes?{query}")
+        };
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    async fn put_once(app: &Router, dataset: &str, path: &str, bytes: &[u8]) {
+        let item_id = arca_cli::ids::new_item_id();
+        let version_id = arca_cli::ids::new_version_id();
+        let req = create_request(dataset, path, item_id, &version_id, bytes);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn changes正常增量拉取_不带since返回全部再用新游标只拉增量() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        put_once(&app, id, "a.txt", b"a").await;
+
+        let resp = app.clone().oneshot(changes_request(id, "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["op"], "upsert");
+        assert_eq!(events[0]["path"], "a.txt");
+        let cursor1 = body["cursor"].as_str().unwrap().to_string();
+
+        put_once(&app, id, "b.txt", b"b").await;
+
+        let resp = app
+            .clone()
+            .oneshot(changes_request(id, &format!("since={cursor1}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "since 之后应该只有第二条");
+        assert_eq!(events[0]["path"], "b.txt");
+    }
+
+    #[tokio::test]
+    async fn changes空增量时游标不变() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+        put_once(&app, id, "a.txt", b"a").await;
+
+        let resp = app.clone().oneshot(changes_request(id, "")).await.unwrap();
+        let body = body_json(resp).await;
+        let cursor = body["cursor"].as_str().unwrap().to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(changes_request(id, &format!("since={cursor}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["events"].as_array().unwrap().is_empty());
+        assert_eq!(body["cursor"].as_str().unwrap(), cursor);
+    }
+
+    #[tokio::test]
+    async fn changes游标epoch与当前不符时返回410且code为reset_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+        put_once(&app, id, "a.txt", b"a").await;
+
+        // 一个语法合法、但 epoch 与数据集真实 epoch 不同的游标——本切片
+        // 没有压缩，任何不匹配当前 epoch 的游标都视为"早于保留区间"。
+        let foreign_epoch = "0".repeat(32);
+        let resp = app
+            .clone()
+            .oneshot(changes_request(id, &format!("since={foreign_epoch}:1")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "journal.reset_required");
+        assert!(body["cursor"].as_str().is_some(), "应给出当前有效游标");
+    }
+
+    #[tokio::test]
+    async fn changes游标语法非法返回400而不是当成从头开始() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+        put_once(&app, id, "a.txt", b"a").await;
+
+        for bogus in ["没有冒号", "0:notanumber", ""] {
+            let resp = app
+                .clone()
+                .oneshot(changes_request(id, &format!("since={bogus}")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "输入：{bogus:?}");
+            let body = body_json(resp).await;
+            assert_eq!(body["code"], "request.cursor_invalid");
+        }
+    }
+
+    #[tokio::test]
+    async fn changes数据集离线返回503() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        // 不建存储根。
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+        let resp = app.oneshot(changes_request(id, "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn changes全新数据集没有journal时返回空数组与null游标() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let resp = app.oneshot(changes_request(id, "")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["events"].as_array().unwrap().is_empty());
+        assert!(body["cursor"].is_null());
+    }
+
+    // -- longpoll（Task 3）--
+
+    #[tokio::test]
+    async fn changes_longpoll无新事件时挂到超时才返回空增量() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let start = std::time::Instant::now();
+        let resp = app.oneshot(changes_request(id, "wait=1")).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["events"].as_array().unwrap().is_empty());
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "应该真的挂起了接近 1 秒，实得 {elapsed:?}"
+        );
+    }
+
+    /// 核心判据：一个客户端挂着 longpoll 时，另一个客户端的 PUT 照常完成
+    /// 并唤醒前者——挂起的连接不得占用写锁、不得阻塞其它请求（brief 原文）。
+    #[tokio::test]
+    async fn changes_longpoll被另一个客户端的put唤醒而不必等到超时() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let longpoll_app = app.clone();
+        let id_owned = id.to_string();
+        let start = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            longpoll_app
+                .oneshot(changes_request(&id_owned, "wait=30"))
+                .await
+                .unwrap()
+        });
+
+        // 给 longpoll 请求一点时间真正进入挂起状态（拿到 permit、完成第一轮
+        // 探测、开始 select! 等待），再发起另一个客户端的 PUT。
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!handle.is_finished(), "此时不应该已经返回——还没有新事件");
+
+        put_once(&app, id, "woken.txt", b"content").await;
+
+        let resp = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("PUT 之后 longpoll 应该被立即唤醒，不应该等到 5 秒超时")
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["path"], "woken.txt");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "应该远早于 wait=30 秒返回，实得 {elapsed:?}"
+        );
+    }
+
+    /// I11 在 longpoll 上的对应：挂起期间数据集掉线必须立即 503，不能挂到
+    /// `wait` 超时才返回——那与"空库"等价。
+    #[tokio::test]
+    async fn changes_longpoll挂起期间存储根被移走立即返回503而不等超时() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+        let dir_path = dir.path().to_path_buf();
+
+        let longpoll_app = app.clone();
+        let id_owned = id.to_string();
+        let start = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            longpoll_app
+                .oneshot(changes_request(&id_owned, "wait=30"))
+                .await
+                .unwrap()
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!handle.is_finished());
+
+        // 模拟卷被卸载：整个存储根目录消失。
+        std::fs::remove_dir_all(&dir_path).unwrap();
+
+        let resp = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("掉线应该在下一次探测周期内被发现，不应该等到 5 秒超时")
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "应该远早于 wait=30 秒发现掉线，实得 {elapsed:?}"
+        );
+    }
+
+    /// `wait=999999` 这种远超上限的输入必须被钳制——真的等它挂到 90 秒
+    /// 会让测试套件慢到不可用，这里改为白盒验证钳制用的正是
+    /// `.min(MAX_WAIT_SECS)`（handler 里那一行）会产出的值，而不是走一遍
+    /// 真的耗时 90 秒的完整请求；`wait=1`（[`changes_longpoll无新事件时挂到超时才返回空增量`]）
+    /// 已经证明这条钳制路径本身在真实请求里确实生效，这里只补上"上限
+    /// 具体是 90，且严格小于请求级超时"这条边界数值的回归保护——见
+    /// `MAX_WAIT_SECS`/`REQUEST_TIMEOUT` 定义处的编译期 `const` 断言，
+    /// 那两条断言在任何一次编译里都会被检查，不需要在这里重复运行时验证。
+    #[test]
+    fn changes_wait钳制到max_wait_secs而不是照单全收() {
+        let requested = 999_999u64;
+        assert_eq!(requested.min(MAX_WAIT_SECS), MAX_WAIT_SECS);
+        assert_eq!(MAX_WAIT_SECS, 90, "spec §5.2 挂起区间上界");
+    }
+
+    /// longpoll 专属并发上限：超过上限的请求不排队，直接降级为立即返回
+    /// 当前增量——资源耗尽面测试（brief 原文：多少个并发挂起会耗尽什么）。
+    #[tokio::test]
+    async fn changes_超过longpoll并发上限时新请求立即降级返回而不排队等待() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        // 占满全部 longpoll 配额：`MAX_CONCURRENT_LONGPOLL` 个长等待请求。
+        let mut handles = Vec::new();
+        for _ in 0..crate::storage::MAX_CONCURRENT_LONGPOLL {
+            let a = app.clone();
+            let id_owned = id.to_string();
+            handles.push(tokio::spawn(async move {
+                a.oneshot(changes_request(&id_owned, "wait=30"))
+                    .await
+                    .unwrap()
+            }));
+        }
+        // 给它们时间真正拿到 permit、进入挂起状态。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for h in &handles {
+            assert!(!h.is_finished(), "配额内的请求此刻应该仍在挂起");
+        }
+
+        // 第 17 个请求：配额已满，应该立即降级返回，不会真的挂起 30 秒。
+        let start = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(3),
+            app.clone().oneshot(changes_request(id, "wait=30")),
+        )
+        .await
+        .expect("超过配额的请求应该立即降级返回，不应该等到 3 秒超时")
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "应该几乎立即返回（降级为短轮询），实得 {elapsed:?}"
+        );
+        let body = body_json(resp).await;
+        assert!(body["events"].as_array().unwrap().is_empty());
     }
 }

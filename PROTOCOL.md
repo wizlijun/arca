@@ -96,6 +96,9 @@
 | `DELETE /v1/datasets/{id}/files/{path}` | `If-Match: <version_id>` 必需（I4，删除同样是 CAS 提交，没有"仅创建"这种豁免）；`Arca-Item-Id: <item_id>` 必需（单点确认的线上对应：明确对哪个 item 提交 tombstone，闸门第 2 道同一条纪律的服务端版本）；`Arca-Session` | 无 | `204`：tombstone 已提交（`files/<path>` 移入 `.arca/trash/`，服务端同样不得物理销毁，见 M2b Task 5） | `400`：缺 `If-Match`（`code=request.if_match_required`）；`404`：路径此刻不存在，无事可删；`409`：`Arca-Item-Id` 与该路径实际归属不符（`code=request.item_id_mismatch`，评审 C1——挡住伪造 item_id 把 tombstone 记到错误身份名下）；`412`：CAS 冲突；`503`：数据集离线 |
 | `GET /v1/datasets/{id}/state` | `Arca-Session` | 无 | `200`：JSON 数组，每条 `{"path","item_id","version_id","hash","size","state"}`（`state` 为 `"present"` 或 `"tombstoned"`；`tombstoned` 条目没有 `hash`/`size`）——字段命名与 `arca ls --json`（§5.0a）同源，`state` 是新增字段（`ls` 的 M1 输出不含 tombstone，见其模块文档）；按路径 UTF-8 字节序排序，供客户端直接构造 `RemoteState` 集合 | `503`：数据集离线，**绝不返回 `200` 加空数组**（I11） |
 | `GET /v1/datasets/{id}/trash/{item_id}?hash=<blake3-hex>` | `Arca-Session` | 无 | `200`：`{"recoverable":true,"hash":"blake3:...","size":1234}`——`hash`/`size` 是现场重算的结果（三方核验：查询参数带的期望哈希 = `.meta` 记录 = 现场重算，与 `Transport::recoverable(item_id, expected_hash)` 同一签名，见 M2b Task 1） | `400`：`hash` 缺失或格式不合法（`code=request.hash_missing`）；`404`：`{"recoverable":false}`（没有匹配的可取回记录——用 JSON 体而不是空 404，闸门第 4 道的调用方不需要额外分支判断"是不是解析失败"）；`503`：数据集离线 |
+| `GET /v1/datasets/{id}/blobs/{hash}` | `Arca-Session` | 无 | `200`：全量字节，响应头 `ETag`（内容哈希，与请求路径的 `{hash}` 相同）、`Content-Length`——按内容哈希直接寻址，不经过路径/CAS（`arca cat <hash>` 的传输层对应，M2c Task 1；`Transport::read_by_hash` 同一签名）；多个路径共享同一份内容时结果确定（按路径 UTF-8 字节序取第一个命中，与 `arca cat` plumbing 现有算法一致，见 `commands/plumbing.rs::cat_cmd`） | `400`：`{hash}` 不是合法的 `blake3:<hex>` 形式（`code=request.hash_invalid`）；`404`：hub 侧当前没有任何路径的内容匹配这个哈希（`Absent`/`Tombstoned`/从未出现过统一折叠，与 `GET .../files/{path}` 的 404 同一纪律）；`503`：数据集离线 |
+| `PUT /v1/datasets/{id}/batch` | `Content-Type: application/json`；`Arca-Session` | JSON 数组，每条与单个 `PUT .../files/{path}` 的元数据同构：`{"path","item_id","version_id","parent","mtime","content_base64"}`（`parent` 为 `null` 表示仅创建，语义等价单文件的 `If-None-Match: *`；`content_base64` 是这次要落地的原始字节的标准 Base64——批量端点用 JSON 信封而不是多段 `multipart`，字节内联编码是这个信封形状能表达任意内容最简单的方式，M2c 尚不为批量端点做流式优化，见 Task 1 brief「批量提交」一节） | `200`：JSON 数组，与请求顺序一一对应，每条 `{"item_id","version_id","hash","size"}`（全部成功，`Transport::BatchOutcome::Committed` 的线上形状）——**要么整批成功要么整批不生效**（I5：不做"部分成功"，调用方无法据此判断该从哪里重试） | `400`：请求体不是合法 JSON、或某一条缺少必需字段/`content_base64` 不是合法 Base64（`code=request.batch_malformed`，响应体附 `index` 指出哪一条）；`409`：某一条的 `item_id` 与目标路径/该 item 自身版本链归属不符，或已被 tombstone 终结（`code=request.item_id_mismatch`，响应体附 `index`，整批不生效）；`412`：某一条 CAS 冲突（`code=commit.stale_parent`，结构化冲突体见下，附 `index` 指出哪一条，整批不生效——**CAS 仍逐条校验**，见 Task 1 brief）；`503`：数据集离线 |
+| `GET /v1/datasets/{id}/changes?since=<epoch:seq>&wait=<秒>` | `Arca-Session` | 无 | `200`：`{"events":[...],"cursor":"<epoch:seq>"或null}`——`events` 是该游标之后的 journal 事件（`FORMAT.md` §7.2 字段形状，`from`/`hash`/`size` 视 `op` 而定），`cursor` 是可用于下一次 `since` 的新游标（没有任何历史事件时为 `null`）；省略 `since` 等价于"从头开始"；`wait`（秒，可选，默认 0）大于 0 时挂起等待新事件（longpoll，spec §5.2，M2c Task 3），超时仍返回 `200` 与空 `events`+原游标，**不是错误**；服务端把 `wait` 钳制到 `[0, 90]`，超过上限不报错、静默取 90（资源耗尽面，见下） | `400`：`since` 不是合法的 `<epoch:seq>` 语法（`code=request.cursor_invalid`，**不当作"从头开始"处理**，I5：别猜）；`410`：`since` 携带的 `epoch` 与数据集当前 epoch 不符——本切片没有 journal 压缩，`epoch` 只会在（未来的）压缩后轮转，任何不匹配当前 epoch 的游标都视为"早于保留区间"（spec §5.2 `reset_required`），响应体 `{"code":"journal.reset_required","message":"...","cursor":"<当前有效游标>"}`，客户端应据此做一次全量对账，之后从响应体的 `cursor` 继续增量拉取；`503`：数据集离线（**含挂起期间掉线**——longpoll 等待过程中每次重新探测都会重新校验挂载，掉线立即返回 503，不等到 `wait` 超时才发现，I11） |
 
 `GET .../files/{path}` 对 `RemoteState::Tombstoned` 与从未存在过的
 `RemoteState::Absent` 统一报 `404`——都是"这个路径此刻没有可下载的内容"，
@@ -154,6 +157,49 @@
 禁止）。`arcad` 的其它数据集（不同存储根，独立故障域，spec §4.3.2）不受
 影响，照常 `200`。
 
+#### `GET .../changes`：游标失效与 longpoll 的资源上限（M2c Task 2/3）
+
+`since` 缺省即"从头开始"；`since` 提供时先经 `Cursor::parse`（`FORMAT.md` §4：
+`<epoch>:<seq>`，`epoch` 必须是合法的 32 位小写十六进制）——**语法不合法直接
+`400 request.cursor_invalid`，绝不当作"从头开始"处理**（I5：一个解析不出来
+的游标可能是客户端的 bug，也可能是被篡改的输入，"从头开始"是一个静默但影响
+巨大的猜测，不能替客户端做这个决定）。
+
+语法合法之后才谈得上"游标是否还在保留区间内"：本切片没有实现 journal
+压缩（`crates/arcad/src/journal_store.rs` 仍是 M2 之前的骨架），`epoch`
+因此只在数据集的 journal 从未初始化过时不存在，一旦存在就不会变——**任何
+`since.epoch` 与数据集当前 epoch 不一致的游标，都视为"早于保留区间"**
+（`journal.reset_required`，§7 已注册，`class=protocol`），选用 HTTP
+`410 Gone`（RFC 9110 §15.5.11：目标资源不再可用，且这个状态应视为永久）
+——游标指向的正是一个不再可服务的历史位置，语义上比 `409 Conflict`
+更精确，也与 `412`（CAS 的"版本"维度）区分开，不共用同一个状态码。响应体
+带 `cursor` 字段给出数据集当前实际游标，客户端据此先做一次全量对账
+（`GET .../state`），再从这个 `cursor` 继续增量拉取——不是简单地把 `since`
+清空重来，那样会在有历史的数据集上把 `epoch` 都读错。
+
+`wait`：longpoll 挂起的秒数（spec §5.2「客户端挂起 30–90 秒」）。**服务端把
+它钳制到 `[0, 90]`，超过上限不报错、静默取 90**——这是 M2b 评审在 C2
+（单请求 600MB PUT 让 RSS 涨到 1.86GB、无并发上限）之后留下的教训在一个新
+维度上的复现：挂起的连接本身不占大量内存，但**占用连接与等待时长**，一个
+声称 `wait=999999` 的客户端不该让 `arcad` 真的挂一个请求处理线程/任务
+将近 12 天。上限选 90 秒，与 spec 明文的挂起区间上界一致，不是随意选定的
+数字。
+
+挂起期间**每次重新探测新事件都会重新打开、重新校验存储根身份**（与非
+longpoll 端点的"每请求重新打开"是同一条纪律，见 `storage.rs` 模块文档）：
+数据集在挂起期间掉线，下一次探测立即发现并返回 `503`，不会等到 `wait`
+超时才返回——挂到超时才返回空增量，在客户端看来与"这本来就是个没有变化的
+空库"无法区分，等价于 I11 明确禁止的"呈现为空库"。
+
+服务端**另设一个独立于全局并发请求上限（`MAX_CONCURRENT_REQUESTS`）的
+longpoll 并发上限**：一次挂起可能占用一个请求处理槽位长达 90 秒，若不单独
+限制，一批恶意或行为不当的 longpoll 客户端能把全局并发配额全部耗尽，
+连累所有 `PUT`/`GET`/`DELETE`——那正是新引入的资源维度（brief 原文：
+"挂起的连接"）。超过 longpoll 专属上限的请求不排队等待（排队本身也占用
+全局配额，无助于隔离），而是**降级为立即返回当前增量**（可能为空），
+等价于 spec 提到的"2 秒短轮询"这条降级路径的极限形式——不算错误，客户端
+按正常的空增量处理，下一次重试即可。
+
 #### HTTP 状态码 ↔ `code`（§7 表格的 M2 部分，随端点增补，只增不改语义）
 
 | HTTP 状态码 | `code` | 出现在 |
@@ -164,12 +210,16 @@
 | `400` | `request.hash_missing` | `GET .../trash/{item_id}` 缺少或格式不合法的 `hash` 查询参数（含 `hash` 参数重复出现，评审 Minor 项：与"没提供"共用同一诊断） |
 | `400` | `request.item_id_invalid` | `GET .../trash/{item_id}` 的 `item_id` 不是合法的 32 位小写十六进制 |
 | `400` | `request.header_ambiguous` | `Range` 续传的 `If-Match` 重复出现且取值有歧义（评审 Minor 项：`PUT`/`DELETE` 的同类歧义复用 `request.if_match_required`，语义已经是"没有提供有效的单一条件"） |
+| `400` | `request.hash_invalid` | `GET .../blobs/{hash}` 的 `{hash}` 不是合法的 `blake3:<hex>` 形式（M2c Task 1） |
+| `400` | `request.batch_malformed` | `PUT .../batch` 请求体不是合法 JSON，或某一条的路径/`item_id`/`version_id`/`parent`/`mtime` 不合规、或 `content_base64` 不是合法 Base64（M2c Task 1，响应体附 `index`；批量端点用一个码覆盖全部条目级结构问题，不像单文件端点那样为路径单独区分 `path.rejected`——`index` 已经足够定位，不需要额外的码区分维度） |
+| `400` | `request.cursor_invalid` | `GET .../changes` 的 `since` 不是合法的 `<epoch>:<seq>` 语法（M2c Task 2，I5：不当作"从头开始"处理） |
 | `404` | （无 `code`，标准 HTTP 语义已自解释） | 路径/记录此刻不存在 |
-| `409` | `request.item_id_mismatch` | `Arca-Item-Id` 与目标路径/该 item 自身版本链实际归属的身份不符，或该 item_id 已被 tombstone 终结（评审 C1，见 §7 总表） |
-| `412` | `commit.stale_parent` | CAS 冲突，结构化响应体见上；`Range` 续传的 `If-Match` 与当前版本不符时同样用这个 `code`（响应体退化为只带 `theirs`，没有 `base`/`yours`——续传不是一次写入提交，没有这两者的概念） |
+| `409` | `request.item_id_mismatch` | `Arca-Item-Id` 与目标路径/该 item 自身版本链实际归属的身份不符，或该 item_id 已被 tombstone 终结（评审 C1，见 §7 总表）；`PUT .../batch` 某一条命中同一判定时同样用这个 `code`，响应体附 `index` |
+| `410` | `journal.reset_required` | `GET .../changes` 的 `since.epoch` 与数据集当前 epoch 不符——游标早于保留区间（M2c Task 2，spec §5.2） |
+| `412` | `commit.stale_parent` | CAS 冲突，结构化响应体见上；`Range` 续传的 `If-Match` 与当前版本不符时同样用这个 `code`（响应体退化为只带 `theirs`，没有 `base`/`yours`——续传不是一次写入提交，没有这两者的概念）；`PUT .../batch` 某一条 CAS 冲突时同样用这个 `code`，响应体附 `index`，整批不生效 |
 | `413` | `request.body_too_large` | `PUT` 请求体超过体积上限（评审 C2：流式接收，累计超限即中止，不等请求体收完） |
 | `500` | `store.corrupt` | `arcad` 已通过挂载检查、请求本身也合法，但从存储层拿到失败——链断裂、内容缺失、索引/journal 解析失败等（评审 I2，见 §7 总表） |
-| `503` | `mount.absent` / `mount.identity_mismatch` | 数据集离线（I11） |
+| `503` | `mount.absent` / `mount.identity_mismatch` | 数据集离线（I11），含 `GET .../changes` 挂起期间掉线（立即返回，不等 `wait` 超时） |
 | `504` | （无 `code`，标准 HTTP 语义已自解释） | 单次请求处理超时（评审 C2，传输层兜底，不是本节定义的业务失败） |
 
 `request.if_match_required`/`request.metadata_missing`/`request.hash_missing`/
@@ -178,8 +228,11 @@
 的瞬时故障，也不是协议层的正常冲突）——按 §7 的既有登记纪律补进那张总表；
 `request.item_id_mismatch`/`store.corrupt`/`request.body_too_large`/
 `request.body_read_failed` 随 M2b 切片评审的 C1/C2/I2 修复补入总表，同样
-`class=needs_human`。本表只覆盖本节定义的五个端点；longpoll/SSE/游标（M2c）
-与更多端点落地时继续增补，不改动已登记条目的语义（I10）。
+`class=needs_human`。`request.hash_invalid`/`request.batch_malformed`/
+`request.cursor_invalid` 随 M2c Task 1/2 补入，同样 `class=needs_human`；
+`journal.reset_required` 早已在 §7 登记（`class=protocol`），本节只是把它
+接到具体的 HTTP 状态码上。longpoll/SSE（`Content-Type: text/event-stream`
+的 agent 场景）与更多端点落地时继续增补，不改动已登记条目的语义（I10）。
 
 **实现落地时对本节文本未明确覆盖的两处分支做了最小一致延伸**
 （`crates/arcad/src/api.rs`，M2b Task 5）：
@@ -205,7 +258,19 @@
 
 - append-only、`epoch:seq` 游标、压缩后 `reset_required` 全量对账兜底。
 - 每个事件带 actor（账号 + 设备/agent + 会话，I8）。
-- TODO：事件类型表与序列化。
+- 事件类型表、序列化、线上端点（`GET .../changes`）、游标失效与 longpoll
+  的完整定义见 §1.2「`GET .../changes`：游标失效与 longpoll 的资源上限」
+  （M2c Task 2/3）——不在本节重复，本节只记录一条本切片顺带补齐的落地前提：
+
+  **`upsert` 事件现在由 `commit`/`commit_streamed`/`commit_batch` 落盘时一并
+  写入**（`crates/arca-cli/src/transport/local.rs`，M2c Task 1）。M2a 只让
+  `tombstone` 写 journal（删除传播闸门当时唯一的消费者），`commit` 落地一个
+  新版本从未写过 `Op::Upsert` 事件——这在 M2a/M2b 语境下无害（`hub::read_remote`
+  从 `items/`/`index/` 直接推导 `Present` 状态，不依赖 journal），但本切片
+  新增的"变更流"端点如果只回放 tombstone/rename，客户端能看到删除却看不到
+  新增/修改，长轮询就失去了存在的意义。这是 Task 1「补 trait」范围之外、
+  但支撑 Task 2/3 成立的必要前提，随 Task 1 一并补上，不新增磁盘格式
+  （`Op::Upsert` 早已在 `FORMAT.md` §7.2 定义，只是此前从未被写入端触发）。
 
 ## 4. 认证与令牌
 
