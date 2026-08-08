@@ -86,7 +86,7 @@ dataset_root/
     ├── chunks/<xx>/<hash>.zst      ← 见 §8
     ├── journal/epoch               ← 单行文本：当前 epoch 标识（32 位十六进制）
     ├── journal/<epoch>.jsonl       ← 见 §7.2
-    ├── trash/                      ← M2 定义
+    ├── trash/                      ← 见 §7.3（M2a 定稿）
     ├── uploads/                    ← M2 定义
     ├── tmp/                        ← 写入暂存；孤儿普通文件可安全清除，
     │                                  出现符号链接或目录则启动失败（绝不递归删除）
@@ -181,6 +181,39 @@ hub 侧两条 append-only 事件流，均为 JSON Lines（§1）。
 与 §7.1 items 版本链相同的处置纪律，直接继承自 lazync STORAGE.md §Incremental Change Journal
 （该节描述的正是 lazync 侧 `journal.bin` 的截断行为，是这条纪律真正的出处；
 arca 把它同时用于 journal 与 items 版本链）。
+
+### 7.3 trash 记录
+
+`trash/<trash_id>.data` + `trash/<trash_id>.meta`——tombstone 执行时从 `files/<path>`
+**移动**（rename，同一文件系统天然原子，绝不 copy+unlink）到这里的内容与其描述
+记录。这不是销毁（I3）：删除 = tombstone，物理销毁只经显式 `arca gc`；本节两个
+文件都只是把内容从 `files/` 逃生舱挪到旁路存储，保留期内可通过 `arca restore`
+整体找回。
+
+`trash_id`：32 位小写十六进制，创建时分配、永不复用——与 `item_id` 同一编码与
+分配纪律（§1）。
+
+`trash/<trash_id>.data`：原始字节，原样保留，不做二次编码/压缩——保留期内随时
+可能被 `arca restore` 整体搬回 `files/`，不值得为一个通常很快就会被还原或到期
+清理的临时态引入额外的编解码开销。
+
+`trash/<trash_id>.meta`：JSON，单行：
+
+```json
+{"v":1,"path":"京都/鸭川.png","item_id":"3f2a000000000000000000000000beef","deleted_at":"2026-08-04T11:00:00Z"}
+```
+
+`path`：移入回收站前的逻辑路径（与该次 tombstone 对应的 journal 事件 `path` 字段
+一致）；`item_id`：该路径对应的身份；`deleted_at`：移入回收站的时刻（RFC 3339）。
+
+写入顺序：`.data` 先落地（rename）、`.meta` 后写——与 §6 index 记录"内容先于
+指针发布"同一条纪律：崩溃可能留下一个没有 `.meta` 的孤儿 `.data`（内容仍在，
+只是暂时找不到它对应哪个路径，无害，可诊断），但绝不会留下一个指向不存在
+内容的 `.meta`。
+
+保留期由更高层策略决定（M2 后续切片，默认值见 spec §7）；本节只定义两个文件
+各自的格式，不定义保留期到期后的清理流程——物理销毁只经显式 `arca gc`（I3），
+不在本节范围内。
 
 ## 8. chunks 块存储
 
@@ -507,8 +540,8 @@ trace 丢了事实仍完整存在于二者中。给每条 trace 上 fsync 会让
 
 - **Unicode 规范化不做转换**（见 §2）：v1 按字节原样保存与比较路径，
   macOS 的 NFD 与其他平台的 NFC 会被视为不同路径。已知边界，v2 议题。
-- **引用计数与 `trash/` / `uploads/` / `locks/` 格式待 M2**：本文件只固定了它们的目录名与用途，
-  未固定字节级格式。
+- **引用计数与 `uploads/` / `locks/` 格式待 M2**：本文件只固定了它们的目录名与用途，
+  未固定字节级格式。`trash/` 的字节级格式已在 §7.3 定稿（M2a）。
 - **逃生舱恢复演示依赖 `b3sum`**（BLAKE3 官方 CLI），严格意义上不属于 coreutils——
   I1 的承诺是"不需要任何 arca 代码"，而非"只用 coreutils"，此处按前者执行并明示。
 - **trace 不定义 `thread` 字段**（§10）：arca-core 是单线程状态机，边缘的并发以 `region` 表达。

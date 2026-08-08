@@ -9,33 +9,41 @@
 //! 上传/删除），遇到第一条读不懂的记录就必须整体停下——继续拿着不完整、
 //! 已知有问题的远端视图去调和，比停下报告更危险。
 //!
-//! # 本函数结构上产不出 `RemoteState::Tombstoned`——这是已知的、刻意的缺口
+//! # 现在如何产出 `RemoteState::Tombstoned`（M2a tombstone 计划 Task 3）
 //!
 //! `arca_format::items` 的版本链**只记录 upsert 形状的记录**：FORMAT.md
 //! §7.2 明文规定 `tombstone`/`rename` 都不在 `items/<item_id>.jsonl` 产生新
 //! 版本（`version_id` 沿用改动前最后一个存活版本的 id），tombstone 的权威记录
-//! 只存在于 `journal/<epoch>.jsonl` 的 `op:"tombstone"` 事件里。而 spec §12.3
-//! 的里程碑表把 `tombstone` 与 `journal+longpoll` 明确划进 **M2**，不在 M1
-//! 范围内。所以 `read_remote` 目前的两个数据源（`index/` + `items/`）**结构上
-//! 就无法分辨**「这个路径被删除了」与「这个路径从来没有过」——两者在
-//! `index/` 里都表现为"没有这条记录"。
+//! 只存在于 `journal/<epoch>.jsonl` 的 `op:"tombstone"` 事件里——所以只靠
+//! `index/`+`items/` 这两个数据源，结构上分辨不出「这个路径被删除了」与
+//! 「这个路径从来没有过」，M1 因此把 `RemoteState::Tombstoned` 留成一个
+//! 刻意保留、当时不可达的变体（`arca_core::reconcile` 决策表依赖它的分支
+//! 完整写好并被属性测试覆盖，只是没有任何调用方能喂出这个输入）。
 //!
-//! 这个缺口是刻意保留、不是遗漏：`arca_core::state::RemoteState::Tombstoned`
-//! 这个变体、以及 `arca_core::reconcile` 决策表里依赖它的分支（`DeleteLocal`、
-//! `Conflict{modify_vs_delete}` 等）**完整保留、不做任何删减**——M2 把 journal
-//! 接上之后，`read_remote` 只需要新增"该路径最近一次 journal 事件是否是
-//! tombstone"这一步判断，不需要改 `arca-core` 一个字节。
+//! 本函数现在多读一处：整段 journal（`crate::journal::read_all`），算出
+//! 「每个 `item_id` 最后一条事件是不是 tombstone」，据此在结果里插入
+//! `RemoteState::Tombstoned`——`arca-core` 一行都不用改，这正是当初把决策
+//! 与执行分开的收益。
 //!
-//! **连带后果（读这段的人，大概率是在写 Task 6 的 `sync`，请一并处理）：**
-//! 因为 `read_remote` 永远不产出 `Tombstoned`，"远端删除"不会传播到本地——
-//! 本地会一直认为那个文件还在。反过来，"本地删除"这一侧不受影响，三态仍是
-//! `(base=present, local=absent, remote=present)`，决策表照常给出
-//! `Action::TombstoneRemote{parent}`；但 M1 的 `items/<item_id>.jsonl` 里
-//! 没有任何地方可以承载一条 tombstone 记录（上面已经说明为什么），也就是说
-//! **M1 没有落盘 `TombstoneRemote` 的地方**。`sync`（Task 6）对这个 `Action`
-//! 绝不能悄悄当 no-op 处理——按 I5，能力缺失要如实报告：本轮应把它记为
-//! 「删除传播属 M2，本轮未执行」，并让 `arca sync` 的退出码反映出有未完成的
-//! 工作，而不是安静退出、让用户以为删除已经生效。
+//! # 两种「这个路径被 tombstone 了」的磁盘证据，一律优先信 journal
+//!
+//! - **`index/` 记录已经被清理**（tombstone 执行的一部分，本切片不实现
+//!   执行本身，由后续 M2a 切片补上）：这个路径压根不出现在 `index/` 里，
+//!   只能靠 journal 才知道它曾经存在过、现在被删了——本函数在遍历完
+//!   `index/` 之后，为每个「最后一条事件是 tombstone、且它记录的路径当前
+//!   没有存活 index 记录认领」的 item 补一条 `Tombstoned`。
+//! - **`index/` 记录还没被清理**（tombstone 执行落在清理 `index/` 之前的
+//!   崩溃窗口，或那一步压根还没实现）：这个路径仍有一条指向该 item 的
+//!   index 记录，若继续走旧逻辑（读 items 链 + 探测 `files/` 内容），会因为
+//!   内容已经被移进 `.arca/trash/`（`crate::trash::move_to_trash`）而报
+//!   `HubError::MissingContent`——那是把"刚执行完 tombstone"误诊断成
+//!   "存储根损坏"。所以本函数现在**先查这条 index 记录的 `item_id` 是否
+//!   已被 journal 判定为 tombstone，查到就直接产出 `Tombstoned`，根本不去
+//!   碰 `files/`**；`index/` 记录本身是否已被清理不影响这个判断的正确性。
+//!
+//! 一个路径先后被多个 item 占用（删除后用同名路径新建、又再次删除）时，
+//! 以 journal 里 **`seq` 更大**（更晚）的那条 tombstone 为准——旧 item 的
+//! tombstone 是历史，不应该盖过路径的当前归属。
 //!
 //! # `RemoteState::Present` 必须以 `files/<path>` 实际存在为前提（评审 Critical #1）
 //!
@@ -58,6 +66,8 @@ use arca_core::state::RemoteState;
 use arca_format::hub_layout::layout;
 use arca_format::index::IndexRecord;
 use arca_format::items;
+use arca_format::journal::{JournalEvent, Op};
+use arca_format::model::{ItemId, VersionId};
 use arca_store::root::StorageRoot;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -86,6 +96,9 @@ pub enum HubError {
     /// 读取 `.arca/index/`、`.arca/items/` 或 `files/` 目录本身失败，且不是
     /// "目录不存在"（真正的 IO 故障：权限、路径某一级类型不对等）。
     Io { path: String, reason: String },
+    /// 读 journal（用于判断某个 item 是否已被 tombstone）失败——journal 是
+    /// 真相源，读错等于伪造历史，见 `crate::journal` 的损坏处置纪律。
+    Journal(crate::journal::JournalError),
 }
 
 impl fmt::Display for HubError {
@@ -107,17 +120,69 @@ impl fmt::Display for HubError {
                  存储根损坏，绝不当作\"文件不存在\"静默处理"
             ),
             HubError::Io { path, reason } => write!(f, "读取 {path} 失败：{reason}"),
+            HubError::Journal(e) => write!(f, "读取 journal 失败：{e}"),
         }
     }
 }
 
-impl std::error::Error for HubError {}
+impl std::error::Error for HubError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            HubError::Journal(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 fn io_err(path: &Path, e: io::Error) -> HubError {
     HubError::Io {
         path: path.display().to_string(),
         reason: e.to_string(),
     }
+}
+
+/// 一个 item 最后一条 journal 事件若是 tombstone，这里记下判断
+/// `RemoteState::Tombstoned` 与解决"同一路径被多个 item 先后占用"所需的全部
+/// 信息。`seq` 只用于跨 item 比较新旧，不出现在最终的 `RemoteState` 里。
+#[derive(Debug, Clone)]
+struct TombstoneInfo {
+    item_id: ItemId,
+    version_id: VersionId,
+    path: String,
+    seq: u64,
+}
+
+/// 读整段 journal，算出「每个 `item_id` 最后一条事件是不是 tombstone」。
+///
+/// journal 事件按 `seq` 单调递增追加（`crate::journal::read_all` 已经保证
+/// 这一点），所以只需按顺序遍历、对同一个 `item_id` 反复覆盖，最后留下的
+/// 自然就是最后一条事件——不需要额外排序。一个 `item_id` 一旦 tombstone，
+/// 它的血脉就此终结（spec §4.1：删除后重建 = 新身份，走全新 `item_id`），
+/// 不存在"后来又被 upsert 复活"的情形，所以这里"最后一条是不是 tombstone"
+/// 足以唯一确定这个 item 的终态。
+fn tombstoned_by_item(events: &[JournalEvent]) -> BTreeMap<ItemId, TombstoneInfo> {
+    let mut last_by_item: BTreeMap<ItemId, &JournalEvent> = BTreeMap::new();
+    for event in events {
+        last_by_item.insert(event.item_id, event);
+    }
+    last_by_item
+        .into_iter()
+        .filter_map(|(item_id, event)| {
+            if event.op == Op::Tombstone {
+                Some((
+                    item_id,
+                    TombstoneInfo {
+                        item_id,
+                        version_id: event.version_id.clone(),
+                        path: event.path.clone(),
+                        seq: event.seq,
+                    },
+                ))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// 从一个已打开、身份已确认的存储根读出「每个当前受管路径的远端状态」。
@@ -127,9 +192,14 @@ fn io_err(path: &Path, e: io::Error) -> HubError {
 /// `arca_core::state::RemoteState`）。产出按路径排序的 `BTreeMap`：同一存储根
 /// 状态两次调用必须得到同一份结果。
 ///
-/// **不产出 `RemoteState::Tombstoned`**——原因与连带后果见模块顶部 doc comment。
+/// **现在会产出 `RemoteState::Tombstoned`**——做法与两种磁盘证据的优先级见
+/// 模块顶部 doc comment。
 pub fn read_remote(root: &StorageRoot) -> Result<BTreeMap<String, RemoteState>, HubError> {
+    let (_cursor, journal_events) = crate::journal::read_all(root).map_err(HubError::Journal)?;
+    let tombstoned = tombstoned_by_item(&journal_events);
+
     let mut result = BTreeMap::new();
+    let mut claimed_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let index_dir = root.path().join(layout::INDEX_DIR);
 
     for shard in read_dir_sorted(&index_dir)? {
@@ -139,10 +209,50 @@ pub fn read_remote(root: &StorageRoot) -> Result<BTreeMap<String, RemoteState>, 
                 path: record_path.display().to_string(),
                 reason: e.to_string(),
             })?;
-            let state = read_current_version(root, &record)?;
+            claimed_paths.insert(record.path.clone());
+
+            let state = if let Some(info) = tombstoned.get(&record.item_id) {
+                // index/ 记录还没被清理（tombstone 执行落在清理之前的崩溃
+                // 窗口，或那一步还没实现）——journal 说了算，绝不去碰
+                // files/（内容已经被移进 .arca/trash/，探测会误报
+                // MissingContent，见模块顶部 doc comment）。
+                RemoteState::Tombstoned {
+                    item_id: info.item_id,
+                    version_id: info.version_id.clone(),
+                }
+            } else {
+                read_current_version(root, &record)?
+            };
             result.insert(record.path, state);
         }
     }
+
+    // index/ 记录已经被清理、只剩 journal 能证明"这个路径曾经存在过、现在
+    // 被删了"的情形：为每个最后一条事件是 tombstone、且没有存活 index 记录
+    // 认领同一路径的 item 补一条 Tombstoned。多个 item 先后占用同一路径时，
+    // 以 seq 更大（更晚）的那条为准（模块顶部 doc comment）。
+    let mut by_path: BTreeMap<String, TombstoneInfo> = BTreeMap::new();
+    for info in tombstoned.into_values() {
+        if claimed_paths.contains(&info.path) {
+            continue; // 已经在上面的循环里按 index 记录处理过。
+        }
+        match by_path.get(&info.path) {
+            Some(existing) if existing.seq >= info.seq => {}
+            _ => {
+                by_path.insert(info.path.clone(), info);
+            }
+        }
+    }
+    for (path, info) in by_path {
+        result.insert(
+            path,
+            RemoteState::Tombstoned {
+                item_id: info.item_id,
+                version_id: info.version_id,
+            },
+        );
+    }
+
     Ok(result)
 }
 
@@ -437,11 +547,11 @@ mod tests {
         }
     }
 
-    /// 不产出 `Tombstoned`：文档化的已知缺口本身也要有回归测试守着，防止
-    /// 未来有人在没有先接上 journal 的情况下，悄悄从 items 链的某个巧合
-    /// 状态"猜"出一个 tombstone 来。
+    /// 健康存储根、journal 里没有任何 tombstone 事件时，`read_remote` 不应
+    /// 凭空产出 `Tombstoned`——回归测试防止未来有人从 items 链的某个巧合
+    /// 状态"猜"出一个 tombstone 来（journal 才是唯一的证据来源）。
     #[test]
-    fn 当前实现结构上不会产出tombstoned() {
+    fn journal没有tombstone事件时不产出tombstoned() {
         let dir = tempfile::tempdir().unwrap();
         write_format_json(dir.path());
         write_indexed_item(dir.path(), "a.txt", ItemId::from_bytes([0x33; 16]), b"z");
@@ -451,5 +561,256 @@ mod tests {
         assert!(remote
             .values()
             .all(|state| !matches!(state, RemoteState::Tombstoned { .. })));
+    }
+
+    // -----------------------------------------------------------------
+    // M2a tombstone 计划 Task 3：journal 接上之后 `RemoteState::Tombstoned`
+    // 第一次可达。
+    // -----------------------------------------------------------------
+
+    fn 造存储根(dir: &Path) {
+        write_format_json(dir);
+        fs::create_dir_all(dir.join("files")).unwrap();
+        fs::create_dir_all(dir.join(".arca/tmp")).unwrap();
+        fs::create_dir_all(dir.join(".arca/trash")).unwrap();
+        fs::create_dir_all(dir.join(".arca/journal")).unwrap();
+    }
+
+    fn actor() -> Actor {
+        Actor {
+            account: "bruce".into(),
+            device: "test".into(),
+            session: "s1".into(),
+        }
+    }
+
+    /// 手工移除某个路径在 `.arca/index/` 下的记录文件——模拟"tombstone 执行
+    /// 已经把 index 记录清理掉"这一步（真正的执行流程属 Task 4，这里只手工
+    /// 拼出执行完成后的存储根状态）。与 `sync.rs` 里
+    /// `崩溃在index写入之前遗留的孤儿字节...` 测试用的是同一个手法。
+    fn remove_index_record(dir: &Path, path: &str) {
+        let key = path_rules::index_key(path);
+        let shard = dir.join(".arca/index").join(&key.to_hex()[..2]);
+        let record_path = shard.join(format!("{}.json", key.to_hex()));
+        fs::remove_file(record_path).unwrap();
+    }
+
+    /// brief 明确要求的场景：写 tombstone 后 `read_remote` 产出 `Tombstoned`，
+    /// `files/` 下内容已不在但 `.arca/trash/` 里在。这里模拟一次"完整执行"
+    /// （内容移入 trash + 追加 tombstone 事件 + 清理 index 记录），验证
+    /// `read_remote` 的输出与磁盘上的痕迹都符合预期。
+    #[test]
+    fn 写tombstone后read_remote产出tombstoned且files内容已移入trash() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let id = ItemId::from_bytes([0x55; 16]);
+        let version = write_indexed_item(dir.path(), "a.png", id, b"content");
+        let root = open(dir.path());
+
+        crate::trash::move_to_trash(&root, "a.png", id, "2026-08-08T09:10:00Z").unwrap();
+        let event = JournalEvent {
+            seq: 1,
+            op: Op::Tombstone,
+            item_id: id,
+            version_id: version.version_id.clone(),
+            path: "a.png".to_string(),
+            from: None,
+            actor: actor(),
+            at: "2026-08-08T09:10:00Z".to_string(),
+        };
+        crate::journal::append(&root, &event).unwrap();
+        remove_index_record(dir.path(), "a.png");
+
+        let remote = read_remote(&root).unwrap();
+        match remote.get("a.png") {
+            Some(RemoteState::Tombstoned {
+                item_id,
+                version_id,
+            }) => {
+                assert_eq!(*item_id, id);
+                assert_eq!(*version_id, version.version_id);
+            }
+            other => panic!("应为 Tombstoned，实得 {other:?}"),
+        }
+
+        assert!(
+            !dir.path().join("files/a.png").exists(),
+            "files/ 下的内容应已移走"
+        );
+        let has_trash_data = fs::read_dir(dir.path().join(".arca/trash"))
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".data"));
+        assert!(has_trash_data, "内容应能在 .arca/trash/ 下找到");
+    }
+
+    /// 崩溃窗口场景：tombstone 已经执行（内容进了 trash、journal 也写了），
+    /// 但清理 `index/` 记录那一步还没发生（或者压根没实现）——`read_remote`
+    /// 必须仍然优先信 journal，产出 `Tombstoned`，而不是去读 `files/` 内容
+    /// 报出 `MissingContent`（那会把"刚执行完 tombstone"误诊断成"存储根
+    /// 损坏"）。
+    #[test]
+    fn index记录未清理时journal的tombstone仍然优先不报missing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let id = ItemId::from_bytes([0x66; 16]);
+        let version = write_indexed_item(dir.path(), "b.png", id, b"content");
+        let root = open(dir.path());
+
+        crate::trash::move_to_trash(&root, "b.png", id, "2026-08-08T09:10:00Z").unwrap();
+        crate::journal::append(
+            &root,
+            &JournalEvent {
+                seq: 1,
+                op: Op::Tombstone,
+                item_id: id,
+                version_id: version.version_id.clone(),
+                path: "b.png".to_string(),
+                from: None,
+                actor: actor(),
+                at: "2026-08-08T09:10:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        // 刻意不调用 remove_index_record：index/ 记录仍然在。
+
+        let remote = read_remote(&root).unwrap();
+        assert!(
+            matches!(remote.get("b.png"), Some(RemoteState::Tombstoned { .. })),
+            "实得 {:?}",
+            remote.get("b.png")
+        );
+    }
+
+    /// 同一路径被两个 item 先后占用、且都已经 tombstone、都没有存活的
+    /// index 记录时，`read_remote` 必须以 `seq` 更大（更晚）的那条为准——
+    /// 旧 item 的 tombstone 是历史，不应该盖过路径的当前归属。
+    #[test]
+    fn 同一路径被多个item先后占用时以更晚的tombstone为准() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+
+        let item1 = ItemId::from_bytes([0x01; 16]);
+        let v1 = VersionId::new("20260808T090000Z", &"1".repeat(32)).unwrap();
+        crate::journal::append(
+            &root,
+            &JournalEvent {
+                seq: 1,
+                op: Op::Upsert,
+                item_id: item1,
+                version_id: v1.clone(),
+                path: "a.png".into(),
+                from: None,
+                actor: actor(),
+                at: "t1".into(),
+            },
+        )
+        .unwrap();
+        crate::journal::append(
+            &root,
+            &JournalEvent {
+                seq: 2,
+                op: Op::Tombstone,
+                item_id: item1,
+                version_id: v1,
+                path: "a.png".into(),
+                from: None,
+                actor: actor(),
+                at: "t2".into(),
+            },
+        )
+        .unwrap();
+
+        let item2 = ItemId::from_bytes([0x02; 16]);
+        let v2 = VersionId::new("20260808T091000Z", &"2".repeat(32)).unwrap();
+        crate::journal::append(
+            &root,
+            &JournalEvent {
+                seq: 3,
+                op: Op::Upsert,
+                item_id: item2,
+                version_id: v2.clone(),
+                path: "a.png".into(),
+                from: None,
+                actor: actor(),
+                at: "t3".into(),
+            },
+        )
+        .unwrap();
+        crate::journal::append(
+            &root,
+            &JournalEvent {
+                seq: 4,
+                op: Op::Tombstone,
+                item_id: item2,
+                version_id: v2.clone(),
+                path: "a.png".into(),
+                from: None,
+                actor: actor(),
+                at: "t4".into(),
+            },
+        )
+        .unwrap();
+
+        let remote = read_remote(&root).unwrap();
+        match remote.get("a.png") {
+            Some(RemoteState::Tombstoned {
+                item_id,
+                version_id,
+            }) => {
+                assert_eq!(*item_id, item2, "应以更晚的 tombstone（item2）为准");
+                assert_eq!(*version_id, v2);
+            }
+            other => panic!("应为 item2 的 Tombstoned，实得 {other:?}"),
+        }
+    }
+
+    /// brief 明确要求的决策表验证：`decide` 对 `(present, unchanged,
+    /// tombstoned)` 给出 `DeleteLocal`——用 `read_remote` 真实产出的
+    /// `RemoteState`，不是手写一个假的，确保这条链路真的接通了。
+    #[test]
+    fn decide对present_unchanged_tombstoned给出deletelocal() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let id = ItemId::from_bytes([0x77; 16]);
+        let version = write_indexed_item(dir.path(), "c.png", id, b"content");
+        let root = open(dir.path());
+
+        crate::trash::move_to_trash(&root, "c.png", id, "t").unwrap();
+        crate::journal::append(
+            &root,
+            &JournalEvent {
+                seq: 1,
+                op: Op::Tombstone,
+                item_id: id,
+                version_id: version.version_id.clone(),
+                path: "c.png".to_string(),
+                from: None,
+                actor: actor(),
+                at: "t".to_string(),
+            },
+        )
+        .unwrap();
+        remove_index_record(dir.path(), "c.png");
+
+        let remote = read_remote(&root).unwrap();
+        let remote_state = remote.get("c.png").unwrap();
+
+        let base = arca_core::state::BaseState::Present {
+            item_id: id,
+            version_id: version.version_id.clone(),
+            hash: version.hash,
+            size: version.size,
+        };
+        let local = arca_core::state::LocalState::Present {
+            hash: version.hash,
+            size: version.size,
+        };
+        let decision = arca_core::reconcile::decide(&base, &local, remote_state);
+        match decision.action {
+            arca_core::reconcile::Action::DeleteLocal { item_id } => assert_eq!(item_id, id),
+            other => panic!("应为 DeleteLocal，实得 {other:?}"),
+        }
+        assert_eq!(decision.reason, "remote_tombstoned");
     }
 }

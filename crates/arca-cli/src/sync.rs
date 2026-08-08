@@ -45,7 +45,7 @@ use arca_format::manifest::{Manifest, ManifestEntry};
 use arca_format::model::{Actor, ItemId, Version};
 use arca_format::path_rules;
 use arca_format::trace::TraceSink;
-use arca_store::atomic::{AtomicError, Batch};
+use arca_store::atomic::{self, AtomicError, Batch};
 use arca_store::root::StorageRoot;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -379,8 +379,15 @@ fn execute_download(
         .expect("path 已经过 path_rules::check（来自 index 记录），不会逃出存储根");
     let bytes = fs::read(&source).map_err(|e| io_err(&source, e))?;
 
+    // 下载的内容必须 fsync 之后才允许保存基线（M2a tombstone 计划「为什么这是
+    // M2 的第一块」一节；`arca_store::atomic::write_local` 的文档展开了完整
+    // 论证）：这里若只是写完就 rename、不确认落盘，崩溃窗口里会留下「基线
+    // 已保存、内容却丢失」的状态——下次调和把它读成「本地删除」，M1 只导致
+    // 一条无处执行的 `TombstoneRemote` 报告，M2 接通 tombstone 执行之后就会
+    // 变成崩溃引发的 hub 权威副本销毁。`execute_download` 返回之前，`?` 已经
+    // 保证这一步失败时函数整体报错、调用方不会继续把 `new_state` 写进基线。
     let local_path = dataset_root.join(to_native(path));
-    write_local_atomic(&local_path, &bytes).map_err(|e| io_err(&local_path, e))?;
+    atomic::write_local(dataset_root, &local_path, &bytes).map_err(SyncError::Atomic)?;
 
     Ok(BaseState::Present {
         item_id,
@@ -481,29 +488,6 @@ fn to_native(path: &str) -> PathBuf {
     out
 }
 
-/// 原子写一个任意本地文件（tmp → rename，同目录）。
-///
-/// 不做 `arca_store::atomic` 那一整套 fsync 事务链——下载下来的本地副本是
-/// hub 权威内容的一份可重建投影（与 I9 对可抛弃投影的宽容度同理）：这次写入
-/// 若被打断，`baseline` 还没来得及记下这个路径，下次 `arca sync` 会重新判定
-/// 需要 `Download` 并再下载一次，不构成数据风险。
-fn write_local_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let tmp_name = format!(".{file_name}.arca-tmp-{}", std::process::id());
-    let tmp = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
-        _ => PathBuf::from(tmp_name),
-    };
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
 fn rfc3339_from_systemtime(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
@@ -515,6 +499,7 @@ fn rfc3339_from_systemtime(t: std::time::SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arca_core::reconcile::decide;
     use arca_format::hub_layout::FormatJson;
     use arca_format::trace::NullSink;
     use std::fs;
@@ -662,6 +647,177 @@ mod tests {
         assert!(report.uploaded.is_empty());
         assert!(report.downloaded.is_empty());
         assert!(report.deleted_local.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Task 1（M2a tombstone 计划）：下载内容的 fsync 纪律。
+    //
+    // 完整背景见 `docs/superpowers/plans/2026-08-08-m2a-tombstone.md`
+    // 「为什么这是 M2 的第一块」一节，以及 `execute_download`/
+    // `arca_store::atomic::write_local` 顶部的论证。这里只放两条测试：
+    // 先证明隐患真实存在（下面第一条），再证明修复后这个窗口关上了
+    // （第二条）。
+    // -----------------------------------------------------------------
+
+    /// 证明隐患真实存在：不是凭空构造一个 `BaseState`/`RemoteState`，而是用
+    /// 真实的 `sync`/`baseline`/`hub::read_remote` 拼出「基线已保存、内容却
+    /// 缺失」这个崩溃窗口状态（正常下载一次后，手工删掉本地内容，模拟
+    /// fsync 时机不对时崩溃会留下的后果——不是用户主动删除）。断言下一轮
+    /// `decide` 给出 `TombstoneRemote`：M1 里这只是一条无处落盘的报告，
+    /// 但 M2（本计划 Task 3/4）接通 tombstone 执行之后，这个决策会真的
+    /// 删除 hub 的权威副本——这正是 Task 1 必须先于 tombstone 执行落地的
+    /// 理由。
+    #[test]
+    fn 崩溃窗口状态_基线已保存内容却缺失_会让下一轮决策给出tombstone_remote() {
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+
+        // 先在另一台设备上把内容上传到远端。
+        let seed = tempfile::tempdir().unwrap();
+        fs::write(seed.path().join("h.txt"), b"downloaded content").unwrap();
+        let root = open_root(store.path());
+        let mut sink = NullSink;
+        sync(seed.path(), &root, &actor(), &mut sink).unwrap();
+
+        // 本地正常下载一次：内容落地、基线记下这个路径。
+        let report = sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+        assert_eq!(report.downloaded, vec!["h.txt".to_string()]);
+
+        // 模拟崩溃窗口的后果：内容在崩溃后消失，但基线已经落盘。
+        fs::remove_file(dataset.path().join("h.txt")).unwrap();
+
+        let base = baseline::load(dataset.path()).unwrap().get("h.txt");
+        let remote = hub::read_remote(&root).unwrap();
+        let remote_state = remote.get("h.txt").cloned().unwrap();
+        let decision = decide(&base, &LocalState::Absent, &remote_state);
+
+        match decision.action {
+            Action::TombstoneRemote { .. } => {}
+            other => panic!(
+                "应为 TombstoneRemote，实得 {other:?}——隐患描述有误或已经不成立，\
+                 这条测试本身需要重新核对"
+            ),
+        }
+    }
+
+    /// 证明修复后窗口关上了：`execute_download` 现在经
+    /// `arca_store::atomic::write_local` 写入本地内容——目录落盘确认失败时
+    /// 必须整体报错（`SyncError::Atomic(AtomicError::CommittedUnsynced)`），
+    /// 而不是像旧的手写 tmp→rename 实现那样对这一步毫无感知、一路"成功"到
+    /// 保存基线。这里直接调用 `execute_download`（跳过 `sync()` 的扫描阶段，
+    /// 否则 chmod 掉的目录会先在扫描阶段报错，测不到目标的落盘确认步骤）。
+    ///
+    /// 用 chmod 模拟目录 fsync 失败：`rename` 只需要目录的写+执行权限，
+    /// `File::open` 读该目录用于 fsync 则需要读权限，二者可以分别控制
+    /// （与 `arca_store::atomic::write_local` 同款测试用的是同一个手法）。
+    /// chmod 对 root 用户无效、部分文件系统也不支持权限位，先自证一次假设，
+    /// 不成立就跳过而不是假装测过了。
+    #[test]
+    #[cfg(unix)]
+    fn 修复后_目录落盘确认失败时execute_download整体报错而不静默成功() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+
+        let seed = tempfile::tempdir().unwrap();
+        fs::write(seed.path().join("i.txt"), b"content").unwrap();
+        let root = open_root(store.path());
+        let mut sink = NullSink;
+        sync(seed.path(), &root, &actor(), &mut sink).unwrap();
+        let remote = hub::read_remote(&root).unwrap();
+        let remote_state = remote.get("i.txt").cloned().unwrap();
+
+        // "i.txt" 没有子目录，target_parent 恰好就是 dataset_root 本身——
+        // 直接 chmod 它。
+        fs::set_permissions(dataset.path(), fs::Permissions::from_mode(0o300)).unwrap();
+        if fs::File::open(dataset.path()).is_ok() {
+            fs::set_permissions(dataset.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("跳过：当前用户不受 chmod 限制（root 或文件系统不支持权限位）");
+            return;
+        }
+
+        let result = execute_download(dataset.path(), &root, "i.txt", &remote_state);
+
+        // 恢复权限，否则 tempdir 在 Drop 时清理不掉这个目录。
+        fs::set_permissions(dataset.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        match result {
+            Err(SyncError::Atomic(AtomicError::CommittedUnsynced { .. })) => {}
+            other => panic!("应报 SyncError::Atomic(CommittedUnsynced)，实得 {other:?}"),
+        }
+        // 内容确实已经落地（rename 已完成）——但调用方（`sync`）看到 `Err`
+        // 就不会把这次"下载"记进基线：下次重跑会重新判定需要 Download/
+        // AdoptBaseline，不会把一个未确认落盘的状态当成"已同步"写死。
+        assert_eq!(fs::read(dataset.path().join("i.txt")).unwrap(), b"content");
+    }
+
+    /// 端到端验证 M2a tombstone 计划 Task 3 的价值：`hub::read_remote` 现在
+    /// 能产出 `RemoteState::Tombstoned`，`present|unchanged|tombstoned ->
+    /// DeleteLocal` 这一格决策表**第一次在真实的 `sync()` 调用里可达**——
+    /// 而 `DeleteLocal` 的执行早在 M1d Task 6 就已经写好（见本文件 `sync`
+    /// 函数里 `Action::DeleteLocal` 分支），只是从未被真正触发过。这里手工
+    /// 模拟"另一台设备/未来的 tombstone 执行"已经把这个路径在 hub 侧删除
+    /// （内容移进 trash + 追加 tombstone 事件 + 清理 index 记录），验证本地
+    /// 设备下一次 `sync()` 会把本地副本也移除——且这只是移除本地副本，
+    /// hub 的权威副本仍然安全地留在 `.arca/trash/` 里（I3）。
+    #[test]
+    fn hub侧tombstone传播到本地时sync会执行deletelocal() {
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        fs::create_dir_all(store.path().join(".arca/trash")).unwrap();
+        fs::create_dir_all(store.path().join(".arca/journal")).unwrap();
+        fs::write(dataset.path().join("j.txt"), b"content").unwrap();
+
+        let root = open_root(store.path());
+        let mut sink = NullSink;
+        sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+        assert!(dataset.path().join("j.txt").is_file());
+
+        // 找出刚上传的 item_id/version，手工执行一次 tombstone（真正的执行
+        // 流程属 Task 4，这里拼出执行完成后的存储根状态）。
+        let remote_before = hub::read_remote(&root).unwrap();
+        let (item_id, version_id) = match remote_before.get("j.txt").unwrap() {
+            RemoteState::Present {
+                item_id,
+                version_id,
+                ..
+            } => (*item_id, version_id.clone()),
+            other => panic!("应为 Present，实得 {other:?}"),
+        };
+        crate::trash::move_to_trash(&root, "j.txt", item_id, "2026-08-08T09:20:00Z").unwrap();
+        crate::journal::append(
+            &root,
+            &arca_format::journal::JournalEvent {
+                seq: 1,
+                op: arca_format::journal::Op::Tombstone,
+                item_id,
+                version_id,
+                path: "j.txt".to_string(),
+                from: None,
+                actor: actor(),
+                at: "2026-08-08T09:20:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        let report = sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+
+        assert_eq!(report.deleted_local, vec!["j.txt".to_string()]);
+        assert!(
+            report.is_clean(),
+            "DeleteLocal 是决策表的正常终态，不应让 is_clean 为假：{report:?}"
+        );
+        assert!(!dataset.path().join("j.txt").exists(), "本地副本应已被移除");
+        // hub 的权威副本仍然安全——本地副本被移除后，内容必须仍能在
+        // .arca/trash/ 里找到，绝不是被销毁了（I3）。
+        let trash_has_data = fs::read_dir(store.path().join(".arca/trash"))
+            .unwrap()
+            .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".data"));
+        assert!(trash_has_data, "hub 的权威副本必须仍在 .arca/trash/ 里");
     }
 
     #[test]

@@ -315,6 +315,77 @@ fn write_and_rename(
     Ok((target, target_parent))
 }
 
+/// 原子把存储根内部一个**已存在**的文件从 `from_relative` 移动到 `to_relative`
+/// （`rename`，同一文件系统天然原子）+ fsync 两侧目录链确认落盘。
+///
+/// 与 [`write`] 是同一持久化纪律在"移动既有内容"这个场景下的对应实现：
+/// `rename` 本身在 POSIX 上要么完全没发生、要么完全发生，但"这次目录项变化
+/// 已经落盘"是另一回事——这次移动改了**两个**目录的目录项（源的父目录少了
+/// 一条、目标的父目录多了一条），必须两侧都 fsync 到 `root`，否则崩溃可能
+/// 只让其中一侧的变化持久化，留下「两边都看得到」或「两边都看不到」这份
+/// 内容的状态。
+///
+/// 供 tombstone 执行把 `files/<path>` 移进 `.arca/trash/`（M2a tombstone
+/// 计划 Task 3，FORMAT.md §7.3）：**这是移动，不是复制+删除**——过程中不
+/// 存在"源与目标同时存在两份"的窗口，也不存在自己删除源文件的代码路径
+/// （I3：同步路径无销毁权；`rename` 让源"消失"是操作系统对同一个 inode
+/// 改名的效果，不是本模块新增的一次删除）。
+///
+/// 调用方须保证 `from_relative` 指向的文件确实存在——不存在时 `rename`
+/// 报 `NotFound`，按普通 `Io` 错误向上传播，不做特殊包装：调用方通常在
+/// 调用前已经用更贴近业务语义的方式确认过源存在（例如 tombstone 执行前的
+/// 闸门检查），这里不重复发明一种"源缺失"的专属错误变体。
+pub fn rename(
+    root: &StorageRoot,
+    from_relative: &str,
+    to_relative: &str,
+) -> Result<(), AtomicError> {
+    let from = root.join(from_relative)?;
+    let to = root.join(to_relative)?;
+
+    let to_parent = to
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.path().to_path_buf());
+    fs::create_dir_all(&to_parent).map_err(|e| io_error(&to_parent, &e))?;
+
+    let from_parent = from
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.path().to_path_buf());
+
+    if let Err(e) = fs::rename(&from, &to) {
+        let mapped = if e.kind() == io::ErrorKind::CrossesDevices {
+            AtomicError::CrossDevice {
+                tmp: from.display().to_string(),
+                target: to.display().to_string(),
+            }
+        } else {
+            io_error(&from, &e)
+        };
+        return Err(mapped);
+    }
+
+    // rename 已经成功：从这里往后任何失败都意味着"移动本身已经发生"，只是
+    // 两侧目录项变化的落盘确认还没做完，同一条 `CommittedUnsynced` 语义——
+    // 调用方绝不应该因为这里失败就重试整个移动（源已经不在原处了，重试
+    // `rename` 只会因为源不存在而报错）。
+    sync_dir_chain_to_root(root.path(), &from_parent).map_err(|e| {
+        AtomicError::CommittedUnsynced {
+            target: to.display().to_string(),
+            reason: format!("源目录 {} 落盘确认失败：{e}", from_parent.display()),
+        }
+    })?;
+    sync_dir_chain_to_root(root.path(), &to_parent).map_err(|e| {
+        AtomicError::CommittedUnsynced {
+            target: to.display().to_string(),
+            reason: format!("目标目录 {} 落盘确认失败：{e}", to_parent.display()),
+        }
+    })?;
+
+    Ok(())
+}
+
 /// 批量原子写入：文件自身的「tmp → fsync → rename」逐次立即执行，持久性
 /// 不打折扣；父目录的 fsync **推迟并去重**到 [`Batch::commit`]——批量归档
 /// 场景下（`arca adopt`/`arca sync` 一次处理成千上万个文件），逐文件都做一次
@@ -426,6 +497,65 @@ fn insert_dir_chain(root: &Path, from: &Path, touched: &mut BTreeSet<PathBuf>) {
             None => return,
         }
     }
+}
+
+/// 原子写入到**任意本地路径**——不要求调用方持有 [`StorageRoot`]（tmp → fsync
+/// 文件 → rename → fsync 目标所在目录及其祖先直到 `boundary`）。
+///
+/// # 为什么需要这个变体（M2a tombstone 计划，「为什么这是 M2 的第一块」一节）
+///
+/// [`write`]/[`Batch::write`] 只能写存储根内部（tmp 建在固定的 `.arca/tmp/`
+/// 下，目标是 `root.join(relative_target)`）。但 `arca-cli` 的 `file://`
+/// 同步（`sync::execute_download`）把 hub 的内容下载到**本地工作区**——那不是
+/// 存储根，没有 `.arca/tmp/` 这样的固定暂存目录，此前用的是一个自己手写的
+/// tmp → rename、**完全不 fsync** 的迷你实现。M1d 的切片评审留了一条明确的
+/// 前置：那个实现把内容写进工作区就返回，随后基线立刻落盘——崩溃窗口里的
+/// 状态是「基线持久、下载的内容丢失」，下次调和会把它误读成「本地把这个
+/// 文件删了」，M1 里这只导致一条无处执行的 `TombstoneRemote` 报告（无害），
+/// 但 M2 一旦接通 tombstone 的真正执行，这个洞就会变成崩溃引发的 hub 权威
+/// 副本销毁。修法就是本函数：把 [`write`] 的四步持久化纪律原样搬到「目标不
+/// 在存储根内」的场景，tmp 建在目标的同一目录下（保证与目标同一文件系统，
+/// `rename` 才谈得上原子——道理与 `write` 把 tmp 建在 `.arca/tmp/` 而不是
+/// `std::env::temp_dir()` 完全一致），`boundary` 由调用方传入（通常是数据集
+/// 根），限定「向上 fsync 到哪一层为止」，不会一路 fsync到与本次调用无关的
+/// 祖先目录。
+///
+/// 调用方须保证 `target` 位于 `boundary` 之内——本函数不做路径逃逸校验
+/// （`target` 是调用方已经用 `dataset_root.join(..)` 拼好的本地路径，不是
+/// 直接来自网络/用户输入的不可信相对路径字符串，与 [`write`] 面向的
+/// `relative_target: &str` 场景不同，见 `StorageRoot::join` 校验的是后者）。
+pub fn write_local(boundary: &Path, target: &Path, bytes: &[u8]) -> Result<(), AtomicError> {
+    let target_parent = target
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| boundary.to_path_buf());
+    fs::create_dir_all(&target_parent).map_err(|e| io_error(&target_parent, &e))?;
+
+    let tmp_name = tmp_file_name(&target.display().to_string());
+    let tmp_path = target_parent.join(tmp_name);
+
+    write_and_sync(&tmp_path, bytes)?;
+
+    if let Err(e) = fs::rename(&tmp_path, target) {
+        let mapped = if e.kind() == io::ErrorKind::CrossesDevices {
+            AtomicError::CrossDevice {
+                tmp: tmp_path.display().to_string(),
+                target: target.display().to_string(),
+            }
+        } else {
+            io_error(&tmp_path, &e)
+        };
+        cleanup_tmp(&tmp_path);
+        return Err(mapped);
+    }
+
+    // rename 成功：与 `write` 同一条分界线，从这里往后任何失败都意味着目标
+    // 已经是新内容、只是持久性未确认，报 `CommittedUnsynced` 而不是普通
+    // `Io`——调用方绝不能因此重试整个写入（见该变体的文档）。
+    sync_dir_chain_to_root(boundary, &target_parent).map_err(|e| AtomicError::CommittedUnsynced {
+        target: target.display().to_string(),
+        reason: e.to_string(),
+    })
 }
 
 /// fsync `from` 及其在 `root` 内的每一层祖先目录，一路向上到 `root` 本身
@@ -610,6 +740,125 @@ mod tests {
         assert!(msg.contains("不应重试整个批次"));
         assert!(msg.contains("files/shared"));
         assert!(msg.contains("files/other"));
+    }
+
+    /// `write_local` 的基本往返：写入后能读回，且目标同目录下不留 tmp 残留
+    /// （rename 成功后 tmp 名字已经不存在了）。
+    #[test]
+    fn write_local_往返一致且不留tmp残留() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("sub/note.txt");
+
+        write_local(dir.path(), &target, b"hello").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"hello");
+        let siblings: Vec<_> = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(siblings, vec![target.file_name().unwrap().to_owned()]);
+    }
+
+    /// `write_local` 覆盖已存在的目标：新内容替换旧内容，不是追加。
+    #[test]
+    fn write_local_覆盖已有目标() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("note.txt");
+        write_local(dir.path(), &target, b"v1").unwrap();
+        write_local(dir.path(), &target, b"v2-longer").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"v2-longer");
+    }
+
+    /// `write_local` 的目录落盘确认失败必须报 `CommittedUnsynced`，而不是
+    /// 吞掉——这正是 Task 1 要补的洞：旧的手写 tmp→rename 实现完全没有这一步，
+    /// 任何 fsync 失败（包括真实断电导致的持久性丢失）都无法被检测到，
+    /// 调用方会带着"已经成功"的错觉继续保存基线。这里用 chmod 模拟目录
+    /// fsync 失败（`File::open` 读该目录需要读权限，`rename` 本身只需要
+    /// 写+执行权限，二者可以分别控制）：chmod 对 root 用户无效、部分文件系统
+    /// 也不支持权限位，所以先自证一次假设是否成立，不成立就跳过而不是假装
+    /// 测过了（与 `arca-git`/`arca-store` 既有测试同一条纪律）。
+    #[test]
+    #[cfg(unix)]
+    fn write_local_目录落盘确认失败时报committed_unsynced而不是静默成功() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let boundary = dir.path();
+        let target = dir.path().join("note.txt");
+
+        // 目录本身只保留写+执行权限，去掉读权限——rename 仍能成功
+        // （改目录项不需要读该目录本身），但 `File::open(boundary)` 用于
+        // fsync 会因为没有读权限而失败。
+        fs::set_permissions(boundary, fs::Permissions::from_mode(0o300)).unwrap();
+
+        if File::open(boundary).is_ok() {
+            fs::set_permissions(boundary, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "跳过：当前用户不受 chmod 限制（root 或文件系统不支持权限位），\
+                 无法用权限手段模拟目录 fsync 失败"
+            );
+            return;
+        }
+
+        let result = write_local(boundary, &target, b"hello");
+
+        // 恢复权限，否则 tempdir 在 Drop 时清理不掉这个目录。
+        fs::set_permissions(boundary, fs::Permissions::from_mode(0o755)).unwrap();
+
+        match result {
+            Err(AtomicError::CommittedUnsynced { target: t, .. }) => {
+                assert_eq!(t, target.display().to_string());
+            }
+            other => panic!("应报 CommittedUnsynced，实得 {other:?}"),
+        }
+        // 目标已经是新内容（rename 已经成功），只是这一事实的落盘确认失败——
+        // 绝不能因为这个错误就以为内容也丢了、更不能去删除或回滚它。
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"hello",
+            "rename 已完成，内容必须仍在目标路径上"
+        );
+    }
+
+    fn 造存储根(dir: &Path) {
+        fs::create_dir_all(dir.join(".arca/tmp")).unwrap();
+        fs::create_dir_all(dir.join("files")).unwrap();
+        fs::create_dir_all(dir.join(".arca/trash")).unwrap();
+        let format = arca_format::hub_layout::FormatJson {
+            format: 1,
+            dataset_id: "9c41000000000000000000000000abcd".to_string(),
+            hash_algo: "blake3".to_string(),
+            created_at: "2026-08-08T09:00:00Z".to_string(),
+        };
+        fs::write(dir.join(".arca/format.json"), format.to_json().unwrap()).unwrap();
+    }
+
+    /// `rename` 把内容从一个相对路径移到另一个，源不再存在、目标内容不变。
+    #[test]
+    fn rename_把内容从源移到目标() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = StorageRoot::open(dir.path(), None).unwrap();
+        write(&root, "files/a.txt", b"content").unwrap();
+
+        rename(&root, "files/a.txt", ".arca/trash/abc.data").unwrap();
+
+        assert!(!dir.path().join("files/a.txt").exists(), "源应已不存在");
+        assert_eq!(
+            fs::read(dir.path().join(".arca/trash/abc.data")).unwrap(),
+            b"content"
+        );
+    }
+
+    /// 源不存在时 `rename` 报普通 `Io`（`NotFound`），不做特殊包装。
+    #[test]
+    fn rename_源不存在时报io错误() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = StorageRoot::open(dir.path(), None).unwrap();
+
+        let err = rename(&root, "files/不存在.txt", ".arca/trash/x.data").unwrap_err();
+        assert!(matches!(err, AtomicError::Io { .. }), "实得 {err:?}");
     }
 
     /// `insert_dir_chain` 白盒验证去重不变量：同一目录链的第二次插入应该
