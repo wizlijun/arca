@@ -2,6 +2,35 @@
 //! `docs/superpowers/plans/2026-08-08-m2b-arcad-cas.md`「为什么先抽传输，再写
 //! 服务端」一节）。
 //!
+//! # M2c Task 1：补齐四条缺口
+//!
+//! M2b 切片评审在「Readiness for M2c/M2e」里点名了四条这个 trait 当时够不着
+//! 的能力（`docs/superpowers/plans/2026-08-08-m2c-journal-longpoll.md`「为什么
+//! 第一个任务是补 trait 而不是写 HTTP」一节）：
+//!
+//! 1. **流式读**：[`Transport::read_content_into`]——`read_content` 强制调用方
+//!    整份内容驻留内存，这是服务端 C2（600MB PUT 让 RSS 涨到 1.86GB）的镜像，
+//!    只是发生在客户端一侧；两端要一起修，否则 M2e 的 HTTP 客户端会继承同样
+//!    的内存曲线。
+//! 2. **Range/续传**：[`Transport::read_range`]——服务端的 206 已经能用且经
+//!    评审验证（`arcad/src/api.rs::get_file`），只是这个 trait 够不着，
+//!    `http::HttpTransport`（Task 5）没有对应方法可调。
+//! 3. **按哈希寻址的读**：[`Transport::read_by_hash`]——`arca cat <hash>`
+//!    （`PROTOCOL.md` §5.0b）没有 HTTP 对应，服务端补
+//!    `GET /v1/datasets/{id}/blobs/{hash}`（`PROTOCOL.md` §1.2，先写协议
+//!    再实现，I10）。
+//! 4. **批量提交**：[`Transport::commit_batch`]——`sync.rs` 本地已经用
+//!    `arca_store::atomic::Batch` 把内容写入的目录 fsync 收口到一次，但每个
+//!    文件仍是一次独立的 `Transport::commit` 调用；HTTP 场景下这意味着 1 万
+//!    文件的 sweep 是 1 万次网络往返。批量提交**要么整批成功要么整批不
+//!    生效**——不做"部分成功"，那会让调用方无法判断该从哪里重试（I5）；
+//!    CAS 仍逐条校验，任一条 `parent` 过期即整批失败，明确指出是哪一条
+//!    （[`BatchOutcome::Rejected`]）。
+//!
+//! 这四条都是接口扩展，不是行为变更：现有依赖 [`Transport::commit`]/
+//! [`Transport::read_content`] 等既有方法的调用点与测试一行不改（判据见
+//! Task 1 brief），新方法是纯粹的加法。
+//!
 //! 在这个抽象出现之前，`hub.rs`/`sync.rs`/`gates.rs`/`trash.rs` 全都直接摸
 //! `arca_store::root::StorageRoot`——M2a 的切片评审点名：闸门第 4 道
 //! （`gates::DeleteCheck`）拿 `&StorageRoot` 的签名会在 HTTP 传输下挡路，且
@@ -63,6 +92,7 @@ use arca_core::state::RemoteState;
 use arca_format::model::{Actor, ItemId, VersionId};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Write;
 
 /// 提交一个新版本所需的全部信息。
 ///
@@ -137,6 +167,24 @@ pub enum CommitOutcome {
         /// 冲突对象此刻真正的归属 item_id——`None` 表示冲突源不是"另一个
         /// item_id 占着"，而是"这个 item_id 自己已经被 tombstone 终结"。
         actual_item_id: Option<ItemId>,
+    },
+}
+
+/// 一次 [`Transport::commit_batch`] 的结果——**要么整批成功要么整批不生效**
+/// （M2c Task 1 brief：不做"部分成功"，那会让调用方无法判断该从哪里重试，
+/// 与 I5 相悖）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchOutcome {
+    /// 全部提交成功，与 `reqs` 输入顺序一一对应，每项都是
+    /// `CommitOutcome::Committed`（不是 `Committed` 变体本身以省一层
+    /// 匹配——调用方通常直接要 `(item_id, version_id)`）。
+    Committed(Vec<(ItemId, VersionId)>),
+    /// 批次中第 `index` 项（0-based）校验未通过——**整批未写入任何内容**，
+    /// 不只是这一条。`outcome` 是 [`CommitOutcome::Conflict`] 或
+    /// [`CommitOutcome::IdentityMismatch`]（批量场景下不会是 `Committed`）。
+    Rejected {
+        index: usize,
+        outcome: CommitOutcome,
     },
 }
 
@@ -224,9 +272,43 @@ pub trait Transport {
     /// 取一个路径当前版本的内容字节。
     fn read_content(&self, path: &str) -> Result<Vec<u8>, TransportError>;
 
+    /// 把一个路径当前版本的内容流式写进 `out`——缺口第 1 条（模块顶部
+    /// 「M2c Task 1」一节）：调用方不需要先把整份内容攒成 `Vec<u8>` 再处理，
+    /// `local.rs` 用有界缓冲拷贝实现（`std::io::copy`，固定大小的栈上缓冲，
+    /// 不随文件大小增长）；`http.rs`（Task 5）会用流式响应体实现，两者的
+    /// 内存占用都不与文件体积成正比。返回写出的字节数，供调用方（如
+    /// `arca cat`）在不预先知道内容长度时也能报告"读了多少"。
+    fn read_content_into(&self, path: &str, out: &mut dyn Write) -> Result<u64, TransportError>;
+
+    /// 取一个路径当前版本内容的字节区间 `[start, start+len)`——缺口第 2 条：
+    /// 服务端的 206 续传（`arcad/src/api.rs::get_file` 的 Range 处理）已经
+    /// 实现并经评审验证，只是这个 trait 此前够不着，`http::HttpTransport`
+    /// 没有方法可以表达"我只要这一段"。`local.rs` 用 `seek` + 有界读实现，
+    /// 与服务端 `bounded_read` 同一手法：只分配这一段区间大小的内存，不管
+    /// 文件本身多大。`start`/`len` 越界（区间超出内容实际大小）是调用方的
+    /// 参数错误，映射为 [`TransportError::Io`]（与 `read_content` 对"文件
+    /// 不存在"的处置同一严重性，不是这个 trait 的新错误分类）。
+    fn read_range(&self, path: &str, start: u64, len: u64) -> Result<Vec<u8>, TransportError>;
+
+    /// 按内容哈希取字节——缺口第 3 条：`arca cat <hash>`（`PROTOCOL.md`
+    /// §5.0b）的传输层原语。多个路径共享同一份内容时（去重命中）按路径
+    /// UTF-8 字节序取第一个命中，结果确定——与
+    /// `commands/plumbing.rs::cat_cmd` 现有算法同一条纪律，这里只是把它从
+    /// "直接摸 `StorageRoot`"的命令实现里提炼成传输层方法，供
+    /// `arcad::api::get_blob`（`GET .../blobs/{hash}`）与未来的 HTTP
+    /// `cat` 实现共用。查无匹配内容时返回 `None`，不是 `Err`——"没有这个
+    /// 哈希"是完全正常的查询结果，不是传输层故障。
+    fn read_by_hash(&self, hash: ContentHash) -> Result<Option<Vec<u8>>, TransportError>;
+
     /// 提交新版本（CAS：`req.parent` 与 hub 侧当前版本不一致即 [`CommitOutcome::Conflict`]，
     /// 不是 `Err`）。
     fn commit(&self, req: &CommitRequest) -> Result<CommitOutcome, TransportError>;
+
+    /// 批量提交多个版本——缺口第 4 条，见模块顶部「M2c Task 1」一节与
+    /// [`BatchOutcome`] 的文档：一次调用只有一次 CAS 临界区（与
+    /// [`Transport::commit`] 逐条各自加锁不同），要么全部生效要么全部不生效。
+    /// 空切片是合法输入，返回 `Ok(BatchOutcome::Committed(vec![]))`，不是错误。
+    fn commit_batch(&self, reqs: &[CommitRequest]) -> Result<BatchOutcome, TransportError>;
 
     /// 提交 tombstone（同样是 CAS，冲突形状与 [`Transport::commit`] 一致）。
     fn tombstone(&self, req: &TombstoneRequest) -> Result<CommitOutcome, TransportError>;

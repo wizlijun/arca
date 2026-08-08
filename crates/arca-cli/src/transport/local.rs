@@ -12,7 +12,8 @@
 //! `DELETE` 就应该在服务端真正校验 If-Match。
 
 use super::{
-    CommitOutcome, CommitRequest, Recoverable, TombstoneRequest, Transport, TransportError,
+    BatchOutcome, CommitOutcome, CommitRequest, Recoverable, TombstoneRequest, Transport,
+    TransportError,
 };
 use crate::{hub, journal, trash};
 use arca_chunk::hash::ContentHash;
@@ -20,14 +21,16 @@ use arca_core::state::RemoteState;
 use arca_format::hub_layout::layout;
 use arca_format::index::IndexRecord;
 use arca_format::items;
+use arca_format::journal::{JournalEvent, Op};
 use arca_format::model::{Actor, ItemId, Version, VersionId};
 use arca_format::path_rules;
 use arca_store::atomic;
 use arca_store::root::StorageRoot;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
+use std::io::{Read, Seek, SeekFrom, Write};
 
 /// `file://` 传输：包一个已打开、身份已确认的存储根。
 ///
@@ -127,6 +130,7 @@ impl<'a> LocalTransport<'a> {
         };
         append_item_version(self.root, &version)?;
         write_index_record(self.root, path, item_id)?;
+        append_upsert_journal_event(self.root, &version, path)?;
 
         Ok(CommitOutcome::Committed {
             item_id,
@@ -279,6 +283,67 @@ impl Transport for LocalTransport<'_> {
         })
     }
 
+    fn read_content_into(&self, path: &str, out: &mut dyn Write) -> Result<u64, TransportError> {
+        let full = self
+            .root
+            .join(&format!("{}/{}", layout::FILES_DIR, path))
+            .map_err(|e| TransportError::Io {
+                path: path.to_string(),
+                reason: e.to_string(),
+            })?;
+        let mut file = fs::File::open(&full).map_err(|e| TransportError::Io {
+            path: full.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        // `io::copy` 用固定大小（8 KiB）的栈上缓冲往返搬运，不整份读入内存
+        // ——与 `read_content` 的关键区别，见 `Transport::read_content_into`
+        // 的文档（服务端 C2 的镜像修复）。
+        io::copy(&mut file, out).map_err(|e| TransportError::Io {
+            path: full.display().to_string(),
+            reason: e.to_string(),
+        })
+    }
+
+    fn read_range(&self, path: &str, start: u64, len: u64) -> Result<Vec<u8>, TransportError> {
+        let full = self
+            .root
+            .join(&format!("{}/{}", layout::FILES_DIR, path))
+            .map_err(|e| TransportError::Io {
+                path: path.to_string(),
+                reason: e.to_string(),
+            })?;
+        let mut file = fs::File::open(&full).map_err(|e| TransportError::Io {
+            path: full.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| TransportError::Io {
+                path: full.display().to_string(),
+                reason: e.to_string(),
+            })?;
+        // 只分配这一段区间大小的内存——与服务端 `bounded_read`
+        // （`arcad/src/api.rs`）同一手法，不管文件本身多大。
+        let mut buf = vec![0u8; len as usize];
+        file.read_exact(&mut buf).map_err(|e| TransportError::Io {
+            path: full.display().to_string(),
+            reason: format!("读取区间 [{start}, {}) 失败：{e}", start + len),
+        })?;
+        Ok(buf)
+    }
+
+    fn read_by_hash(&self, hash: ContentHash) -> Result<Option<Vec<u8>>, TransportError> {
+        let remote = self.read_remote()?;
+        // `BTreeMap` 按路径 UTF-8 字节序迭代——多个路径共享同一份内容时，
+        // 取第一个命中即结果确定（与 `cat_cmd` 现有算法同一条纪律）。
+        let Some(hit_path) = remote.iter().find_map(|(p, s)| match s {
+            RemoteState::Present { hash: h, .. } if *h == hash => Some(p.clone()),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        self.read_content(&hit_path).map(Some)
+    }
+
     fn commit(&self, req: &CommitRequest) -> Result<CommitOutcome, TransportError> {
         // 评审 I3：跨进程排他——见 `arca_store::lock` 模块文档、
         // `commit_streamed` 同一处注释。
@@ -307,11 +372,172 @@ impl Transport for LocalTransport<'_> {
         atomic::write(self.root, &target, &req.bytes).map_err(TransportError::Atomic)?;
         append_item_version(self.root, &version)?;
         write_index_record(self.root, &req.path, req.item_id)?;
+        append_upsert_journal_event(self.root, &version, &req.path)?;
 
         Ok(CommitOutcome::Committed {
             item_id: req.item_id,
             version_id: req.version_id.clone(),
         })
+    }
+
+    fn commit_batch(&self, reqs: &[CommitRequest]) -> Result<BatchOutcome, TransportError> {
+        if reqs.is_empty() {
+            return Ok(BatchOutcome::Committed(Vec::new()));
+        }
+        // 评审 I3 同一条纪律：整批只在一次临界区内完成"读当前状态 → 校验
+        // 全部 → 写入全部"，不是逐条各自加锁——这正是"整批成功要么整批
+        // 不生效"在并发层面的对应：批次执行期间不会有另一个 commit/tombstone
+        // 插进来篡改校验依据的快照。
+        let _lock = arca_store::lock::acquire(self.root).map_err(TransportError::Lock)?;
+        let remote = self.read_remote()?;
+
+        // 预先算好"哪些 item_id 已被 tombstone 终结"，只读一次 journal——
+        // 不对每条请求各自调用 `hub::item_is_tombstoned`（那会重复扫描整段
+        // journal，是 `journal::append`/`gates.rs` 已经修过的 O(n·m) 同一
+        // 形状在批量提交上的重演，评审 I3 先例）。tombstone 是终局状态
+        // （一旦发生，`validate_commit`/本函数都拒绝任何后续提交复用同一
+        // item_id），"这个 item_id 在 journal 里出现过 Tombstone 事件"与
+        // "这个 item_id 的最后一条事件是 Tombstone"因此等价，不需要
+        // `hub::tombstoned_by_item` 那样额外保留"最后一条事件"的开销。
+        let (_cursor, journal_events) =
+            journal::read_all(self.root).map_err(TransportError::Journal)?;
+        let tombstoned: BTreeSet<ItemId> = journal_events
+            .iter()
+            .filter(|e| e.op == Op::Tombstone)
+            .map(|e| e.item_id)
+            .collect();
+
+        // working 状态：批次内先前条目一旦通过校验，就模拟"已经生效"更新
+        // 这两份状态，让批次内的连续版本（同一 item_id 在同一路径上先创建
+        // 后推进）也能正确校验，不只是互不相干的并列路径——`working_remote`
+        // 同时也是校验失败时 `Conflict.actual` 的数据来源，反映批次内先前
+        // 条目真实会造成的状态，不是过时的批前快照。
+        let mut working_remote: BTreeMap<String, RemoteState> = remote.clone();
+        let mut working_last_version: BTreeMap<ItemId, Option<VersionId>> = BTreeMap::new();
+
+        let mut prepared: Vec<(&CommitRequest, Option<VersionId>)> = Vec::with_capacity(reqs.len());
+        for (index, req) in reqs.iter().enumerate() {
+            if tombstoned.contains(&req.item_id) {
+                return Ok(BatchOutcome::Rejected {
+                    index,
+                    outcome: CommitOutcome::IdentityMismatch {
+                        path: req.path.clone(),
+                        claimed_item_id: req.item_id,
+                        actual_item_id: None,
+                    },
+                });
+            }
+
+            let current = working_remote
+                .get(&req.path)
+                .cloned()
+                .unwrap_or(RemoteState::Absent);
+            if let Some(owner) = owner_item_id(&current) {
+                if owner != req.item_id {
+                    return Ok(BatchOutcome::Rejected {
+                        index,
+                        outcome: CommitOutcome::IdentityMismatch {
+                            path: req.path.clone(),
+                            claimed_item_id: req.item_id,
+                            actual_item_id: Some(owner),
+                        },
+                    });
+                }
+            }
+            if let Some(other_path) = working_remote.iter().find_map(|(p, s)| {
+                (p != &req.path && owner_item_id(s) == Some(req.item_id)).then(|| p.clone())
+            }) {
+                return Ok(BatchOutcome::Rejected {
+                    index,
+                    outcome: CommitOutcome::IdentityMismatch {
+                        path: other_path,
+                        claimed_item_id: req.item_id,
+                        actual_item_id: Some(req.item_id),
+                    },
+                });
+            }
+
+            // CAS 比较对象：item 自己的版本链尾——批次内已经校验通过的条目从
+            // `working_last_version` 取（尚未落盘，磁盘读不到）；第一次在本批次
+            // 出现的 item_id 才去读磁盘（与单条 `commit` 的 `validate_commit`
+            // 同一处置）。
+            let item_last_version = match working_last_version.get(&req.item_id) {
+                Some(v) => v.clone(),
+                None => read_item_last_version(self.root, req.item_id)?.map(|v| v.version_id),
+            };
+            if item_last_version != req.parent {
+                return Ok(BatchOutcome::Rejected {
+                    index,
+                    outcome: CommitOutcome::Conflict {
+                        expected_parent: req.parent.clone(),
+                        actual: current,
+                    },
+                });
+            }
+
+            working_remote.insert(
+                req.path.clone(),
+                RemoteState::Present {
+                    item_id: req.item_id,
+                    version_id: req.version_id.clone(),
+                    hash: ContentHash::from_bytes(&req.bytes),
+                    size: req.bytes.len() as u64,
+                },
+            );
+            working_last_version.insert(req.item_id, Some(req.version_id.clone()));
+            prepared.push((req, item_last_version));
+        }
+
+        // 全部校验通过——落盘：内容先经 `atomic::Batch`（目录 fsync 去重收口，
+        // 与 M1d 批量归档同一手法）整批写入，再统一追加 items 链 + index
+        // 记录 + journal 事件（`AppendBatch` 同样把目录 fsync 收口到一次）。
+        // "内容先于指针发布"的顺序不变：全部内容先落盘，指针（items/index/
+        // journal）才跟进。
+        let mut file_batch = atomic::Batch::new(self.root);
+        for (req, _) in &prepared {
+            let target = format!("{}/{}", layout::FILES_DIR, req.path);
+            file_batch
+                .write(&target, &req.bytes)
+                .map_err(TransportError::Atomic)?;
+        }
+        file_batch.commit().map_err(TransportError::Atomic)?;
+
+        let mut journal_batch =
+            journal::AppendBatch::open(self.root).map_err(TransportError::Journal)?;
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        for (req, item_last_version) in prepared {
+            let version = Version {
+                version_id: req.version_id.clone(),
+                item_id: req.item_id,
+                parent: item_last_version,
+                hash: ContentHash::from_bytes(&req.bytes),
+                size: req.bytes.len() as u64,
+                mtime: req.mtime.clone(),
+                actor: req.actor.clone(),
+                committed_at: crate::clock::now_rfc3339(),
+            };
+            append_item_version(self.root, &version)?;
+            write_index_record(self.root, &req.path, req.item_id)?;
+
+            let seq = journal_batch.next_seq();
+            journal_batch
+                .push(JournalEvent {
+                    seq,
+                    op: Op::Upsert,
+                    item_id: version.item_id,
+                    version_id: version.version_id.clone(),
+                    path: req.path.clone(),
+                    from: None,
+                    actor: version.actor.clone(),
+                    at: version.committed_at.clone(),
+                })
+                .map_err(TransportError::Journal)?;
+
+            outcomes.push((req.item_id, req.version_id.clone()));
+        }
+        journal_batch.commit().map_err(TransportError::Journal)?;
+
+        Ok(BatchOutcome::Committed(outcomes))
     }
 
     fn tombstone(&self, req: &TombstoneRequest) -> Result<CommitOutcome, TransportError> {
@@ -425,6 +651,36 @@ fn append_item_version(root: &StorageRoot, version: &Version) -> Result<(), Tran
     content.push_str(&items::to_line(version).map_err(TransportError::Format)?);
     content.push('\n');
     atomic::write(root, &rel, content.as_bytes()).map_err(TransportError::Atomic)
+}
+
+/// M2c Task 1：把这次落地的新版本写进 journal（`Op::Upsert`）——补齐
+/// `journal.rs`/`PROTOCOL.md` §3 记录的落地前提：M2a 只让 `tombstone` 写
+/// journal（删除传播闸门当时唯一的消费者），`commit`/`commit_streamed` 从未
+/// 写过 `Op::Upsert` 事件。这在 M2a/M2b 语境下无害——`hub::read_remote` 从
+/// `items/`/`index/` 直接推导 `Present` 状态，不依赖 journal——但 M2c 的
+/// 变更流端点（`GET .../changes`）如果只回放 tombstone/rename，客户端能看到
+/// 删除却看不到新增/修改，长轮询就失去了存在的意义。`Op::Upsert` 早已在
+/// `FORMAT.md` §7.2 定义，这里只是补上触发写入的一处调用点，不新增磁盘格式。
+fn append_upsert_journal_event(
+    root: &StorageRoot,
+    version: &Version,
+    path: &str,
+) -> Result<(), TransportError> {
+    let seq = journal::next_seq(root).map_err(TransportError::Journal)?;
+    journal::append(
+        root,
+        &JournalEvent {
+            seq,
+            op: Op::Upsert,
+            item_id: version.item_id,
+            version_id: version.version_id.clone(),
+            path: path.to_string(),
+            from: None,
+            actor: version.actor.clone(),
+            at: version.committed_at.clone(),
+        },
+    )
+    .map_err(TransportError::Journal)
 }
 
 /// 整体原子替换 `index/<xx>/<key>.json`——与 `sync.rs::write_index_record` 同一手法。
@@ -994,6 +1250,395 @@ mod tests {
                 assert!(*version_id == v2 || *version_id == v3);
             }
             other => panic!("应为 Present，实得 {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // M2c Task 1：四条缺口
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn commit现在把upsert事件写进journal() {
+        // 补齐前提（模块顶部 `append_upsert_journal_event` 文档）：
+        // M2c 变更流端点要能看到新增/修改，不能只看到删除。
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        let item_id = crate::ids::new_item_id();
+        let v1 = crate::ids::new_version_id();
+
+        transport
+            .commit(&CommitRequest {
+                path: "a.txt".to_string(),
+                item_id,
+                version_id: v1.clone(),
+                parent: None,
+                bytes: b"hello".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+
+        let (_cursor, events) = journal::read_all(&root).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].op, arca_format::journal::Op::Upsert);
+        assert_eq!(events[0].item_id, item_id);
+        assert_eq!(events[0].version_id, v1);
+        assert_eq!(events[0].path, "a.txt");
+    }
+
+    #[test]
+    fn read_content_into流式读出与read_content相同的字节() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        transport
+            .commit(&CommitRequest {
+                path: "a.txt".to_string(),
+                item_id: crate::ids::new_item_id(),
+                version_id: crate::ids::new_version_id(),
+                parent: None,
+                bytes: b"hello streamed world".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+
+        let mut out = Vec::new();
+        let written = transport.read_content_into("a.txt", &mut out).unwrap();
+        assert_eq!(written, "hello streamed world".len() as u64);
+        assert_eq!(out, b"hello streamed world");
+    }
+
+    #[test]
+    fn read_content_into对不存在路径报io错误() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        let mut out = Vec::new();
+        assert!(matches!(
+            transport.read_content_into("不存在.txt", &mut out),
+            Err(TransportError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn read_range取出正确的字节区间() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        transport
+            .commit(&CommitRequest {
+                path: "a.txt".to_string(),
+                item_id: crate::ids::new_item_id(),
+                version_id: crate::ids::new_version_id(),
+                parent: None,
+                bytes: b"0123456789".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+
+        assert_eq!(transport.read_range("a.txt", 2, 3).unwrap(), b"234");
+        assert_eq!(transport.read_range("a.txt", 0, 10).unwrap(), b"0123456789");
+    }
+
+    #[test]
+    fn read_range越界时报io错误() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        transport
+            .commit(&CommitRequest {
+                path: "a.txt".to_string(),
+                item_id: crate::ids::new_item_id(),
+                version_id: crate::ids::new_version_id(),
+                parent: None,
+                bytes: b"short".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+
+        assert!(matches!(
+            transport.read_range("a.txt", 0, 100),
+            Err(TransportError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn read_by_hash按内容哈希取回字节_多路径去重取路径序第一个() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        transport
+            .commit(&CommitRequest {
+                path: "z.txt".to_string(),
+                item_id: crate::ids::new_item_id(),
+                version_id: crate::ids::new_version_id(),
+                parent: None,
+                bytes: b"shared".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+        transport
+            .commit(&CommitRequest {
+                path: "a.txt".to_string(),
+                item_id: crate::ids::new_item_id(),
+                version_id: crate::ids::new_version_id(),
+                parent: None,
+                bytes: b"shared".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+
+        let hash = ContentHash::from_bytes(b"shared");
+        // 两个路径都持有相同内容——按路径排序应取 "a.txt"（排在 "z.txt" 前）。
+        assert_eq!(
+            transport.read_by_hash(hash).unwrap(),
+            Some(b"shared".to_vec())
+        );
+    }
+
+    #[test]
+    fn read_by_hash查无匹配返回none而不是错误() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        let result = transport
+            .read_by_hash(ContentHash::from_bytes("从未出现过的内容".as_bytes()))
+            .unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn commit_batch空切片直接返回空的committed() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        assert_eq!(
+            transport.commit_batch(&[]).unwrap(),
+            BatchOutcome::Committed(vec![])
+        );
+    }
+
+    #[test]
+    fn commit_batch全部成功时内容与journal事件按顺序全部落地() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+
+        let item_a = crate::ids::new_item_id();
+        let item_b = crate::ids::new_item_id();
+        let va = crate::ids::new_version_id();
+        let vb = crate::ids::new_version_id();
+
+        let outcome = transport
+            .commit_batch(&[
+                CommitRequest {
+                    path: "a.txt".to_string(),
+                    item_id: item_a,
+                    version_id: va.clone(),
+                    parent: None,
+                    bytes: b"content-a".to_vec(),
+                    mtime: "t".to_string(),
+                    actor: actor(),
+                },
+                CommitRequest {
+                    path: "b.txt".to_string(),
+                    item_id: item_b,
+                    version_id: vb.clone(),
+                    parent: None,
+                    bytes: b"content-b".to_vec(),
+                    mtime: "t".to_string(),
+                    actor: actor(),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            BatchOutcome::Committed(vec![(item_a, va.clone()), (item_b, vb.clone())])
+        );
+        assert_eq!(
+            fs::read(dir.path().join("files/a.txt")).unwrap(),
+            b"content-a"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("files/b.txt")).unwrap(),
+            b"content-b"
+        );
+
+        let (_cursor, events) = journal::read_all(&root).unwrap();
+        assert_eq!(events.len(), 2, "两条 upsert 事件都应落盘");
+        assert_eq!(events[0].path, "a.txt");
+        assert_eq!(events[1].path, "b.txt");
+    }
+
+    /// 批次内同一 item_id 在同一路径上连续两个版本——依赖 working 状态
+    /// 而不是磁盘读取才能正确校验（模块内 `commit_batch` 文档）。
+    #[test]
+    fn commit_batch支持同一批次内同item的连续版本() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        let item_id = crate::ids::new_item_id();
+        let v1 = crate::ids::new_version_id();
+        let v2 = crate::ids::new_version_id();
+
+        let outcome = transport
+            .commit_batch(&[
+                CommitRequest {
+                    path: "a.txt".to_string(),
+                    item_id,
+                    version_id: v1.clone(),
+                    parent: None,
+                    bytes: b"v1".to_vec(),
+                    mtime: "t".to_string(),
+                    actor: actor(),
+                },
+                CommitRequest {
+                    path: "a.txt".to_string(),
+                    item_id,
+                    version_id: v2.clone(),
+                    parent: Some(v1.clone()),
+                    bytes: b"v2".to_vec(),
+                    mtime: "t".to_string(),
+                    actor: actor(),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            BatchOutcome::Committed(vec![(item_id, v1), (item_id, v2)])
+        );
+        assert_eq!(fs::read(dir.path().join("files/a.txt")).unwrap(), b"v2");
+    }
+
+    /// 整批要么全部成功要么全部不生效——第二条 CAS 冲突时，第一条也不应该
+    /// 落盘（M2c Task 1 brief：不做"部分成功"）。
+    #[test]
+    fn commit_batch任一条冲突时整批不生效() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+
+        let item_a = crate::ids::new_item_id();
+        let item_b = crate::ids::new_item_id();
+        let stale_parent =
+            arca_format::model::VersionId::new("20260101T000000Z", &"9".repeat(32)).unwrap();
+
+        let outcome = transport
+            .commit_batch(&[
+                CommitRequest {
+                    path: "a.txt".to_string(),
+                    item_id: item_a,
+                    version_id: crate::ids::new_version_id(),
+                    parent: None,
+                    bytes: b"content-a".to_vec(),
+                    mtime: "t".to_string(),
+                    actor: actor(),
+                },
+                CommitRequest {
+                    path: "b.txt".to_string(),
+                    item_id: item_b,
+                    // 声称已经存在一个旧版本——远端其实是 Absent，必然冲突。
+                    parent: Some(stale_parent.clone()),
+                    version_id: crate::ids::new_version_id(),
+                    bytes: b"content-b".to_vec(),
+                    mtime: "t".to_string(),
+                    actor: actor(),
+                },
+            ])
+            .unwrap();
+
+        match outcome {
+            BatchOutcome::Rejected { index, outcome } => {
+                assert_eq!(index, 1, "应指明是第二条（0-based）失败");
+                assert!(matches!(outcome, CommitOutcome::Conflict { .. }));
+            }
+            other => panic!("应为 Rejected，实得 {other:?}"),
+        }
+
+        // 整批不生效：第一条即便自己校验通过，也不应该落盘。
+        assert!(
+            !dir.path().join("files/a.txt").exists(),
+            "第一条不应因为它自己校验通过就被单独落盘"
+        );
+        assert!(!dir.path().join("files/b.txt").exists());
+        let (cursor, events) = journal::read_all(&root).unwrap();
+        assert_eq!(cursor, None, "整批失败时不应有任何 journal 事件落盘");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn commit_batch遇到已被tombstone终结的item时报identity_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        let item_id = crate::ids::new_item_id();
+        let v1 = crate::ids::new_version_id();
+
+        transport
+            .commit(&CommitRequest {
+                path: "a.txt".to_string(),
+                item_id,
+                version_id: v1.clone(),
+                parent: None,
+                bytes: b"content".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+        transport
+            .tombstone(&TombstoneRequest {
+                path: "a.txt".to_string(),
+                item_id,
+                parent: v1,
+                actor: actor(),
+                at: "t".to_string(),
+            })
+            .unwrap();
+
+        let outcome = transport
+            .commit_batch(&[CommitRequest {
+                path: "a.txt".to_string(),
+                item_id,
+                version_id: crate::ids::new_version_id(),
+                parent: None,
+                bytes: b"resurrected".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            }])
+            .unwrap();
+
+        match outcome {
+            BatchOutcome::Rejected { index, outcome } => {
+                assert_eq!(index, 0);
+                assert!(matches!(
+                    outcome,
+                    CommitOutcome::IdentityMismatch {
+                        actual_item_id: None,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("应为 Rejected，实得 {other:?}"),
         }
     }
 }
