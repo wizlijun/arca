@@ -89,6 +89,9 @@ dependencies = [
  "arca-publish",
  "arca-store",
  "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
