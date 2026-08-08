@@ -152,15 +152,30 @@
 | `400` | `request.metadata_missing` | `PUT` 缺少 `Arca-Item-Id`/`Arca-Version-Id`/`Arca-Mtime` |
 | `400` | `path.rejected` | 路径未通过 `path_rules::check` |
 | `400` | `request.hash_missing` | `GET .../trash/{item_id}` 缺少或格式不合法的 `hash` 查询参数 |
+| `400` | `request.item_id_invalid` | `GET .../trash/{item_id}` 的 `item_id` 不是合法的 32 位小写十六进制 |
 | `404` | （无 `code`，标准 HTTP 语义已自解释） | 路径/记录此刻不存在 |
-| `412` | `commit.stale_parent` | CAS 冲突，结构化响应体见上 |
+| `412` | `commit.stale_parent` | CAS 冲突，结构化响应体见上；`Range` 续传的 `If-Match` 与当前版本不符时同样用这个 `code`（响应体退化为只带 `theirs`，没有 `base`/`yours`——续传不是一次写入提交，没有这两者的概念） |
 | `503` | `mount.absent` / `mount.identity_mismatch` | 数据集离线（I11） |
 
-`request.if_match_required`/`request.metadata_missing`/`request.hash_missing`
-是本节新增的三个码，`class=needs_human`（调用方的客户端实现有 bug，需要
-人修，不是可以退避重试的瞬时故障，也不是协议层的正常冲突）——按 §7 的
-既有登记纪律补进那张总表。本表只覆盖本节定义的五个端点；longpoll/SSE/
-游标（M2c）与更多端点落地时继续增补，不改动已登记条目的语义（I10）。
+`request.if_match_required`/`request.metadata_missing`/`request.hash_missing`/
+`request.item_id_invalid` 是本节新增的四个码，`class=needs_human`（调用方的
+客户端实现有 bug，需要人修，不是可以退避重试的瞬时故障，也不是协议层的
+正常冲突）——按 §7 的既有登记纪律补进那张总表。本表只覆盖本节定义的五个
+端点；longpoll/SSE/游标（M2c）与更多端点落地时继续增补，不改动已登记条目
+的语义（I10）。
+
+**实现落地时对本节文本未明确覆盖的两处分支做了最小一致延伸**
+（`crates/arcad/src/api.rs`，M2b Task 5）：
+
+- `PUT` 用 `If-None-Match: *`（仅创建）提交、但路径此刻已存在而冲突时，
+  412 响应体的 `base` 为 `null`——本节「412 的响应体」一节的示例只覆盖了
+  「客户端声明了一个具体 `version_id`」的情形；`If-None-Match: *` 场景下
+  客户端没有声明任何版本，`null` 与 `theirs`/`yours` 在"这里没有这个东西"
+  上用同一个记号，不是遗漏。
+- `base.hash`/`base.size` 需要反查 `items/<item_id>.jsonl` 版本链才能得到；
+  找不到对应版本时（原文「理论上不该发生」的情形）响应体只留
+  `base.item_id`/`base.version_id`，不让这个诊断性丰富信息的缺失连累整个
+  412 响应失败。
 
 ## 2. 上传协议
 
@@ -313,6 +328,7 @@ status`/`arca sync` 据此判断本轮是否会做全量对账）；`reset_reaso
 | `request.if_match_required` | `needs_human` | HTTP `PUT`/`DELETE` 缺少必需的条件头（`If-Match` 或 `If-None-Match: *`）——I4 不允许无条件写，§1.2 |
 | `request.metadata_missing` | `needs_human` | HTTP `PUT` 缺少 `Arca-Item-Id`/`Arca-Version-Id`/`Arca-Mtime` 中的一个或多个，§1.2 |
 | `request.hash_missing` | `needs_human` | HTTP `GET .../trash/{item_id}` 缺少或格式不合法的 `hash` 查询参数，§1.2 |
+| `request.item_id_invalid` | `needs_human` | HTTP `GET .../trash/{item_id}` 的 `item_id` 不是合法的 32 位小写十六进制，§1.2 |
 | `internal.invariant_violated` | `bug` | 内部不变量被破坏 |
 
 TODO：退出码与 `code` 的映射表（M1）。HTTP 状态码与 `code` 的映射表——§1.2
