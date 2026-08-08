@@ -60,6 +60,11 @@ enum Command {
         /// 覆盖从 .gitarca 解析出的存储根路径（外置盘换挂载点等场景）
         #[arg(long)]
         root: Option<std::path::PathBuf>,
+        /// 显式承认"就是要在这个（当前打不开的）路径上新建一个全新存储根"
+        /// ——数据集此前已被纳管过（.arca/manifest 存在）而存储根缺失时，
+        /// 默认按 I11 拒绝凭空新建，必须用这个开关明确表态（评审 Critical #2）
+        #[arg(long = "create-root")]
+        create_root: bool,
     },
     /// 对一个已纳管的数据集跑一轮 file:// 调和闭环
     Sync {
@@ -191,7 +196,11 @@ fn main() -> std::process::ExitCode {
             hub_url.as_deref(),
             root.as_deref(),
         ),
-        Command::Adopt { path, root } => commands::porcelain::adopt_cmd(&path, root.as_deref()),
+        Command::Adopt {
+            path,
+            root,
+            create_root,
+        } => commands::porcelain::adopt_cmd(&path, root.as_deref(), create_root),
         Command::Sync { path, root } => commands::porcelain::sync_cmd(&path, root.as_deref()),
         Command::Status { path, root } => commands::porcelain::status_cmd(&path, root.as_deref()),
         Command::Verify { path, root } => commands::porcelain::verify_cmd(&path, root.as_deref()),

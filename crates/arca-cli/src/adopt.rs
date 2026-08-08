@@ -30,7 +30,8 @@
 use crate::sync;
 use crate::vault::{self, HubRootError, VaultError};
 use arca_format::dataset::DatasetConfig;
-use arca_format::manifest::{Manifest, ManifestEntry};
+#[cfg(test)]
+use arca_format::manifest::Manifest;
 use arca_format::model::Actor;
 use arca_format::path_rules::{self, PathStatus};
 use arca_format::trace::TraceSink;
@@ -54,6 +55,13 @@ pub struct AdoptOptions<'a> {
     /// 覆盖从 `.gitarca` 解析出的存储根路径（外置盘换挂载点等场景）。
     pub root_override: Option<&'a Path>,
     pub actor: Actor,
+    /// 显式承认"就是要在这个（当前打不开的）路径上新建一个存储根"——
+    /// 唯一能绕过 [`AdoptError::RootMissingButAdopted`] 这道 I11 拦截的开关
+    /// （评审 Critical #2）。默认 `false`：`StorageRoot::open` 报
+    /// `MountError::Absent` 时，若这个数据集此前已经被纳管过（见该错误的
+    /// doc comment），一律拒绝凭空 create，绝不能让"外置盘被拔了"与
+    /// "这是一个全新的根"这两种状态被静默混同。
+    pub allow_create_root: bool,
 }
 
 #[derive(Debug)]
@@ -85,6 +93,27 @@ pub enum AdoptError {
     HubRoot(HubRootError),
     /// 存储根存在但身份不符（I11）——挂错了盘。
     Mount(MountError),
+    /// 存储根缺失（`MountError::Absent`），但这个数据集**此前已经被纳管
+    /// 过**——`<dataset>/.arca/manifest` 存在，那是进 git 的、"这个数据集
+    /// 曾经跑过一次成功的 adopt"的权威信号（评审 Critical #2）。基线
+    /// （`.arca/client/`）不能用来当这道判断的安全网：它按 I9 是可抛弃投影，
+    /// 唯一能保证的就是"会被丢弃"，用一个保证会消失的信号去守一个绝不能
+    /// 静默发生的操作，方向是反的。
+    ///
+    /// 这种情况下 `Absent` 就是"卷真的不见了"（外置盘被拔、挂载点变了），
+    /// 不是"这是一个还没建过的全新根"——绝不静默 `StorageRoot::create`：
+    /// 那会在幽灵挂载点（例如内部磁盘上一个恰好同名的空目录）上凭空造出
+    /// 一个新的、内容为空的存储根，因为 `dataset_id` 与真正的 hub 相同，
+    /// 之后 `StorageRoot::open` 会欣然接受它，把真正的 hub 呈现成"什么都
+    /// 没有"——这正是 I11 明令禁止的"绝不呈现为空库"的镜像形态。
+    ///
+    /// 唯一的绕过方式是显式传入 `AdoptOptions::allow_create_root = true`
+    /// （CLI 是 `--create-root`）：调用方必须自己说出"就是要在这里新建"，
+    /// 这个决定绝不能由 arca 替用户做。
+    RootMissingButAdopted {
+        path: String,
+        root: String,
+    },
     Create(CreateError),
     PathInvalid(PathStatus),
     Sync(sync::SyncError),
@@ -113,6 +142,12 @@ impl fmt::Display for AdoptError {
             AdoptError::HubNotFound { hub } => write!(f, "hub {hub:?} 未在 .gitarca 登记"),
             AdoptError::HubRoot(e) => write!(f, "{e}"),
             AdoptError::Mount(e) => write!(f, "{e}"),
+            AdoptError::RootMissingButAdopted { path, root } => write!(
+                f,
+                "{path} 此前已被纳管过（{path}/.arca/manifest 存在），但存储根 {root} 缺失——\
+                 按 I11 视为离线，绝不在幽灵挂载点上凭空新建根。请确认正确的挂载点/--root；\
+                 如确实要在这个新位置初始化一个全新的存储根，请显式加 --create-root"
+            ),
             AdoptError::Create(e) => write!(f, "{e}"),
             AdoptError::PathInvalid(s) => write!(f, "数据集路径不合规：{}", s.as_str()),
             AdoptError::Sync(e) => write!(f, "{e}"),
@@ -168,13 +203,26 @@ pub fn adopt(
     let root_path =
         vault::resolve_hub_root(hub, opts.root_override).map_err(AdoptError::HubRoot)?;
 
+    // 数据集自己携带着"它是否曾被 adopt 过"的信号：`.arca/manifest` 进
+    // git，与基线（会被丢弃的本地投影，I9）不同，它的存在与否本身就是可信
+    // 的历史证据（评审 Critical #2）。只用来判断"要不要允许在 Absent 时凭空
+    // create"，不参与后续任何调和逻辑。
+    let manifest_marker = dataset_dir.join(".arca").join("manifest");
+    let previously_adopted = manifest_marker.is_file();
+
     let bootstrapped_storage_root;
     let root = match StorageRoot::open(&root_path, Some(&cfg.dataset_id)) {
         Ok(root) => {
             bootstrapped_storage_root = false;
             root
         }
-        Err(MountError::Absent { .. }) => {
+        Err(MountError::Absent { path }) => {
+            if previously_adopted && !opts.allow_create_root {
+                return Err(AdoptError::RootMissingButAdopted {
+                    path: normalized_path,
+                    root: path,
+                });
+            }
             let created_at = crate::clock::now_rfc3339();
             let root = StorageRoot::create(&root_path, &cfg.dataset_id, &created_at)
                 .map_err(AdoptError::Create)?;
@@ -186,7 +234,9 @@ pub fn adopt(
 
     let report = sync::sync(&dataset_dir, &root, &opts.actor, sink).map_err(AdoptError::Sync)?;
 
-    write_manifest(&dataset_dir).map_err(AdoptError::Manifest)?;
+    // 清单已经由 `sync::sync` 在收尾时从最终基线重新生成（评审 Important #4：
+    // 清单不能只在 `adopt` 里生成一次，`sync` 每次收尾都要保持它与基线同步）。
+    // `adopt` 不需要再单独生成一遍。
 
     vault::update_gitignore(
         repo.root(),
@@ -215,38 +265,6 @@ pub fn adopt(
         report,
         bootstrapped_storage_root,
         untracked_from_git,
-    })
-}
-
-/// 从基线重建当前的清单并原子写入 `<dataset>/.arca/manifest`——`sync` 落地
-/// 之后的基线就是"这个数据集当前每个受管路径的哈希/大小/mtime 的权威快照"，
-/// 与清单要记录的信息完全同构，不需要重新扫描一遍磁盘。
-fn write_manifest(dataset_dir: &Path) -> Result<(), arca_format::error::FormatError> {
-    let baseline = crate::baseline::load(dataset_dir).map_err(|e| {
-        arca_format::error::FormatError::Malformed {
-            line: 0,
-            reason: e.to_string(),
-        }
-    })?;
-    let entries: Vec<ManifestEntry> = baseline
-        .iter()
-        .filter_map(|(path, state)| match state {
-            arca_core::state::BaseState::Present { hash, size, .. } => Some(ManifestEntry {
-                path: path.clone(),
-                hash: *hash,
-                size: *size,
-                mtime: crate::clock::now_rfc3339(),
-            }),
-            arca_core::state::BaseState::Absent => None,
-        })
-        .collect();
-    let manifest = Manifest::from_entries(entries)?;
-    let path = dataset_dir.join(".arca").join("manifest");
-    vault::write_text_atomic(&path, &manifest.to_string()).map_err(|e| {
-        arca_format::error::FormatError::Malformed {
-            line: 0,
-            reason: format!("写入 {} 失败：{e}", path.display()),
-        }
     })
 }
 
@@ -345,6 +363,7 @@ mod tests {
                 path: "assets",
                 root_override: None,
                 actor: actor(),
+                allow_create_root: false,
             },
             &mut sink,
         )
@@ -365,6 +384,7 @@ mod tests {
                 path: "assets",
                 root_override: None,
                 actor: actor(),
+                allow_create_root: false,
             },
             &mut sink,
         )
@@ -391,6 +411,7 @@ mod tests {
                 path: "assets",
                 root_override: None,
                 actor: actor(),
+                allow_create_root: false,
             },
             &mut sink,
         )
@@ -414,6 +435,7 @@ mod tests {
                 path: "assets",
                 root_override: None,
                 actor: actor(),
+                allow_create_root: false,
             },
             &mut sink,
         )
@@ -444,6 +466,7 @@ mod tests {
                 path: "assets",
                 root_override: None,
                 actor: actor(),
+                allow_create_root: false,
             },
             &mut sink,
         )
@@ -516,6 +539,7 @@ mod tests {
                 path: "assets",
                 root_override: None,
                 actor: actor(),
+                allow_create_root: false,
             },
             &mut sink,
         )
@@ -555,6 +579,7 @@ mod tests {
                 path: "assets",
                 root_override: None,
                 actor: actor(),
+                allow_create_root: false,
             },
             &mut sink,
         )
@@ -592,6 +617,7 @@ mod tests {
                 path: "assets",
                 root_override: None,
                 actor: actor(),
+                allow_create_root: false,
             },
             &mut sink,
         )
@@ -642,6 +668,7 @@ mod tests {
                 path: "assets",
                 root_override: None,
                 actor: actor(),
+                allow_create_root: false,
             },
             &mut sink,
         )
@@ -653,5 +680,125 @@ mod tests {
             outcome_b.report.uploaded.is_empty(),
             "零传输：不应该重复上传"
         );
+    }
+
+    /// 评审 Critical #2 的核心复现测试：数据集此前已经被成功 adopt 过
+    /// （`.arca/manifest` 存在），随后存储根整个"消失"（外置盘被拔——把
+    /// 整个存储根目录搬走模拟这个场景）。第二次 `adopt` 必须拒绝、且绝不
+    /// 在幽灵挂载点上创建任何东西——这正是评审实测到的"幽灵挂载点上凭空
+    /// 造出一个新存储根，真正的 hub 被静默呈现成空库"的那条路径。
+    #[test]
+    fn 已纳管过的数据集存储根消失时adopt拒绝创建新根() {
+        let (vault_dir, store_dir) = 建已登记的数据集(&[("a.txt", b"hello")]);
+        let mut sink = NullSink;
+        adopt(
+            vault_dir.path(),
+            AdoptOptions {
+                path: "assets",
+                root_override: None,
+                actor: actor(),
+                allow_create_root: false,
+            },
+            &mut sink,
+        )
+        .unwrap();
+        assert!(
+            vault_dir.path().join("assets/.arca/manifest").is_file(),
+            "测试前置条件：第一次 adopt 应该已经生成清单"
+        );
+
+        // 模拟"外置盘被拔"：整个存储根目录消失，挂载点路径本身还在
+        // （`root_path` 是 `store_dir/root`），但 `format.json` 及一切内容
+        // 都不见了——这正是幽灵挂载点场景（评审用例把根目录整体移走）。
+        let root_path = store_dir.path().join("root");
+        assert!(root_path.exists(), "测试前置条件：存储根应该已经存在");
+        fs::remove_dir_all(&root_path).unwrap();
+
+        let err = adopt(
+            vault_dir.path(),
+            AdoptOptions {
+                path: "assets",
+                root_override: None,
+                actor: actor(),
+                allow_create_root: false,
+            },
+            &mut sink,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, AdoptError::RootMissingButAdopted { .. }),
+            "应报 RootMissingButAdopted，实得 {err:?}"
+        );
+        // 绝不能在幽灵挂载点上凭空创建任何东西——I11：未挂载就是未挂载，
+        // 不能被静默呈现成"一个刚建好的空库"。
+        assert!(
+            !root_path.exists(),
+            "拒绝时绝不应该创建任何目录，实际却出现了 {}",
+            root_path.display()
+        );
+    }
+
+    /// `--create-root`（`AdoptOptions::allow_create_root`）是唯一能绕过上面
+    /// 那道拦截的显式开关：用户明确说"就是要在这里新建"时才创建。
+    #[test]
+    fn 已纳管过的数据集加上allow_create_root后可以显式重建() {
+        let (vault_dir, store_dir) = 建已登记的数据集(&[("a.txt", b"hello")]);
+        let mut sink = NullSink;
+        adopt(
+            vault_dir.path(),
+            AdoptOptions {
+                path: "assets",
+                root_override: None,
+                actor: actor(),
+                allow_create_root: false,
+            },
+            &mut sink,
+        )
+        .unwrap();
+
+        let root_path = store_dir.path().join("root");
+        fs::remove_dir_all(&root_path).unwrap();
+
+        let outcome = adopt(
+            vault_dir.path(),
+            AdoptOptions {
+                path: "assets",
+                root_override: None,
+                actor: actor(),
+                allow_create_root: true,
+            },
+            &mut sink,
+        )
+        .unwrap();
+        assert!(outcome.bootstrapped_storage_root);
+        assert!(root_path.join(".arca/format.json").is_file());
+    }
+
+    /// 对照组：从未 adopt 过（`.arca/manifest` 不存在）时，`Absent` 就是
+    /// "这是一个还没建过的全新根"——应当正常引导，不需要 `--create-root`。
+    /// （`adopt引导全新存储根并上传全部文件` 已经隐含覆盖了这一路径，这里
+    /// 显式把断言写清楚：manifest 确实不存在，且不需要 allow_create_root。）
+    #[test]
+    fn 从未adopt过时manifest不存在存储根照常正常引导() {
+        let (vault_dir, _store_dir) = 建已登记的数据集(&[("a.txt", b"hello")]);
+        assert!(
+            !vault_dir.path().join("assets/.arca/manifest").exists(),
+            "测试前置条件：首次 adopt 之前不应该有清单"
+        );
+
+        let mut sink = NullSink;
+        let outcome = adopt(
+            vault_dir.path(),
+            AdoptOptions {
+                path: "assets",
+                root_override: None,
+                actor: actor(),
+                allow_create_root: false,
+            },
+            &mut sink,
+        )
+        .unwrap();
+        assert!(outcome.bootstrapped_storage_root);
     }
 }

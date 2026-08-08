@@ -157,8 +157,8 @@ fn flush_trace_if_needed(sid: &arca_format::trace::Sid, sink: &mut RingSink, suc
     }
 }
 
-/// `arca adopt <path> [--root <path>]`。
-pub fn adopt_cmd(path: &str, root: Option<&Path>) -> ExitCode {
+/// `arca adopt <path> [--root <path>] [--create-root]`。
+pub fn adopt_cmd(path: &str, root: Option<&Path>, allow_create_root: bool) -> ExitCode {
     let sid = trace_sink::resolve_sid();
     let mut sink = RingSink::default();
 
@@ -166,6 +166,7 @@ pub fn adopt_cmd(path: &str, root: Option<&Path>) -> ExitCode {
         path,
         root_override: root,
         actor: default_actor(),
+        allow_create_root,
     };
     let (code, succeeded) = match adopt::adopt(&cwd(), opts, &mut sink) {
         Ok(outcome) => {
@@ -204,6 +205,10 @@ pub fn adopt_cmd(path: &str, root: Option<&Path>) -> ExitCode {
             eprintln!("存储根身份不明，已按 I11 拒绝——数据集离线");
             (ExitCode::from(2), false)
         }
+        Err(e @ adopt::AdoptError::RootMissingButAdopted { .. }) => {
+            eprintln!("{e}");
+            (ExitCode::from(2), false)
+        }
         Err(e) => {
             eprintln!("{e}");
             (ExitCode::from(1), false)
@@ -222,7 +227,10 @@ pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::from(2);
+            // 评审 Minor：与 status/verify/ls/state dump 对同一个 VaultError
+            // 统一退出码——"不是 git 仓库"/".gitarca 缺失"不是 I11 意义上的
+            // "身份不明"（那专指存储根挂载失败/卷身份不符），不该占用退出码 2。
+            return ExitCode::from(1);
         }
     };
     let normalized = match arca_format::path_rules::check(path) {
@@ -291,6 +299,14 @@ pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
     let (code, succeeded) =
         match sync_lib::sync(&dataset_dir, &storage_root, &default_actor(), &mut sink) {
             Ok(report) => {
+                // 评审 Important #2：基线被重置（缺失/损坏，本轮是全量对账）
+                // 是"为什么这次结果长这样"的关键线索——`status_cmd` 已经打印
+                // 这条提示，`sync_cmd` 此前算出了同一个字段却从不读它，混合
+                // 场景下用户会看到一堆 upload/adopt 或一个"结构化冲突"却不知道
+                // 起因就是基线被重建。
+                if report.baseline_reset {
+                    eprintln!("基线已重建（此前缺失或损坏）——本轮是一次全量对账");
+                }
                 for p in &report.uploaded {
                     println!("upload\t{p}");
                 }
@@ -448,7 +464,9 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::from(2);
+            // 评审 Minor：与 status/verify/ls/state dump 统一退出码，理由同
+            // `sync_cmd` 上方的同一处改动。
+            return ExitCode::from(1);
         }
     };
     let report = doctor::doctor(&vault.repo, &vault.registry, root);
@@ -461,7 +479,12 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
 
     for dataset_health in &report.datasets {
         match dataset_health {
-            doctor::DatasetHealth::Checked { path, local_only } => {
+            doctor::DatasetHealth::Checked {
+                path,
+                local_only,
+                ignore_issues,
+                manifest_issue,
+            } => {
                 if !local_only.is_empty() {
                     eprintln!();
                     eprintln!(
@@ -477,12 +500,26 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
                     );
                     eprintln!();
                 }
+                // 评审 Important #1：`.gitignore` 反选块的实测问题——受管
+                // 二进制可能会被下一次 `git add -A` 提交进 git，或协作者
+                // 拿不到清单/配置。
+                for issue in ignore_issues {
+                    eprintln!("数据集 {path} 的 .gitignore 反选块有问题：{issue}");
+                }
+                // 评审 Important #4：清单与基线漂移——协作者从 git 拿到的
+                // 清单可能已经不反映当前受管路径集合。
+                if let Some(issue) = manifest_issue {
+                    eprintln!("数据集 {path} 的清单与基线不一致：{issue}");
+                }
             }
             doctor::DatasetHealth::Offline { path, reason } => {
                 eprintln!("数据集 {path} 离线（I11：挂载缺失或卷身份不符）：{reason}");
             }
             doctor::DatasetHealth::CheckFailed { path, reason } => {
                 eprintln!("数据集 {path} 巡检失败：{reason}");
+            }
+            doctor::DatasetHealth::ResolveFailed { path, reason } => {
+                eprintln!("数据集 {path} 解析失败：{reason}");
             }
         }
     }
