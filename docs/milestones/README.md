@@ -14,6 +14,7 @@
 | [M1a 存储根 IO 地基](M1a-存储根IO地基.md) | StorageRoot 身份校验（I11）· 原子写入 · tmp 清理 | 10 | ✅ |
 | [M1b 调和状态机](M1b-调和状态机.md) | 18 格三态决策表 · reconcile.decide 发射 · proptest 收敛性 · 确定性模拟 | 14 | ✅ |
 | [M1c arca-git](M1c-arca-git.md) | `.gitignore` 反选块 · 追踪冲突检测 · pre-push 钩子 · 噩梦路径 | 6 | ✅ |
+| [M1d CLI 与 file:// 同步闭环](M1d-CLI与file同步闭环.md) | init/register/adopt/sync/status/verify/doctor + plumbing · 批量提交 · trace 落盘 | 12 | ✅ |
 
 后续切片见 [M1a 文档末尾的拆分表](M1a-存储根IO地基.md#m1-的其余切片)。
 

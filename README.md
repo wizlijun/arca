@@ -25,7 +25,7 @@ arca 是 git 仓库的二进制附件层：自托管、按相对路径原样可�
 
 ## 状态
 
-**M0 已完成；M1 进行中**（M1a / M1b / M1c 已完成，M1d 待做）。设计规格见
+**M0 与 M1 均已完成。** 设计规格见
 [docs/2026-08-03-arca-spec.md](docs/2026-08-03-arca-spec.md)（v1.2 定稿）。
 
 已实现：`FORMAT.md` 字节级格式契约定稿；`arca-format`（路径规则、身份/版本模型、行式清单、
@@ -71,7 +71,7 @@ arca/
 | | 交付 |
 | --- | --- |
 | **M0 ✅** | 格式与核心：FORMAT.md v1 · arca-format · arca-chunk · arca-store fsck · trace schema · fuzz 与 CI |
-| M1 | 单机纳管 + file:// 同步：CLI 基线闭环（无任何 daemon）。**M1a 存储根 IO ✅ · M1b 调和状态机 ✅ · M1c arca-git ✅**，M1d 待做 |
+| **M1 ✅** | 单机纳管 + file:// 同步：CLI 基线闭环（无任何 daemon）。M1a 存储根 IO · M1b 调和状态机 · M1c arca-git · M1d CLI 与同步闭环 |
 | M2 | arcad 与手动同步：CAS · tombstone · journal · 多 hub 独立故障域 |
 | M3 | agentd + Windows 占位符（★ 核心演示） |
 | M4 | macOS 占位符 |
