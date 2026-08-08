@@ -69,6 +69,80 @@ enum Command {
         #[arg(long)]
         root: Option<std::path::PathBuf>,
     },
+    /// 比对本地与 hub，不动数据；全同步时安静，退出码 0
+    Status {
+        /// 数据集路径，相对 vault 根
+        path: String,
+        /// 覆盖从 .gitarca 解析出的存储根路径
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// fixity 巡检（BLAKE3 重算对账），复用 arca fsck 的巡检逻辑
+    Verify {
+        /// 数据集路径，相对 vault 根
+        path: String,
+        /// 覆盖从 .gitarca 解析出的存储根路径
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// 一致性巡检：.gitarca 一致性 + 本地存在但 hub 尚无副本的文件告警
+    Doctor {
+        /// 覆盖从 .gitarca 解析出的存储根路径（对本次巡检的全部数据集生效）
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// plumbing：hub 侧当前清单（--json 输出，格式见 PROTOCOL.md §5）
+    Ls {
+        /// 数据集路径，相对 vault 根
+        path: String,
+        /// 覆盖从 .gitarca 解析出的存储根路径
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+        /// 目前唯一支持的输出格式；保留该开关是为了未来扩展其它格式时不破坏调用方
+        #[arg(long)]
+        json: bool,
+    },
+    /// plumbing：按内容哈希取字节，原样写 stdout
+    Cat {
+        /// 数据集路径，相对 vault 根
+        path: String,
+        /// 内容哈希（blake3:<hex> 形式）
+        hash: String,
+        /// 覆盖从 .gitarca 解析出的存储根路径
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// plumbing：路径 → hub 侧身份/版本
+    Resolve {
+        /// 数据集路径，相对 vault 根
+        path: String,
+        /// 数据集内的文件路径
+        file: String,
+        /// 覆盖从 .gitarca 解析出的存储根路径
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// plumbing：客户端本地投影（基线）检视
+    State {
+        #[command(subcommand)]
+        action: StateCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum StateCommand {
+    /// 导出当前基线（--json 输出，格式见 PROTOCOL.md §5）
+    Dump {
+        /// 数据集路径，相对 vault 根
+        path: String,
+        /// 覆盖从 .gitarca 解析出的存储根路径（basline dump 本身不需要打开
+        /// 存储根，这个参数只是为了与其它 plumbing 命令的调用形状保持一致）
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+        /// 目前唯一支持的输出格式
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -119,5 +193,26 @@ fn main() -> std::process::ExitCode {
         ),
         Command::Adopt { path, root } => commands::porcelain::adopt_cmd(&path, root.as_deref()),
         Command::Sync { path, root } => commands::porcelain::sync_cmd(&path, root.as_deref()),
+        Command::Status { path, root } => commands::porcelain::status_cmd(&path, root.as_deref()),
+        Command::Verify { path, root } => commands::porcelain::verify_cmd(&path, root.as_deref()),
+        Command::Doctor { root } => commands::porcelain::doctor_cmd(root.as_deref()),
+        Command::Ls {
+            path,
+            root,
+            json: _,
+        } => commands::plumbing::ls_cmd(&path, root.as_deref()),
+        Command::Cat { path, hash, root } => {
+            commands::plumbing::cat_cmd(&path, &hash, root.as_deref())
+        }
+        Command::Resolve { path, file, root } => {
+            commands::plumbing::resolve_cmd(&path, &file, root.as_deref())
+        }
+        Command::State { action } => match action {
+            StateCommand::Dump {
+                path,
+                root,
+                json: _,
+            } => commands::plumbing::state_dump_cmd(&path, root.as_deref()),
+        },
     }
 }

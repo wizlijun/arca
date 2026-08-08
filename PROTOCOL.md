@@ -48,8 +48,72 @@
 `arca ls --json` / `arca cat <hash>` / `arca resolve <path>` / `arca state dump --json`
 的输出格式与退出码属于本规范，受兼容性承诺约束。
 
-- Rule of Silence：成功时安静；数据走 stdout，进度与诊断走 stderr。
-- TODO：各命令的 JSON schema 与退出码表。
+- Rule of Silence 在 plumbing 这一层的具体含义：**数据永远走 stdout**——
+  plumbing 存在的意义就是产出可脚本消费的输出，即便结果是空清单也要打印 `[]`，
+  这不是"安静"；安静只留给"没有这回事"的诊断信息（走 stderr）。
+- 退出码延续 `arca fsck` 定下的三态（spec §3.2）：**0** = 成功；**1** = 命令本身
+  的失败（数据集未登记、查无此哈希/路径等）；**2** = 存储根身份不明
+  （I11：未挂载或卷身份不符，绝不可呈现为"这个路径没有记录"）。
+
+四个命令都以 `arca <cmd> <dataset-path> ...` 的形状取一个数据集相对 vault 根
+的路径作为第一个定位参数（`--root` 可覆盖从 `.gitarca` 解析出的存储根路径，
+语义与 `arca sync --root` 一致）。`ls`/`cat`/`resolve` 读的是 **hub 侧**当前
+状态（`.arca/index/` + `.arca/items/` 的当前版本，M1 尚不产出 tombstone，
+理由见 `crates/arca-cli/src/hub.rs` 模块文档）；`state dump` 读的是**客户端
+本地投影**（`.arca/client/baseline.jsonl`，I9：可抛弃投影）。
+
+### 5.0a `arca ls <path> --json`
+
+hub 侧当前清单，一个 JSON 数组，按路径 UTF-8 字节序排序：
+
+```json
+[
+  {"path":"京都/鸭川.png","item_id":"3f...","version_id":"20260805T093012Z-0123456789abcdef","hash":"blake3:...","size":1234},
+  {"path":"notes/a.md","item_id":"8b...","version_id":"20260805T093013Z-fedcba9876543210","hash":"blake3:...","size":42}
+]
+```
+
+`item_id` 为 32 位小写十六进制（`ItemId::to_hex`）；`hash` 为 `blake3:<hex>`
+形式（`ContentHash::to_text`）；空数据集输出 `[]`，退出码仍是 0。
+
+### 5.0b `arca cat <path> <hash>`
+
+按内容哈希取字节，**原样写 stdout**（不追加换行、不做任何编码转换——输出
+可能是任意二进制，供管道给别的工具用）。`<hash>` 取 `blake3:<hex>` 形式；
+多个路径共享同一份内容时（去重命中）按路径排序取第一个命中，结果确定。
+查无此哈希、或 `<hash>` 本身格式不合规，退出码 1，诊断信息走 stderr。
+
+### 5.0c `arca resolve <path> <file>`
+
+单个路径 → hub 侧身份/版本，一个 JSON 对象，字段与 `ls` 的单条记录相同：
+
+```json
+{"path":"notes/a.md","item_id":"8b...","version_id":"20260805T093013Z-fedcba9876543210","hash":"blake3:...","size":42}
+```
+
+`<file>` 在 hub 侧没有记录（从未同步过，或已被删除——M1 尚无法区分两者，
+见 `hub.rs` 模块文档）时退出码 1。
+
+### 5.0d `arca state dump <path> --json`
+
+客户端本地投影（基线）检视——SQLite 是二进制没关系，git 的 index 也是，
+前提是有 dump 命令（spec §3.2）。一个 JSON 对象：
+
+```json
+{
+  "was_reset": false,
+  "reset_reason": null,
+  "entries": [
+    {"path":"notes/a.md","item_id":"8b...","version_id":"20260805T093013Z-fedcba9876543210","hash":"blake3:...","size":42}
+  ]
+}
+```
+
+`was_reset` 为 `true` 表示本次读取时基线缺失或损坏、已重置为空（I9：`arca
+status`/`arca sync` 据此判断本轮是否会做全量对账）；`reset_reason` 是重置
+原因的人类可读描述，`was_reset` 为 `false` 时恒为 `null`。基线本身不需要
+打开存储根，因此这个命令不会因存储根身份不明而返回退出码 2——它只可能因
+数据集本身未登记而返回退出码 1。
 
 ### 5.1 trace 读侧（M1）
 

@@ -21,10 +21,14 @@
 pub mod adopt;
 pub mod baseline;
 pub mod clock;
+pub mod dataset;
+pub mod doctor;
 pub mod hub;
 pub mod ids;
 pub mod init;
 pub mod register;
 pub mod scan;
+pub mod status;
 pub mod sync;
+pub mod trace_sink;
 pub mod vault;

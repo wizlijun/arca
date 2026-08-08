@@ -17,18 +17,24 @@
 //! | `import` | Dropbox / Google Drive / LFS 迁入，厂商校验和验证 + 审计报告（M5） |
 //! | `publish-map` / `export` | 发布（M5，委托 arca-publish） |
 //!
-//! 本轮（M1d Task 4/5/6）落地 `init`/`register`/`adopt`/`sync` 四个命令壳；
-//! `status`/`verify`/`doctor`/plumbing 属 Task 7，TODO(M1 起)。
+//! M1d Task 4/5/6 落地了 `init`/`register`/`adopt`/`sync` 四个命令壳；
+//! 本文件另加 Task 7 的 `status`/`verify`/`doctor`（plumbing 的 `ls`/`cat`/
+//! `resolve`/`state dump` 落在 `commands/plumbing.rs`）。
 //!
 //! 退出码约定（spec §3.2，与 `arca fsck` 已定的一致）：0 = 干净，
 //! 1 = 有问题/有未完成的工作，2 = 身份不明（存储根挂载失败/身份不符，I11）。
 
 use arca_cli::adopt::{self, AdoptOptions};
+use arca_cli::dataset;
+use arca_cli::doctor;
 use arca_cli::init::{self, HookOutcome};
 use arca_cli::register::{self, RegisterOptions};
+use arca_cli::status as status_lib;
 use arca_cli::sync::{self as sync_lib, SyncActor};
+use arca_cli::trace_sink;
 use arca_cli::vault;
-use arca_format::trace::NullSink;
+use arca_format::trace::{NullSink, RingSink};
+use arca_store::root::StorageRoot;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -125,15 +131,54 @@ pub fn register_cmd(
     }
 }
 
+/// 尽力算出数据集目录，供 trace 失败落盘定位落点（M1d Task 8）——不是权威
+/// 解析（那是 [`dataset::resolve`] 的职责，需要数据集已经登记），只要能定位
+/// 到 vault 根 + 路径合规就够：trace 是诊断产物，落盘目的地宁可算得宽松些，
+/// 也不该让"数据集还没登记好"这种失败反而没有地方记录线索。算不出来（不在
+/// 任何 vault 里、路径本身不合规）就放弃落盘——见 `trace_sink` 模块文档
+/// 「落盘位置」一节点名的结构性缺口。
+fn best_effort_dataset_dir(path: &str) -> Option<PathBuf> {
+    let v = vault::open(&cwd()).ok()?;
+    let normalized = arca_format::path_rules::check(path).ok()?;
+    Some(v.repo.root().join(normalized))
+}
+
+/// trace 只在失败时落盘，`ARCA_TRACE_EVENT` 可强制——见 `trace_sink` 模块
+/// 文档。`dataset_dir` 为 `None`（算不出数据集目录）时放弃落盘，不报错
+/// （trace 是诊断产物，绝不能反过来变成命令失败的原因）。
+fn flush_trace_if_needed(
+    dataset_dir: Option<&Path>,
+    sid: &arca_format::trace::Sid,
+    sink: &mut RingSink,
+    succeeded: bool,
+) {
+    if !trace_sink::should_flush(succeeded) {
+        return;
+    }
+    let Some(dir) = dataset_dir else { return };
+    match trace_sink::flush(dir, sid, sink, trace_sink::DEFAULT_KEEP) {
+        Ok(outcome) => eprintln!(
+            "trace 已落盘：{}（{} 条事件，其中 {} 条因环形缓冲溢出被丢弃）",
+            outcome.path.display(),
+            outcome.events,
+            outcome.dropped
+        ),
+        Err(e) => eprintln!("{e}"),
+    }
+}
+
 /// `arca adopt <path> [--root <path>]`。
 pub fn adopt_cmd(path: &str, root: Option<&Path>) -> ExitCode {
+    let sid = trace_sink::resolve_sid();
+    let mut sink = RingSink::default();
+    let dataset_dir = best_effort_dataset_dir(path);
+
     let opts = AdoptOptions {
         path,
         root_override: root,
         actor: default_actor(),
     };
-    let mut sink = NullSink;
-    match adopt::adopt(&cwd(), opts, &mut sink) {
+    let (code, succeeded) = match adopt::adopt(&cwd(), opts, &mut sink) {
         Ok(outcome) => {
             for p in &outcome.report.uploaded {
                 println!("upload\t{p}");
@@ -161,20 +206,23 @@ pub fn adopt_cmd(path: &str, root: Option<&Path>) -> ExitCode {
             eprintln!("{}", adopt::HISTORY_NOTE);
 
             if outcome.report.is_clean() {
-                ExitCode::SUCCESS
+                (ExitCode::SUCCESS, true)
             } else {
-                ExitCode::from(1)
+                (ExitCode::from(1), false)
             }
         }
         Err(adopt::AdoptError::Mount(_)) => {
             eprintln!("存储根身份不明，已按 I11 拒绝——数据集离线");
-            ExitCode::from(2)
+            (ExitCode::from(2), false)
         }
         Err(e) => {
             eprintln!("{e}");
-            ExitCode::from(1)
+            (ExitCode::from(1), false)
         }
-    }
+    };
+
+    flush_trace_if_needed(dataset_dir.as_deref(), &sid, &mut sink, succeeded);
+    code
 }
 
 /// `arca sync <path> [--root <path>]`——对一个已 `arca register`/`arca adopt`
@@ -232,8 +280,80 @@ pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
         }
     };
 
-    let storage_root = match arca_store::root::StorageRoot::open(&root_path, Some(&cfg.dataset_id))
-    {
+    // sid/sink 建在挂载检查之前——mount.check 是"全项目最危险的判断"（见
+    // `arca_store::root` 模块文档），失败时同样要能落盘诊断，不能只有后面
+    // `sync_lib::sync` 内部的决策轨迹被记录下来。
+    let sid = trace_sink::resolve_sid();
+    let mut sink = RingSink::default();
+    let storage_root = match arca_store::root::StorageRoot::open_traced(
+        &root_path,
+        Some(&cfg.dataset_id),
+        0,
+        &mut sink,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            flush_trace_if_needed(Some(&dataset_dir), &sid, &mut sink, false);
+            return ExitCode::from(2);
+        }
+    };
+
+    let (code, succeeded) =
+        match sync_lib::sync(&dataset_dir, &storage_root, &default_actor(), &mut sink) {
+            Ok(report) => {
+                for p in &report.uploaded {
+                    println!("upload\t{p}");
+                }
+                for p in &report.downloaded {
+                    println!("download\t{p}");
+                }
+                for p in &report.adopted {
+                    println!("adopt\t{p}");
+                }
+                for p in &report.deleted_local {
+                    println!("delete-local\t{p}");
+                }
+                for p in &report.tombstone_pending {
+                    eprintln!("删除传播属 M2，本轮未执行：{p}");
+                }
+                for p in &report.conflicts {
+                    eprintln!("结构化冲突，未动数据：{p}");
+                }
+                for p in &report.needs_human {
+                    eprintln!("状态模糊，需要人工介入：{p}");
+                }
+                for (p, reason) in &report.scan_rejected {
+                    eprintln!("扫描阶段被拒绝（{}）：{p}", reason.as_str());
+                }
+                if report.is_clean() {
+                    (ExitCode::SUCCESS, true)
+                } else {
+                    (ExitCode::from(1), false)
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                (ExitCode::from(1), false)
+            }
+        };
+
+    flush_trace_if_needed(Some(&dataset_dir), &sid, &mut sink, succeeded);
+    code
+}
+
+/// `arca status <path> [--root <path>]`（M1d Task 7）：跑扫描与调和但**不
+/// 执行**——Rule of Silence，全同步时完全安静、退出码 0；有待办（含结构化
+/// 问题）时把分类结果打到 stderr（诊断，不是数据）、退出码 1。
+pub fn status_cmd(path: &str, root: Option<&Path>) -> ExitCode {
+    let resolved = match dataset::resolve(&cwd(), path, root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let store_root = match StorageRoot::open(&resolved.root_path, Some(&resolved.cfg.dataset_id)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{e}");
@@ -242,25 +362,31 @@ pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
     };
 
     let mut sink = NullSink;
-    match sync_lib::sync(&dataset_dir, &storage_root, &default_actor(), &mut sink) {
+    match status_lib::status(&resolved.dataset_dir, &store_root, &mut sink) {
         Ok(report) => {
-            for p in &report.uploaded {
-                println!("upload\t{p}");
+            if report.is_silent() {
+                return ExitCode::SUCCESS;
             }
-            for p in &report.downloaded {
-                println!("download\t{p}");
+            if report.baseline_reset {
+                eprintln!("基线已重建（此前缺失或损坏）——本轮是一次全量对账");
             }
-            for p in &report.adopted {
-                println!("adopt\t{p}");
+            for p in &report.to_upload {
+                eprintln!("待上传：{p}");
             }
-            for p in &report.deleted_local {
-                println!("delete-local\t{p}");
+            for p in &report.to_download {
+                eprintln!("待下载：{p}");
+            }
+            for p in &report.to_adopt {
+                eprintln!("待认领（零传输）：{p}");
+            }
+            for p in &report.to_delete_local {
+                eprintln!("待删除本地副本：{p}");
             }
             for p in &report.tombstone_pending {
-                eprintln!("删除传播属 M2，本轮未执行：{p}");
+                eprintln!("删除传播属 M2，本轮不会执行：{p}");
             }
             for p in &report.conflicts {
-                eprintln!("结构化冲突，未动数据：{p}");
+                eprintln!("结构化冲突：{p}");
             }
             for p in &report.needs_human {
                 eprintln!("状态模糊，需要人工介入：{p}");
@@ -268,15 +394,115 @@ pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
             for (p, reason) in &report.scan_rejected {
                 eprintln!("扫描阶段被拒绝（{}）：{p}", reason.as_str());
             }
-            if report.is_clean() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            }
+            ExitCode::from(1)
         }
         Err(e) => {
             eprintln!("{e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// `arca verify <path> [--root <path>]`（M1d Task 7）：fixity 巡检，复用
+/// `arca_store::fsck::check_path`。
+pub fn verify_cmd(path: &str, root: Option<&Path>) -> ExitCode {
+    let resolved = match dataset::resolve(&cwd(), path, root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // I11：先按已知身份打开一次，确认挂载的是期望的那个数据集——
+    // `fsck::check_path` 本身不预设期望身份（诊断工具的设计，服务于任意
+    // 存储根路径），但 `verify` 是针对一个具体已登记数据集的巡检，必须先
+    // 做这道身份检查；否则挂错了别的空盘会被 `check_path` 老老实实巡检出
+    // "零个问题"，把"身份不明"误判成"库是空的、一切正常"（I11）。
+    if let Err(e) = StorageRoot::open(&resolved.root_path, Some(&resolved.cfg.dataset_id)) {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+
+    match arca_store::fsck::check_path(&resolved.root_path) {
+        Ok(report) => {
+            if report.problems.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                for problem in &report.problems {
+                    eprintln!("{problem:?}");
+                }
+                eprintln!(
+                    "检查 {} 个文件、{} 个块，发现 {} 个问题",
+                    report.checked_files,
+                    report.checked_chunks,
+                    report.problems.len()
+                );
+                ExitCode::from(1)
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `arca doctor [--root <path>]`（M1d Task 7）：`tracking::check_vault` 的
+/// 结果**原样呈现**（含 `Issue::CheckIncomplete`——它意味着"检查没跑成功"，
+/// 不是"检查通过"，doctor 绝不能把它折叠成安静）+ 「本地存在但 hub 尚无
+/// 副本」的显著告警（`git clean -xdf` 风险的唯一缓解措施，见 `doctor.rs`
+/// 模块文档）。doctor 是全 vault 巡检，不针对单个数据集，因此没有 `<path>`
+/// 参数——与 `status`/`verify`/plumbing 四个命令不同。
+pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
+    let vault = match vault::open(&cwd()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let report = doctor::doctor(&vault.repo, &vault.registry, root);
+
+    // check_vault 的每一条 Issue（含 CheckIncomplete）原样打印——Display
+    // 本身已经把语义讲清楚，这里不做任何过滤或降级。
+    for issue in &report.vault_issues {
+        eprintln!("{issue}");
+    }
+
+    for dataset_health in &report.datasets {
+        match dataset_health {
+            doctor::DatasetHealth::Checked { path, local_only } => {
+                if !local_only.is_empty() {
+                    eprintln!();
+                    eprintln!(
+                        "！！！警告：数据集 {path} 下以下文件本地存在，但 hub 尚无副本——\
+                         `git clean -xdf`（含 `-Xdf`）会把它们永久删除且无法找回："
+                    );
+                    for p in local_only {
+                        eprintln!("  {path}/{p}");
+                    }
+                    eprintln!(
+                        "！！！在确认已同步（`arca sync {path}` 或 `arca adopt {path}`）之前，\
+                         请勿运行 `git clean -xdf`。"
+                    );
+                    eprintln!();
+                }
+            }
+            doctor::DatasetHealth::Offline { path, reason } => {
+                eprintln!("数据集 {path} 离线（I11：挂载缺失或卷身份不符）：{reason}");
+            }
+            doctor::DatasetHealth::CheckFailed { path, reason } => {
+                eprintln!("数据集 {path} 巡检失败：{reason}");
+            }
+        }
+    }
+
+    if report.has_offline() {
+        ExitCode::from(2)
+    } else if report.is_clean() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
