@@ -28,6 +28,47 @@ enum Command {
         /// 存储根路径（含 files/ 与 .arca/）
         root: std::path::PathBuf,
     },
+    /// 在 vault 根建 `.gitarca`（若已存在则只校验、不覆盖）、装 pre-push 钩子
+    Init {
+        /// vault 内任意路径，默认当前目录
+        path: Option<std::path::PathBuf>,
+        /// 跳过 pre-push 钩子安装
+        #[arg(long)]
+        no_hook: bool,
+    },
+    /// 把一个目录登记为数据集：建 dataset.toml、更新 .gitarca、更新 .gitignore
+    Register {
+        /// 数据集路径，相对 vault 根
+        path: String,
+        /// hub 名（.gitarca 里的 `[hub.<name>]`）
+        #[arg(long)]
+        hub: String,
+        /// hub 不存在时用它创建；已存在则必须与登记的一致
+        #[arg(long = "hub-instance-id")]
+        hub_instance_id: Option<String>,
+        /// hub 不存在时用它创建（file:// 或裸本地路径）；已存在则更新其 url
+        #[arg(long = "hub-url")]
+        hub_url: Option<String>,
+        /// hub 是新建的且未给 --hub-url 时，从这个路径推导 file:// 地址
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// 就地纳管一个已登记的数据集：算哈希、上传、写 .gitignore 块（文件原地不动）
+    Adopt {
+        /// 数据集路径，相对 vault 根
+        path: String,
+        /// 覆盖从 .gitarca 解析出的存储根路径（外置盘换挂载点等场景）
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
+    /// 对一个已纳管的数据集跑一轮 file:// 调和闭环
+    Sync {
+        /// 数据集路径，相对 vault 根
+        path: String,
+        /// 覆盖从 .gitarca 解析出的存储根路径
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -62,5 +103,21 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::from(1)
             }
         }
+        Command::Init { path, no_hook } => commands::porcelain::init_cmd(path, no_hook),
+        Command::Register {
+            path,
+            hub,
+            hub_instance_id,
+            hub_url,
+            root,
+        } => commands::porcelain::register_cmd(
+            &path,
+            &hub,
+            hub_instance_id.as_deref(),
+            hub_url.as_deref(),
+            root.as_deref(),
+        ),
+        Command::Adopt { path, root } => commands::porcelain::adopt_cmd(&path, root.as_deref()),
+        Command::Sync { path, root } => commands::porcelain::sync_cmd(&path, root.as_deref()),
     }
 }
