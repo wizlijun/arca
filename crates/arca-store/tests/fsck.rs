@@ -312,6 +312,60 @@ fn 无关的损坏index记录不影响其他item的正常校验() {
     assert_eq!(report.checked_files, 1, "健康 item 仍应正常被校验");
 }
 
+/// **评审 I1 攻击重跑**：`LocalTransport::commit_batch` 的写入阶段分三段
+/// （内容 → 逐条 items/index → journal），不是全有全无——手工模拟"批量提交
+/// 中途被 `kill -9`"最简单的一种残留：`files/nest/b` 已经落盘，但没有任何
+/// `items/`/`index/` 记录指向它。此前 fsck 只从 `items/`/`index/` 出发遍历，
+/// 完全看不到这类文件（`arca fsck` exit 0）——修复后必须报出
+/// `Problem::OrphanFile`，逃生舱下用 coreutils 恢复出这份内容的人才能被
+/// 提醒"arca 认为这个文件不存在"。
+#[test]
+fn 检出files下没有任何index记录认领的孤儿文件() {
+    let dir = tempfile::tempdir().unwrap();
+    造一个健康的存储根(dir.path());
+
+    // 模拟批量提交写完内容、还没来得及写 items/index 就中断——嵌套路径
+    // 印证 `files/` 镜像真实目录结构、fsck 必须真正递归而不是只扫一层。
+    fs::create_dir_all(dir.path().join("files/nest")).unwrap();
+    fs::write(dir.path().join("files/nest/b"), b"orphan content").unwrap();
+
+    let report = check_path(dir.path()).unwrap();
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::OrphanFile { path } if path == "nest/b")),
+        "应报出 nest/b 是孤儿文件，实得 {:?}",
+        report.problems
+    );
+    // 健康文件（note.txt）不应被牵连误报。
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::OrphanFile { path } if path == "note.txt")),
+        "健康文件不应被误报为孤儿，实得 {:?}",
+        report.problems
+    );
+}
+
+/// 与上一条对称：健康存储根不应有任何 `OrphanFile` 误报——`造一个健康的
+/// 存储根` 里 `files/note.txt` 有对应的 index 记录，不该被点名。
+#[test]
+fn 健康存储根不产生orphan_file误报() {
+    let dir = tempfile::tempdir().unwrap();
+    造一个健康的存储根(dir.path());
+    let report = check_path(dir.path()).unwrap();
+    assert!(
+        !report
+            .problems
+            .iter()
+            .any(|p| matches!(p, Problem::OrphanFile { .. })),
+        "实得 {:?}",
+        report.problems
+    );
+}
+
 #[test]
 fn fsck_绝不修改任何文件() {
     let dir = tempfile::tempdir().unwrap();

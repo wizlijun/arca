@@ -48,6 +48,16 @@ pub enum Problem {
     /// 读取失败但不是"文件不存在"（权限、损坏的挂载点等 IO 错误）——与「内容不对」
     /// 是不同性质的故障，绝不可折叠成同一个诊断（I5：如实报告失败的性质）。
     IoError { path: String, reason: String },
+    /// **评审 I1**：`files/` 下有一个物理文件，但没有任何 `index/` 记录指向
+    /// 它——批量提交（`LocalTransport::commit_batch`）的写入阶段分三段
+    /// （内容 → 逐条 items/index → journal），不是全有全无：中途失败（进程被
+    /// 杀、断电）可能留下"内容已落盘、指针从未写出"的孤儿。这与
+    /// [`Problem::OrphanIndex`] 方向相反——`OrphanIndex` 是"index 记录存在，
+    /// 但它指向的 item 版本链找不到"；这里是"物理内容存在，但完全没有任何
+    /// index 记录认领它"，`hub::read_remote`/`GET /state`/`arca sync` 都只
+    /// 从 `index/` 出发，天生看不见这类文件——I1 逃生舱下的人用 coreutils
+    /// 直接看 `files/` 会看到一个 arca 认为"不存在"的文件，必须由 fsck 点名。
+    OrphanFile { path: String },
 }
 
 /// 巡检报告：发现的问题 + 已检查的文件/块计数。
@@ -146,7 +156,22 @@ pub fn check_root(root: &StorageRoot) -> FsckReport {
         }
     }
 
-    // 2. 块存储：每个块解压后哈希必须与文件名一致。读不到（IO 错误）与读到了但
+    // 2. `files/` 树上没有被任何 index 记录认领的物理文件——评审 I1：批量
+    //    提交非原子性可能留下的孤儿，参与调和/同步的路径全部从 `index/`
+    //    出发，天生看不见这类文件，只有从 `files/` 反向核对才能发现。
+    //    `known_paths` 用 `index_map` 的值（这里既含健康记录，也含步骤 1
+    //    已经报过 `CorruptIndex` 的记录残留——`build_index` 对解析失败的
+    //    记录不会写入 `index_map`，所以一条自己已经损坏的 index 记录不会
+    //    错误地帮一个可能同样有问题的物理文件"洗白"，两类问题各自独立
+    //    报出，不互相掩盖）。
+    let known_paths: HashSet<String> = index_map.values().cloned().collect();
+    for physical in list_files_relative(&root.join(layout::FILES_DIR)) {
+        if !known_paths.contains(&physical) {
+            report.problems.push(Problem::OrphanFile { path: physical });
+        }
+    }
+
+    // 3. 块存储：每个块解压后哈希必须与文件名一致。读不到（IO 错误）与读到了但
     //    内容不对（解压失败/哈希不符）是两种不同性质的故障，分别报告（I5）。
     for shard in read_dir_sorted(&root.join(layout::CHUNKS_DIR)) {
         for chunk_file in read_dir_sorted(&shard) {
@@ -240,6 +265,51 @@ fn build_index(root: &Path, report: &mut FsckReport) -> (HashMap<String, String>
         }
     }
     (by_item, corrupt_items)
+}
+
+/// 递归列出 `files/` 树下全部**文件**（不含目录）的相对路径，`/` 分隔、
+/// 已排序——评审 I1「`files/` 树上没有被任何 index 记录认领的物理文件」
+/// 检测的数据来源。`files/` 本身镜像数据集的真实目录结构（不像
+/// `index/`/`items/`/`chunks/` 那样按哈希分片），深度不固定，因此不能复用
+/// 只做单层遍历的 [`read_dir_sorted`]，需要真正递归。
+///
+/// 符号链接（`file_type().is_symlink()`）跳过不计——`files/` 下出现符号
+/// 链接本身就不是一次正常提交会产生的东西（`scan.rs` 在扫描本地工作区时
+/// 对符号链接的处置是跳过+计入 `rejected`，同一条纪律的巡检侧对应），
+/// 把它当作"文件"去比对 `known_paths` 只会制造误报或误判，不在本次修复
+/// 范围内单独处理，交给未来专门的巡检规则。
+fn list_files_relative(files_dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_files(files_dir, files_dir, &mut out);
+    out.sort();
+    out
+}
+
+fn walk_files(base: &Path, dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            walk_files(base, &path, out);
+        } else if file_type.is_file() {
+            if let Ok(rel) = path.strip_prefix(base) {
+                let rel_str = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                out.push(rel_str);
+            }
+        }
+        // 符号链接/其它特殊文件类型：跳过，见函数文档。
+    }
 }
 
 /// 排序读目录：使 fsck 的输出确定（同一状态必产生同一报告）。文件系统的

@@ -59,6 +59,21 @@ use ureq::Body;
 /// [`TransportError::Network`]，让调用方决定要不要退避重试，而不是一直等。
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// GET 响应体在内存中缓冲的上限——**评审 I2/I3**：`ureq::Body::read_json`/
+/// `read_to_vec` 默认把响应体截断在 10MB（`ureq` 内部常量 `MAX_BODY_SIZE`），
+/// 这个默认值此前从未被本模块显式覆盖过：`GET .../state` 每条约 249 字节，
+/// 约 42,000 个文件（"个人照片库"完全在范围内）就会撞上这个上限——而且
+/// 触发方式是把 `ureq::Error::BodyExceedsLimit` 悄悄折进
+/// `TransportError::Protocol`（`class=Bug`，"去看代码"），真实原因却是"库
+/// 太大了"，诊断信息完全误导；`read_by_hash`/`read_range` 同样受这个默认值
+/// 拖累，而它们恰恰是给大文件用的原语（`arca cat <hash>`、Range 续传）。
+/// 与服务端 `arcad::api::MAX_BODY_BYTES`（单次 `PUT` 请求体上限）取同一个
+/// 量级：GET 这一侧允许缓冲的响应体理应能装下服务端愿意接受的最大一次
+/// 写入，两端不能有一侧比另一侧窄。`file://` 的 `LocalTransport` 没有这个
+/// 限制（本地文件系统读取不经过这层缓冲上限），这正是评审点名的"同一个
+/// 数据集 file:// 能同步、http:// 不能"分叉的根源。
+const MAX_RESPONSE_BODY_BYTES: u64 = 256 * 1024 * 1024;
+
 /// 路径分段的百分号编码字符集：字母数字与 `-_.~`（RFC 3986 未预留字符）
 /// 之外全部编码——`/` 本身是分隔符，不在这个字符集里编码，由调用方在分段
 /// 之间保留（`PROTOCOL.md` §1.2「通用约定」：「`/` 是路径分隔符本身、不
@@ -311,6 +326,29 @@ fn identity_mismatch_outcome(body: &serde_json::Value) -> Result<CommitOutcome, 
     })
 }
 
+/// 响应体读取失败的翻译——**评审 I2/I3**：先识别"超过本地缓冲上限"这一种
+/// （[`ureq::Error::BodyExceedsLimit`]，`.into_io()`/`From<io::Error>` 往返
+/// 无损，见 `ureq::body::limit::LimitReader` 的实现），映射为
+/// [`TransportError::Io`]（`class=NeedsHuman`：需要人评估这个数据集的规模
+/// 是否超出了这个操作当前能处理的范围，不是网络抖动——退避重试不会让
+/// 响应变小；也不是代码 bug——请求本身完全合规，只是响应太大）；其余读取
+/// 失败（连接中途断开、JSON 语法错误等）保持原有的 `Protocol`
+/// （`class=Bug`）不变，那些确实是"这次交互不符合协议契约"。
+fn body_read_error(context: &str, e: ureq::Error) -> TransportError {
+    match e {
+        ureq::Error::BodyExceedsLimit(limit) => TransportError::Io {
+            path: context.to_string(),
+            reason: format!(
+                "响应体超过本地缓冲上限 {limit} 字节——数据集/文件的规模超出了这个操作\
+                 当前能处理的范围，不是网络故障也不是协议错误（评审 I2/I3）"
+            ),
+        },
+        other => TransportError::Protocol {
+            message: format!("{context} 响应体读取失败：{other}"),
+        },
+    }
+}
+
 fn read_json_body(
     resp: &mut ureq::http::Response<Body>,
 ) -> Result<serde_json::Value, TransportError> {
@@ -338,12 +376,14 @@ impl Transport for HttpTransport {
                 message: format!("GET .../state 返回意外状态码 {status}"),
             });
         }
-        let entries: Vec<StateEntryWire> =
-            resp.body_mut()
-                .read_json()
-                .map_err(|e| TransportError::Protocol {
-                    message: format!("GET .../state 响应体解析失败：{e}"),
-                })?;
+        // 评审 I2：把 ureq 默认的 10MB 上限提到 `MAX_RESPONSE_BODY_BYTES`，
+        // 并把"超过上限"与其它读取失败区分开（`body_read_error` 文档）。
+        let entries: Vec<StateEntryWire> = resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BODY_BYTES)
+            .read_json()
+            .map_err(|e| body_read_error("GET .../state", e))?;
         let mut out = BTreeMap::new();
         for entry in entries {
             let path_for_error = entry.path.clone();
@@ -418,12 +458,36 @@ impl Transport for HttpTransport {
                 ),
             });
         }
-        resp.body_mut()
+        // 评审 I3：把 ureq 默认的 10MB 上限提到 `MAX_RESPONSE_BODY_BYTES`
+        // ——`read_range` 恰恰是给大文件续传用的原语，不能比 `file://` 那侧
+        // 先天窄一大截。
+        let bytes = resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BODY_BYTES)
             .read_to_vec()
-            .map_err(|e| TransportError::Io {
+            .map_err(|e| body_read_error(path, e))?;
+        // 评审 I4：服务端按 RFC 9110 把越界的 `end` 钳到文件末尾、正常回
+        // 206（服务端行为本身没错），但这意味着响应体可能比请求的 `len`
+        // 短——`local.rs::read_range` 对越界请求报 `Io`（`read_exact` 读不满
+        // 就失败），`http.rs` 此前从未校验返回长度是否等于请求的 `len`，
+        // 两侧因此在"越界 Range"上行为不一致：同一份 2 字节文件请求 100
+        // 万字节，`file://` 报错、`http://` 静默返回 2 字节——续传场景下
+        // 一次静默短读就是一个被截断的文件，绝不能悄悄放过（trait 文档
+        // 明写"越界应映射为 `Io`"）。
+        if bytes.len() as u64 != len {
+            return Err(TransportError::Io {
                 path: path.to_string(),
-                reason: e.to_string(),
-            })
+                reason: format!(
+                    "Range 请求 [{start}, {}) 期望 {len} 字节，实得 {}——响应被截断\
+                     （评审 I4：服务端把越界的 end 钳到文件末尾，客户端必须校验\
+                     实际返回长度，不能静默接受短读）",
+                    start + len,
+                    bytes.len()
+                ),
+            });
+        }
+        Ok(bytes)
     }
 
     fn read_by_hash(&self, hash: ContentHash) -> Result<Option<Vec<u8>>, TransportError> {
@@ -439,14 +503,16 @@ impl Transport for HttpTransport {
             return Err(e);
         }
         match status {
-            StatusCode::OK => {
-                resp.body_mut()
-                    .read_to_vec()
-                    .map(Some)
-                    .map_err(|e| TransportError::Protocol {
-                        message: format!("GET .../blobs/{} 读取响应体失败：{e}", hash.to_text()),
-                    })
-            }
+            // 评审 I3：同一处上限提升——`read_by_hash` 是 `arca cat <hash>`
+            // 的传输层原语，天然面向"想要拿到某个哈希对应的完整内容"，
+            // 不能被 ureq 的默认 10MB 拦在半路。
+            StatusCode::OK => resp
+                .body_mut()
+                .with_config()
+                .limit(MAX_RESPONSE_BODY_BYTES)
+                .read_to_vec()
+                .map(Some)
+                .map_err(|e| body_read_error(&format!("GET .../blobs/{}", hash.to_text()), e)),
             StatusCode::NOT_FOUND => Ok(None),
             other => Err(TransportError::Protocol {
                 message: format!("GET .../blobs/{} 返回意外状态码 {other}", hash.to_text()),
@@ -881,6 +947,26 @@ mod tests {
         assert_eq!(req.method, "GET");
     }
 
+    /// **评审 I4 攻击重跑**：服务端按 RFC 9110 把越界的 `end` 钳到文件末尾、
+    /// 正常回 206（一份 2 字节文件上请求 100 万字节，服务端只能给出这 2
+    /// 字节）——客户端此前从不校验返回长度是否等于请求的 `len`，会把这
+    /// 2 字节静默当作"这次续传成功了"，续传场景下这就是一个被截断的文件。
+    /// `local.rs::read_range` 对越界请求报 `Io`（`read_exact` 读不满就
+    /// 失败），修复后 `http.rs` 必须给出同样的处置，不能在这一点上比
+    /// `file://` 更宽松。
+    #[test]
+    fn read_range响应长度与请求不符时报io错误而不是静默短读() {
+        let response: &'static [u8] = b"HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-1/2\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi";
+        let (url, handle) = serve_once(response);
+        let transport = HttpTransport::new(&url, "9c41000000000000000000000000abcd", None);
+        // 请求 100 万字节，服务端（真实 arcad）会把越界的 end 钳到文件
+        // 末尾，只返回 2 字节——这里用 mock 直接固定这个响应形状。
+        let err = transport.read_range("a.txt", 0, 1_000_000).unwrap_err();
+        assert!(matches!(err, TransportError::Io { .. }), "实得 {err:?}");
+        assert_eq!(err.class(), arca_format::trace::ErrorClass::NeedsHuman);
+        let _ = handle.join().unwrap();
+    }
+
     #[test]
     fn read_remote解析state数组() {
         let item_id = crate::ids::new_item_id();
@@ -901,6 +987,43 @@ mod tests {
         let remote = transport.read_remote().unwrap();
         assert!(matches!(
             remote.get("a.txt"),
+            Some(RemoteState::Present { item_id: i, .. }) if *i == item_id
+        ));
+        let _ = handle.join().unwrap();
+    }
+
+    /// **评审 I2 攻击重跑**：`GET .../state` 响应体超过 ureq 默认的 10MB
+    /// 上限（此前从未被本模块显式覆盖）——用一个刻意超长的 `path` 字段把
+    /// 单条响应体撑到 11MB（超过旧默认值，远小于新上限
+    /// `MAX_RESPONSE_BODY_BYTES`）。修复前这里会失败并报
+    /// `TransportError::Protocol`（`class=Bug`，"去看代码"）；修复后必须
+    /// 正常解析成功——`file://` 的 `LocalTransport` 从来没有这个限制，
+    /// 两条传输路径不能在这里分叉。
+    #[test]
+    fn read_remote解析超过ureq默认10mb上限的大响应体() {
+        let item_id = crate::ids::new_item_id();
+        let version_id = crate::ids::new_version_id();
+        // 11MB 的 path——超过 ureq 默认的 10MB 上限，远小于
+        // `MAX_RESPONSE_BODY_BYTES`（256MB）。
+        let huge_path = "a".repeat(11 * 1024 * 1024);
+        let body = format!(
+            "[{{\"path\":\"{huge_path}\",\"item_id\":\"{}\",\"version_id\":\"{}\",\"hash\":\"blake3:{}\",\"size\":5,\"state\":\"present\"}}]",
+            item_id.to_hex(),
+            version_id.as_str(),
+            "1".repeat(64),
+        );
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body.as_bytes());
+        let response: &'static [u8] = Box::leak(response.into_boxed_slice());
+        let (url, handle) = serve_once(response);
+        let transport = HttpTransport::new(&url, "9c41000000000000000000000000abcd", None);
+        let remote = transport.read_remote().unwrap();
+        assert!(matches!(
+            remote.get(&huge_path),
             Some(RemoteState::Present { item_id: i, .. }) if *i == item_id
         ));
         let _ = handle.join().unwrap();

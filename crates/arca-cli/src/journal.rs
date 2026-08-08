@@ -253,11 +253,34 @@ pub fn append(root: &StorageRoot, event: &JournalEvent) -> Result<(), JournalErr
 /// 损坏"；崩溃窗口变宽，但没有引入新的失败形态。`sync.rs::sync` 必须在
 /// `commit()` 成功之后才保存基线，与内容侧的 `arca_store::atomic::Batch`
 /// 同一条纪律（I3）。
+///
+/// # `commit()` 走增量追加，不重写已有历史（评审 I5）
+///
+/// 早先的实现把 `events`（含 `open()` 时已经在磁盘上的全部历史）整体重新
+/// 序列化、`atomic::write` 一次——`commit()` 本身的开销因此仍然是
+/// `O(当前 journal 大小)`，`journal::append`（单条追加的便捷壳）在这个形状
+/// 上是"每次调用都读一遍、写一遍全部历史"：50MB journal 上一个 7 字节的
+/// 单条 `PUT`（`arcad` 每次 HTTP 写入都调用一次 `append`）实测耗时 5 秒、
+/// 345MB RSS。`open()` 时磁盘文本若"干净"（以换行结束、没有撕裂的尾巴，
+/// 见 [`current_epoch`]/[`read_epoch_text`] 与模块顶部「`append` 为什么要
+/// 先解析现有内容再整体重写」一节），`commit()` 现在只把 `pending`（本批次
+/// 新追加的事件）序列化、交给 [`arca_store::atomic::append`]——真正的增量
+/// 追加，开销只与新增事件数成正比，不再与历史大小挂钩。只有磁盘文本存在
+/// 撕裂尾巴时才退回整体重写以"治愈"（那正是旧实现存在的原因，见模块顶部
+/// 文档），这种情形只在上一次追加恰好崩溃在中途时出现，此后下一次成功的
+/// `commit()` 会把它治好，不会重复发生。
 pub struct AppendBatch<'a> {
     root: &'a StorageRoot,
     epoch: String,
-    events: Vec<JournalEvent>,
+    /// `open()` 时磁盘上已有的事件——只有走"治愈"慢路径（磁盘文本存在撕裂
+    /// 尾巴）时才需要，`commit()` 的快路径完全不碰它。
+    existing_events: Vec<JournalEvent>,
+    /// 本批次新追加、尚未落盘的事件——`commit()` 只序列化这部分（快路径）。
+    pending: Vec<JournalEvent>,
     next_seq: u64,
+    /// `open()` 时磁盘文本是否"干净"（以换行结束，或本就为空）——`false`
+    /// 表示存在撕裂尾巴，`commit()` 必须走整体重写的治愈慢路径。
+    clean: bool,
 }
 
 impl<'a> AppendBatch<'a> {
@@ -274,13 +297,17 @@ impl<'a> AppendBatch<'a> {
             }
         };
         let text = read_epoch_text(root, &epoch)?;
-        let events = arca_format::journal::parse_stream(&text).map_err(JournalError::Format)?;
-        let next_seq = events.last().map(|e| e.seq + 1).unwrap_or(1);
+        let clean = text.is_empty() || text.ends_with('\n');
+        let existing_events =
+            arca_format::journal::parse_stream(&text).map_err(JournalError::Format)?;
+        let next_seq = existing_events.last().map(|e| e.seq + 1).unwrap_or(1);
         Ok(Self {
             root,
             epoch,
-            events,
+            existing_events,
+            pending: Vec::new(),
             next_seq,
+            clean,
         })
     }
 
@@ -302,22 +329,42 @@ impl<'a> AppendBatch<'a> {
             });
         }
         self.next_seq += 1;
-        self.events.push(event);
+        self.pending.push(event);
         Ok(())
     }
 
-    /// 收口：把批次内全部事件（含打开批次时已经存在的历史事件）整体序列化，
-    /// 原子写一次。调用方必须显式调用——不调用就丢弃 `AppendBatch`，本批次
-    /// 累积的事件不会落盘（与不调用 `arca_store::atomic::Batch::commit` 同一
-    /// 条纪律：未提交的批次视为没发生过，不会有部分写入）。
+    /// 收口：把本批次新追加的事件落盘。调用方必须显式调用——不调用就丢弃
+    /// `AppendBatch`，本批次累积的事件不会落盘（与不调用
+    /// `arca_store::atomic::Batch::commit` 同一条纪律：未提交的批次视为
+    /// 没发生过，不会有部分写入）。没有新事件时是无操作——不产生任何
+    /// 磁盘写入，磁盘上原有的（可能撕裂的）内容原样保留，留给下一次真正
+    /// 有新事件的 `commit()` 去治愈（见结构体文档）。
     pub fn commit(self) -> Result<(), JournalError> {
-        let mut content = String::new();
-        for event in &self.events {
-            content.push_str(&event.to_line().map_err(JournalError::Format)?);
-            content.push('\n');
+        if self.pending.is_empty() {
+            return Ok(());
         }
-        atomic::write(self.root, &journal_path(&self.epoch), content.as_bytes())
-            .map_err(JournalError::Atomic)
+        if self.clean {
+            // 快路径（评审 I5）：磁盘文本本身完整，只需要把新事件的字节
+            // 追加上去，不touch 已有历史。
+            let mut content = String::new();
+            for event in &self.pending {
+                content.push_str(&event.to_line().map_err(JournalError::Format)?);
+                content.push('\n');
+            }
+            atomic::append(self.root, &journal_path(&self.epoch), content.as_bytes())
+                .map_err(JournalError::Atomic)
+        } else {
+            // 慢路径（治愈撕裂尾巴）：整体重写——`existing_events` 已经是
+            // `parse_stream` 天然截断掉撕裂部分之后的干净历史，拼上
+            // `pending` 就是治愈后应有的完整内容。
+            let mut content = String::new();
+            for event in self.existing_events.iter().chain(self.pending.iter()) {
+                content.push_str(&event.to_line().map_err(JournalError::Format)?);
+                content.push('\n');
+            }
+            atomic::write(self.root, &journal_path(&self.epoch), content.as_bytes())
+                .map_err(JournalError::Atomic)
+        }
     }
 }
 
@@ -431,6 +478,51 @@ mod tests {
             vec!["a.png", "b.png", "c.png"]
         );
         assert_eq!(cursor.unwrap().seq, 3);
+    }
+
+    /// **评审 I5 攻击重跑**：单条 `append` 在一个已经很大的 journal 上耗时
+    /// 不应随 journal 的历史大小线性增长——修复前 50MB journal 上一次 7
+    /// 字节的追加实测 5.08 秒、345MB RSS（`commit()` 把全部历史重新序列化
+    /// 后整体原子写一次）。这里用一个更小但仍然明显的 journal（5000 条
+    /// 事件，约几百 KB，足以让"整体重写"与"只追加新字节"在耗时上产生
+    /// 数量级差异，同时保持测试本身在 CI 上快速可靠）验证：先用一次性
+    /// 写入（不经过逐条 `append`，避免测试前置本身也是 O(n²)）铺出一个
+    /// 大 journal，再单独计时**一次** `append`，必须在很短时间内完成——
+    /// 走的是增量追加（[`arca_store::atomic::append`]）快路径，不是整体
+    /// 重写。
+    #[test]
+    fn append在大journal上耗时不随历史大小线性增长() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+
+        // 一次性铺出 5000 条历史事件——直接拼字符串一次写入磁盘，不逐条
+        // `append`（那会是本测试自己的 O(n²)，不是在测试什么有意义的东西）。
+        let epoch = "a".repeat(32);
+        std::fs::write(dir.path().join(".arca/journal/epoch"), format!("{epoch}\n")).unwrap();
+        let mut content = String::new();
+        for seq in 1..=5000u64 {
+            content.push_str(&样例事件(seq, &format!("f{seq}.png")).to_line().unwrap());
+            content.push('\n');
+        }
+        std::fs::write(
+            dir.path().join(format!(".arca/journal/{epoch}.jsonl")),
+            &content,
+        )
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        append(&root, &样例事件(5001, "new.png")).unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "单条 append 在 5000 条历史事件之上耗时 {elapsed:?}，\
+             应该只与新增的这一条成正比，不应该重写全部历史"
+        );
+
+        let (_cursor, events) = read_all(&root).unwrap();
+        assert_eq!(events.len(), 5001);
+        assert_eq!(events.last().unwrap().path, "new.png");
     }
 
     #[test]

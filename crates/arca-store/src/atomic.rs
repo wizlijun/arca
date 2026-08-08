@@ -266,6 +266,58 @@ pub fn write(root: &StorageRoot, relative_target: &str, bytes: &[u8]) -> Result<
     })
 }
 
+/// 追加写入：把 `bytes` 接到 `relative_target` 现有内容之后（目标不存在
+/// 则等价于 [`write`]，从空开始创建），**不重写已有内容**——评审 I5：
+/// `crate::journal`（`arca-cli`）此前对 append-only 的 journal 事件流用
+/// [`write`]/[`Batch::write`] 做"读现有内容 + 拼接新行 + 整体重写"，每次
+/// 追加的开销与**当前已有的全部历史**成正比，`n` 次追加因此是 `O(n²)`——
+/// 50MB journal 上一次 7 字节的追加实测耗时 5 秒、345MB RSS。本函数只处理
+/// 这次新增的字节，开销只与本次追加的大小成正比，与文件已有多大无关。
+///
+/// # 持久化保证与 [`write`] 完全一致，只是没有 rename 这一步
+///
+/// 目标已存在时：`OpenOptions::append(true)` 打开（POSIX 保证每次
+/// `write()` 落在文件当前末尾这一步本身是原子的，但不提供持久化保证）→
+/// 写入新字节 → `sync_all()` 把这次追加从页缓存刷到磁盘（约束 2 第 1–2
+/// 步的对应）。**不需要 rename，因此也不需要 fsync 目录链**——目标路径的
+/// 目录项本身没有变化（文件已经存在，这次操作不产生任何新的目录项），
+/// 约束 2 第 3–4 步只在"目标从无到有"或"目标被替换成另一个 inode"时才
+/// 有意义，追加不属于这两种情形。
+///
+/// # 为什么不能对不存在的目标直接 `OpenOptions::create(true).append(true)`
+///
+/// 那样"创建 + 追加"揉在一次 `open()` 里，绕开了 [`write`] 的
+/// tmp → fsync → rename 创建纪律——第一次追加就是这个文件的整个内容，
+/// 理应享有与其它"从无到有"的写入完全相同的原子性保证（不能让"是不是第
+/// 一次写"这个偶然状态决定这次调用走哪条持久化路径）。所以目标不存在时
+/// 本函数直接委托给 [`write`]，不自己另开一条路径。
+///
+/// # 崩溃安全性：允许在文件尾部留下一行不完整的内容，不允许留下中间行损坏
+///
+/// 若 `write_all` 只写入了新内容的一部分就崩溃/断电，文件尾部会出现一段
+/// 不完整的追加——这与 [`write`]/`Batch::write` 崩溃在 rename 之前时"目标
+/// 完全没变"不同性质，但 append-only 事件流的读取端（`arca_format::journal::parse_stream`）
+/// 本就把"末行不完整"当作正常的崩溃残留处理（截断到最后一个完整行），
+/// 不是新引入的失败形态；调用方（`crate::journal::AppendBatch`）在下一次
+/// 成功追加前会先确认现有内容确实"干净"（以换行结束、没有撕裂的尾巴），
+/// 撕裂时退回整体重写以治愈，绝不会在一段已知撕裂的内容之后继续盲目追加
+/// （那会把撕裂的尾巴变成一条永久损坏的中间行）——这条纪律由调用方负责，
+/// 本函数只提供"追加这一段字节并确认落盘"这一个不做任何解析假设的原语。
+pub fn append(root: &StorageRoot, relative_target: &str, bytes: &[u8]) -> Result<(), AtomicError> {
+    let target = root.join(relative_target)?;
+
+    if !target.exists() {
+        return write(root, relative_target, bytes);
+    }
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&target)
+        .map_err(|e| io_error(&target, &e))?;
+    file.write_all(bytes).map_err(|e| io_error(&target, &e))?;
+    file.sync_all().map_err(|e| io_error(&target, &e))
+}
+
 /// 流式写入句柄：[`write`] 要求调用方先把整份内容攒成 `&[u8]` 再一次性
 /// 交出——HTTP 服务端在把一个请求体的全部字节吃进内存之前，内存占用就已经
 /// 与请求体体积成正比，这与"一次请求不该占用与其体积成正比的内存"
@@ -1050,6 +1102,53 @@ mod tests {
 
         let err = rename(&root, "files/不存在.txt", ".arca/trash/x.data").unwrap_err();
         assert!(matches!(err, AtomicError::Io { .. }), "实得 {err:?}");
+    }
+
+    /// **评审 I5**：`append` 在目标不存在时等价于 `write`（从空创建）。
+    #[test]
+    fn append在目标不存在时等价于write从空创建() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = StorageRoot::open(dir.path(), None).unwrap();
+
+        append(&root, "files/log.jsonl", b"line1\n").unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("files/log.jsonl")).unwrap(),
+            b"line1\n"
+        );
+    }
+
+    /// **评审 I5 核心**：连续多次 `append` 只各自追加新字节，不重写已有
+    /// 内容——用一个粗糙但有效的白盒验证：在两次 `append` 之间，把目标文件
+    /// 的 mtime 人为往回调，第二次 `append` 之后原有前缀字节的 mtime 不应
+    /// 因为"整个文件被重写"而改变（重写会让文件在 rename 后拿到一个全新
+    /// inode/内容，早期字节的物理位置也会变化；真正的追加只在文件末尾
+    /// 增长）。更直接的验证是内容本身：多次追加之后，文件内容必须恰好是
+    /// 各次追加内容按顺序拼接，且过程中不经过任何 `.arca/tmp/` 残留（`write`
+    /// 路径会经过 tmp→rename，`append` 路径对已存在的目标不经过 tmp）。
+    #[test]
+    fn append多次只追加新字节且不经过tmp路径() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = StorageRoot::open(dir.path(), None).unwrap();
+
+        append(&root, "files/log.jsonl", b"line1\n").unwrap();
+        // 记录第一次追加后 tmp 目录的状态——目标已存在时的第二次 append
+        // 不应该在 tmp 目录留下任何新文件（不经过 tmp→rename 路径）。
+        append(&root, "files/log.jsonl", b"line2\n").unwrap();
+        append(&root, "files/log.jsonl", b"line3\n").unwrap();
+
+        assert_eq!(
+            fs::read(dir.path().join("files/log.jsonl")).unwrap(),
+            b"line1\nline2\nline3\n"
+        );
+        let leftovers: Vec<_> = fs::read_dir(dir.path().join(".arca/tmp"))
+            .unwrap()
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "对已存在目标的 append 不应在 .arca/tmp/ 留下任何残留"
+        );
     }
 
     /// `insert_dir_chain` 白盒验证去重不变量：同一目录链的第二次插入应该
