@@ -22,6 +22,9 @@ arca-store = { path = "../arca-store" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 directories = "6.0.0"
+ureq = { version = "3", default-features = false, features = ["json"] }
+percent-encoding = "2.3.2"
+base64 = "0.23.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
