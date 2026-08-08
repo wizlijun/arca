@@ -64,6 +64,63 @@ impl fmt::Display for MountError {
 
 impl std::error::Error for MountError {}
 
+/// `StorageRoot::create` 引导一个全新存储根时的失败。彼此可区分（I5）。
+///
+/// **为什么这个函数住在 `arca-store` 而不是某个消费者 crate**：读写存储根的
+/// 消费者不止一个——M1 的 `arca-cli`（`file://` 直连同步、`arca adopt`）与
+/// M2 的 `arcad`（hub 侧初始化数据集根）都需要「引导一个全新存储根」这件事，
+/// 且创建逻辑必须与 `StorageRoot::open`/`FormatJson::parse` 的校验逻辑挨在一起：
+/// 将来 `format.json` 的字段变化，两者要一起改，放在消费者 crate 里会漂移
+/// （建出一个自己打不开的根）。M1a 的计划没排到这个函数，属于本轮（M1d）
+/// 对 `arca-store` 职责范围的合理补齐，而非越界。
+#[derive(Debug)]
+pub enum CreateError {
+    /// 调用方传入的 `dataset_id` 不合法（不是 32 位小写十六进制）——参数错误，
+    /// 不是磁盘状态的问题。`dataset_id` 由调用方生成并传入（不在本 crate 内生成），
+    /// 这样测试才能构造确定性的样例，与 `open_traced` 的 `t_abs_us` 注入同一条纪律。
+    BadDatasetId { value: String },
+    /// 该路径下已经有 `format.json`——拒绝覆盖。绝不静默重置一个可能活着的存储根
+    /// （I5：状态模糊就停下；这里状态并不模糊，是明确"已存在"，同样拒绝）。
+    AlreadyExists { path: String },
+    /// 骨架目录（`files/`、`.arca/{index,items,chunks,journal,tmp,trash,uploads,locks}/`）
+    /// 创建失败：权限、磁盘满等。
+    Io { path: String, reason: String },
+    /// `format.json` 序列化失败（`FormatJson::to_json` 目前不可达的分支，见其文档）。
+    Format(FormatError),
+    /// `format.json` 的原子写入失败——复用 [`crate::atomic::write`]，因此这里直接
+    /// 包住 [`crate::atomic::AtomicError`]，不拍扁成字符串。
+    Write(crate::atomic::AtomicError),
+}
+
+impl fmt::Display for CreateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CreateError::BadDatasetId { value } => write!(
+                f,
+                "调用方传入的 dataset_id {value:?} 不是合法的 32 位小写十六进制——这是参数错误"
+            ),
+            CreateError::AlreadyExists { path } => write!(
+                f,
+                "{path} 已经存在 {}，拒绝覆盖——绝不重置一个可能活着的存储根",
+                layout::FORMAT_JSON
+            ),
+            CreateError::Io { path, reason } => write!(f, "创建骨架目录 {path} 失败：{reason}"),
+            CreateError::Format(e) => write!(f, "format.json 序列化失败：{e}"),
+            CreateError::Write(e) => write!(f, "写入 format.json 失败：{e}"),
+        }
+    }
+}
+
+impl std::error::Error for CreateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CreateError::Format(e) => Some(e),
+            CreateError::Write(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 /// `StorageRoot::join` 中相对路径试图逃出存储根时的失败。
 ///
 /// `Path::join` 本身没有防护：`relative` 若是绝对路径会把 `self.path` 整个丢掉
@@ -243,6 +300,93 @@ impl StorageRoot {
             path: root.to_path_buf(),
             format,
         })
+    }
+
+    /// 引导一个全新存储根：建骨架目录（`files/`、`.arca/{index,items,chunks,
+    /// journal,tmp,trash,uploads,locks}/`），原子写入 `format.json`。
+    ///
+    /// `root` 目录本身不必预先存在——`arca adopt` 在一个全新的挂载点上建首个
+    /// 数据集时，这个目录很可能还没被创建过。`dataset_id` 由调用方生成并传入
+    /// （不在本函数内生成随机数，保持本 crate 内确定性可测；`created_at` 同理，
+    /// 由调用方注入当前时间字符串，本 crate 不读系统时钟）。
+    ///
+    /// **拒绝在已有 `format.json` 的目录上重复创建**（[`CreateError::AlreadyExists`]）：
+    /// 用 `symlink_metadata` 探测存在性（不跟随链接——即便那是个指向别处的符号
+    /// 链接，也已经是"这个位置有东西"，同样拒绝，不去纠结它到底指向真的
+    /// `format.json` 还是别的什么）。
+    ///
+    /// `format.json` 本身经 [`crate::atomic::write`] 原子写入（tmp → fsync →
+    /// rename → fsync 父目录链），不是裸 `fs::write`——它承载卷身份（I11），
+    /// 半截写入或写入后未落盘都不可接受，与存储根内其余内容同一持久化标准。
+    pub fn create(root: &Path, dataset_id: &str, created_at: &str) -> Result<Self, CreateError> {
+        if !is_hex32(dataset_id) {
+            return Err(CreateError::BadDatasetId {
+                value: dataset_id.to_string(),
+            });
+        }
+
+        let format_path = root.join(layout::FORMAT_JSON);
+        match fs::symlink_metadata(&format_path) {
+            Ok(_) => {
+                return Err(CreateError::AlreadyExists {
+                    path: format_path.display().to_string(),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(CreateError::Io {
+                    path: format_path.display().to_string(),
+                    reason: e.to_string(),
+                })
+            }
+        }
+
+        // 骨架目录：files/ 是逃生舱（I1），.arca/ 下各旁路目录见 FORMAT.md §4。
+        // EPOCH_FILE/index/items 等具体文件不在这里创建——那些随首次真正写入
+        // 才出现，本函数只保证"目录存在"这一层前提（`atomic::write` 需要
+        // `.arca/tmp/` 已存在，其余目录会在各自首次写入时按需 `create_dir_all`）。
+        for dir in [
+            layout::FILES_DIR,
+            layout::INDEX_DIR,
+            layout::ITEMS_DIR,
+            layout::CHUNKS_DIR,
+            layout::JOURNAL_DIR,
+            layout::TMP_DIR,
+            layout::TRASH_DIR,
+            layout::UPLOADS_DIR,
+            layout::LOCKS_DIR,
+        ] {
+            let full = root.join(dir);
+            fs::create_dir_all(&full).map_err(|e| CreateError::Io {
+                path: full.display().to_string(),
+                reason: e.to_string(),
+            })?;
+        }
+
+        // format.json 的记录/存储根格式版本目前都固定为 1（FORMAT.md §0、§5）。
+        // 这两个值本可从 `arca_format::hub_layout` 复用，但那两个常量是私有的
+        // （`FormatJson::parse`/`to_json` 内部自持版本号，调用方不需要关心）；
+        // 这里只需要"v1 是当前唯一认可的版本"这一件事，直接字面量加注释，
+        // 不为此扩大 `arca-format` 的公开面。
+        let format = FormatJson {
+            format: 1,
+            dataset_id: dataset_id.to_string(),
+            hash_algo: "blake3".to_string(),
+            created_at: created_at.to_string(),
+        };
+        let bytes = format.to_json().map_err(CreateError::Format)?;
+
+        // 此时 format.json 尚未落盘，`StorageRoot::open` 校验不过；但
+        // `atomic::write` 只需要 `path()`/`join()`，不要求文件已存在——
+        // 构造一个"暂存"实例专供这一次写入使用是安全的（不对外暴露）。
+        let staged = StorageRoot {
+            path: root.to_path_buf(),
+            format,
+        };
+        crate::atomic::write(&staged, layout::FORMAT_JSON, bytes.as_bytes())
+            .map_err(CreateError::Write)?;
+
+        Ok(staged)
     }
 
     pub fn path(&self) -> &Path {
