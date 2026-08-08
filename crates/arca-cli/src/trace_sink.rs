@@ -6,25 +6,29 @@
 //! 即便本次成功——与 `GIT_TRACE2_EVENT` 那类"设了就是要"的既有心智一致
 //! （PROTOCOL.md §5.2、FORMAT.md §10.6）。
 //!
-//! # 落盘位置：一处刻意偏离 FORMAT.md §10.6 字面表述，已知且待人工拍板
+//! # 落盘位置：全机唯一
 //!
-//! FORMAT.md §10.6 与 spec §3.3 的表格把 trace 的落盘位置定为**全机唯一**的
-//! `<state>/trace/`（Linux `$XDG_STATE_HOME/arca`、macOS
-//! `~/Library/Logs/arca`、Windows `%LOCALAPPDATA%\arca`），与具体数据集无关。
-//! 本模块按 M1d Task 8 brief 的直接指示落到 **`<dataset>/.arca/client/trace/`**
-//! ——数据集级别，而不是全机唯一。
+//! FORMAT.md §10.6 / spec §3.3 把 trace 的落盘位置定为**全机唯一**的
+//! `<state>/trace/`，与具体数据集无关——这正是本模块的落点，[`state_dir`]
+//! 负责解析 `<state>` 本身：
 //!
-//! 这不是无意疏漏：`.arca/client/` 本就是本数据集的、gitignored 的可抛弃
-//! 投影（I9，见 `baseline.rs` 顶部同一纪律），trace 挂在同一目录下语义上
-//! 说得通；且当前实现里除了"数据集根"没有其它天然可用的落点（这一切分片
-//! 命令——`sync`/`adopt`/`status`——都是先解析出一个具体数据集再动手，
-//! 从未建立过一个跨数据集的全局状态目录）。**但这与 FORMAT.md §10.6/spec
-//! §3.3 的字面表述不一致**，且继承了一个结构性缺口：在"数据集尚未解析出来"
-//! 之前发生的失败（例如根本不在任何 vault 里、`.gitarca` 本身解析失败）
-//! 没有地方可落盘，全局 `<state>/trace/` 设计不会有这个缺口。是否要按
-//! FORMAT.md 原意补一个全局状态目录、或者反过来把 FORMAT.md 改成"数据集
-//! 级别"以符合本次实现——留给人工按 I10（格式先于代码）决定，这里不擅自
-//! 改规范文档。
+//! | 平台 | `<state>` |
+//! | --- | --- |
+//! | Linux | `$XDG_STATE_HOME/arca`（缺省 `~/.local/state/arca`） |
+//! | macOS | `~/Library/Logs/arca` |
+//! | Windows | `%LOCALAPPDATA%\arca` |
+//!
+//! 选"全机唯一"而不是挂在某个数据集目录下，不只是照抄规范：**一个挂在
+//! 具体数据集下的落点，天然记录不了"解析数据集失败"这件事本身**——注册表
+//! 损坏、数据集嵌套、路径根本不在任何 vault 里——而那恰恰是最需要诊断线索
+//! 的时刻。全机位置没有这个结构性缺口：任何一次 `arca` 调用，不论最终有没有
+//! 定位到具体数据集，都落在同一个地方，命令壳（`commands/porcelain.rs`）不
+//! 再需要"尽力猜一个数据集目录当落点"这种退让。
+//!
+//! [`flush`] 把 `<state>` 本身作为可注入参数（而不是在函数内部直接调用
+//! [`state_dir`]）：调用方负责解析真实的机器位置，本函数只管"给定一个目录，
+//! 把 trace 落进它的 `trace/` 子目录"——这也是测试不必依赖用户主目录、也不
+//! 必修改 `HOME`/`XDG_STATE_HOME` 就能覆盖落盘路径的原因。
 //!
 //! # 保留策略
 //!
@@ -44,10 +48,47 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// 默认保留的会话文件数（未在 brief/spec 中钉死具体数字；FORMAT.md §10.6
-/// 给全局 `<state>/trace/` 定的是"超过 50 个文件或 14 天"，这里沿用文件数
-/// 那一半，数据集级别的目录预期比全局目录小得多，同一个量级足够宽松）。
+/// 默认保留的会话文件数——FORMAT.md §10.6 给全机唯一的 `<state>/trace/`
+/// 定的是"超过 50 个文件或 14 天"；本模块只实现按文件数的那一半（时间维度
+/// 的淘汰未实现，见 [`gc`] 文档），50 与规范文字直接对应。
 pub const DEFAULT_KEEP: usize = 50;
+
+/// 解析全机唯一的 trace 状态目录 `<state>`（FORMAT.md §10.6 / spec §3.3
+/// 表格定义的字面路径，末段的 `arca` 已经包含在返回值里）——[`flush`] 在
+/// 这个目录下再建 `trace/` 子目录存放会话文件。
+///
+/// 用 [`directories::BaseDirs`]（不是 `ProjectDirs`）取宿主机的标准目录：
+/// `ProjectDirs` 会在各平台约定的组织/应用段之间插入额外的路径分量（如
+/// macOS 的反向域名 bundle id），与 FORMAT.md 钉死的字面路径不符；
+/// `BaseDirs` 只给"这一类目录在这台机器上的位置"，由本函数自己拼上
+/// `arca`：
+///
+/// - **Linux**：`BaseDirs::state_dir()` 就是 XDG state 目录本身
+///   （`$XDG_STATE_HOME`，缺省 `~/.local/state`）——`directories` crate 对
+///   Linux 原生支持这个概念，直接采用。
+/// - **macOS**：`directories` 在 macOS 上没有对应"state"的标准目录
+///   （`state_dir()` 恒为 `None`——Apple 的标准目录体系里没有这一类），
+///   按 FORMAT.md 字面路径手工拼 `home_dir()/Library/Logs`。
+/// - **其他平台（含 Windows）**：同样没有"state"概念；
+///   `BaseDirs::data_local_dir()`（同样是 `BaseDirs` 而非 `ProjectDirs`
+///   版本）在 Windows 上直接返回裸的 `%LOCALAPPDATA%`，不附加任何组织/
+///   应用子目录——正好是 FORMAT.md 要的那个值。
+///
+/// 宿主机连 home/profile 目录都解析不出来时返回 `None`
+/// （[`directories::BaseDirs::new`] 的既有约定，通常只在极度精简的容器
+/// 环境发生）——调用方据此放弃落盘，不能报错让命令本身失败（trace 是
+/// 诊断产物，见模块顶部纪律）。
+pub fn state_dir() -> Option<PathBuf> {
+    let base = directories::BaseDirs::new()?;
+    let dir = if let Some(state) = base.state_dir() {
+        state.to_path_buf()
+    } else if cfg!(target_os = "macos") {
+        base.home_dir().join("Library").join("Logs")
+    } else {
+        base.data_local_dir().to_path_buf()
+    };
+    Some(dir.join("arca"))
+}
 
 const TRACE_SID_ENV: &str = "ARCA_TRACE_SID";
 const TRACE_EVENT_ENV: &str = "ARCA_TRACE_EVENT";
@@ -55,7 +96,7 @@ const TRACE_EVENT_ENV: &str = "ARCA_TRACE_EVENT";
 /// 本次会话是否应当强制落盘（即便成功）——`ARCA_TRACE_EVENT` 被设置为
 /// 任意非空值（PROTOCOL.md §5.2、FORMAT.md §10.6）。
 ///
-/// 只识别"落盘到 `<dataset>/.arca/client/trace/`"这一种取值；FORMAT.md §10.6
+/// 只识别"落盘到 `<state>/trace/`"这一种取值；FORMAT.md §10.6
 /// 还定义了 `=1`/`=2`（实时写 stdout/stderr）与 `=<路径>`（实时写指定文件）
 /// 两种取值，本模块只做"失败落盘"这一件事，尚未实现那两种实时镜像——
 /// 这里只把它当作"要不要强制落盘"的布尔开关，不解释其值。
@@ -123,24 +164,30 @@ pub struct FlushOutcome {
     pub dropped: u64,
 }
 
-fn trace_dir(dataset_root: &Path) -> PathBuf {
-    dataset_root.join(".arca").join("client").join("trace")
+fn trace_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("trace")
 }
 
-/// 把 `sink` 里留存的事件 flush 成 `<dataset_root>/.arca/client/trace/<sid 末段>.jsonl`，
+/// 把 `sink` 里留存的事件 flush 成 `<state_dir>/trace/<sid 末段>.jsonl`，
 /// 并淘汰超出 `keep` 保留数量的最旧会话文件。
+///
+/// `state_dir` 是全机唯一的 `<state>` 目录（见模块文档「落盘位置」一节），
+/// 由调用方解析后传入——通常是 [`state_dir`] 函数的返回值，但本函数刻意
+/// 不在内部调用它：调用方负责"这台机器上真正的位置在哪"，本函数只管
+/// "给定一个目录，把 trace 落进它的 `trace/` 子目录"，这也是测试能够
+/// 不依赖用户主目录、直接注入一个临时目录来覆盖落盘路径的原因。
 ///
 /// `sink` 取可变引用是因为 [`RingSink::drain`] 会清空缓冲——调用方不应该在
 /// 一次 flush 之后继续复用同一个 sink 塞入下一个会话的事件（每次命令调用
 /// 各自持有一个 sink，语义上就是一次会话，`sync.rs` 顶部注释里"一次 `arca`
 /// 调用就是一次会话"的说法在这里同样适用）。
 pub fn flush(
-    dataset_root: &Path,
+    state_dir: &Path,
     sid: &Sid,
     sink: &mut RingSink,
     keep: usize,
 ) -> Result<FlushOutcome, FlushError> {
-    let dir = trace_dir(dataset_root);
+    let dir = trace_dir(state_dir);
     fs::create_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
 
     let dropped = sink.dropped();
@@ -255,13 +302,13 @@ mod tests {
 
     #[test]
     fn flush落盘的文件是合法jsonl且事件数与sink一致() {
-        let dataset = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let mut sink = RingSink::new(16);
         sink.record(TraceRecord::new(EventKind::Start, 0));
         sink.record(TraceRecord::new(EventKind::ScanSummary, 10).with("files", 3u64));
 
         let sid = sid_n(1);
-        let outcome = flush(dataset.path(), &sid, &mut sink, DEFAULT_KEEP).unwrap();
+        let outcome = flush(state.path(), &sid, &mut sink, DEFAULT_KEEP).unwrap();
 
         assert_eq!(outcome.events, 2);
         assert_eq!(outcome.dropped, 0);
@@ -279,50 +326,47 @@ mod tests {
 
     #[test]
     fn flush后sink被清空() {
-        let dataset = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let mut sink = RingSink::new(16);
         sink.record(TraceRecord::new(EventKind::Start, 0));
         let sid = sid_n(1);
-        flush(dataset.path(), &sid, &mut sink, DEFAULT_KEEP).unwrap();
+        flush(state.path(), &sid, &mut sink, DEFAULT_KEEP).unwrap();
         assert!(sink.is_empty());
     }
 
     #[test]
     fn 挤出事件时落盘文件包含trace_dropped且dropped计数如实() {
-        let dataset = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let mut sink = RingSink::new(2);
         for i in 0..5u64 {
             sink.record(TraceRecord::new(EventKind::ScanSummary, i).with("files", i));
         }
         let sid = sid_n(1);
-        let outcome = flush(dataset.path(), &sid, &mut sink, DEFAULT_KEEP).unwrap();
+        let outcome = flush(state.path(), &sid, &mut sink, DEFAULT_KEEP).unwrap();
         assert_eq!(outcome.dropped, 3);
         let text = fs::read_to_string(&outcome.path).unwrap();
         assert!(text.contains("\"trace.dropped\""));
     }
 
     #[test]
-    fn 落盘目录落在dataset_arca_client_trace下() {
-        let dataset = tempfile::tempdir().unwrap();
+    fn 落盘目录落在注入的state目录下的trace子目录() {
+        let state = tempfile::tempdir().unwrap();
         let mut sink = RingSink::new(4);
         sink.record(TraceRecord::new(EventKind::Start, 0));
         let sid = sid_n(1);
-        let outcome = flush(dataset.path(), &sid, &mut sink, DEFAULT_KEEP).unwrap();
-        assert_eq!(
-            outcome.path.parent().unwrap(),
-            dataset.path().join(".arca/client/trace")
-        );
+        let outcome = flush(state.path(), &sid, &mut sink, DEFAULT_KEEP).unwrap();
+        assert_eq!(outcome.path.parent().unwrap(), state.path().join("trace"));
     }
 
     #[test]
     fn 超出保留数量时最旧的会话文件被淘汰() {
-        let dataset = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         for n in 1..=5u8 {
             let mut sink = RingSink::new(4);
             sink.record(TraceRecord::new(EventKind::Start, 0));
-            flush(dataset.path(), &sid_n(n), &mut sink, 3).unwrap();
+            flush(state.path(), &sid_n(n), &mut sink, 3).unwrap();
         }
-        let dir = dataset.path().join(".arca/client/trace");
+        let dir = state.path().join("trace");
         let mut names: Vec<String> = fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -333,6 +377,64 @@ mod tests {
         assert!(!names.iter().any(|n| n.contains("20260801")));
         assert!(!names.iter().any(|n| n.contains("20260802")));
         assert!(names.iter().any(|n| n.contains("20260805")));
+    }
+
+    /// `state_dir` 本身：解析出的路径必须以 `arca` 结尾（每个平台分支都
+    /// 拼接了这一段），且宿主机在测试环境里通常能解析出 home/profile 目录
+    /// （CI/本机都设了 HOME 或等价变量），不应返回 `None`。
+    #[test]
+    fn state_dir解析出的路径以arca结尾() {
+        let dir = state_dir().expect("测试环境应能解析出 home/profile 目录");
+        assert_eq!(dir.file_name().and_then(|n| n.to_str()), Some("arca"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn state_dir在linux上遵循xdg_state_home环境变量() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", "/tmp/arca-test-custom-state");
+        let dir = state_dir();
+        match original {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        assert_eq!(dir, Some(PathBuf::from("/tmp/arca-test-custom-state/arca")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn state_dir在linux上缺省落在本地state目录() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original = std::env::var_os("XDG_STATE_HOME");
+        std::env::remove_var("XDG_STATE_HOME");
+        let dir = state_dir().unwrap();
+        if let Some(v) = original {
+            std::env::set_var("XDG_STATE_HOME", v);
+        }
+        assert!(
+            dir.ends_with(".local/state/arca"),
+            "缺省应落在 ~/.local/state/arca，实得 {dir:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_dir在macos上落在library_logs下() {
+        let dir = state_dir().unwrap();
+        assert!(
+            dir.ends_with("Library/Logs/arca"),
+            "应落在 ~/Library/Logs/arca，实得 {dir:?}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn state_dir在windows上等于localappdata下的arca() {
+        let dir = state_dir().unwrap();
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            assert_eq!(dir, PathBuf::from(local_app_data).join("arca"));
+        }
     }
 
     #[test]

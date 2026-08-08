@@ -131,32 +131,22 @@ pub fn register_cmd(
     }
 }
 
-/// 尽力算出数据集目录，供 trace 失败落盘定位落点（M1d Task 8）——不是权威
-/// 解析（那是 [`dataset::resolve`] 的职责，需要数据集已经登记），只要能定位
-/// 到 vault 根 + 路径合规就够：trace 是诊断产物，落盘目的地宁可算得宽松些，
-/// 也不该让"数据集还没登记好"这种失败反而没有地方记录线索。算不出来（不在
-/// 任何 vault 里、路径本身不合规）就放弃落盘——见 `trace_sink` 模块文档
-/// 「落盘位置」一节点名的结构性缺口。
-fn best_effort_dataset_dir(path: &str) -> Option<PathBuf> {
-    let v = vault::open(&cwd()).ok()?;
-    let normalized = arca_format::path_rules::check(path).ok()?;
-    Some(v.repo.root().join(normalized))
-}
-
 /// trace 只在失败时落盘，`ARCA_TRACE_EVENT` 可强制——见 `trace_sink` 模块
-/// 文档。`dataset_dir` 为 `None`（算不出数据集目录）时放弃落盘，不报错
-/// （trace 是诊断产物，绝不能反过来变成命令失败的原因）。
-fn flush_trace_if_needed(
-    dataset_dir: Option<&Path>,
-    sid: &arca_format::trace::Sid,
-    sink: &mut RingSink,
-    succeeded: bool,
-) {
+/// 文档。落点是全机唯一的 `<state>/trace/`（`trace_sink::state_dir`），
+/// 与具体数据集是否解析成功无关——即便"数据集还没登记好"这类失败也有地方
+/// 落盘（这正是全机位置相对数据集级别位置的优势，见模块文档）。宿主机连
+/// home/profile 目录都解析不出来（`state_dir` 返回 `None`，极罕见的精简
+/// 容器环境）时放弃落盘，不报错（trace 是诊断产物，绝不能反过来变成命令
+/// 失败的原因）。
+fn flush_trace_if_needed(sid: &arca_format::trace::Sid, sink: &mut RingSink, succeeded: bool) {
     if !trace_sink::should_flush(succeeded) {
         return;
     }
-    let Some(dir) = dataset_dir else { return };
-    match trace_sink::flush(dir, sid, sink, trace_sink::DEFAULT_KEEP) {
+    let Some(dir) = trace_sink::state_dir() else {
+        eprintln!("无法解析全机 trace 目录（home/profile 目录不可用），本次跳过 trace 落盘");
+        return;
+    };
+    match trace_sink::flush(&dir, sid, sink, trace_sink::DEFAULT_KEEP) {
         Ok(outcome) => eprintln!(
             "trace 已落盘：{}（{} 条事件，其中 {} 条因环形缓冲溢出被丢弃）",
             outcome.path.display(),
@@ -171,7 +161,6 @@ fn flush_trace_if_needed(
 pub fn adopt_cmd(path: &str, root: Option<&Path>) -> ExitCode {
     let sid = trace_sink::resolve_sid();
     let mut sink = RingSink::default();
-    let dataset_dir = best_effort_dataset_dir(path);
 
     let opts = AdoptOptions {
         path,
@@ -221,7 +210,7 @@ pub fn adopt_cmd(path: &str, root: Option<&Path>) -> ExitCode {
         }
     };
 
-    flush_trace_if_needed(dataset_dir.as_deref(), &sid, &mut sink, succeeded);
+    flush_trace_if_needed(&sid, &mut sink, succeeded);
     code
 }
 
@@ -294,7 +283,7 @@ pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{e}");
-            flush_trace_if_needed(Some(&dataset_dir), &sid, &mut sink, false);
+            flush_trace_if_needed(&sid, &mut sink, false);
             return ExitCode::from(2);
         }
     };
@@ -338,7 +327,7 @@ pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
             }
         };
 
-    flush_trace_if_needed(Some(&dataset_dir), &sid, &mut sink, succeeded);
+    flush_trace_if_needed(&sid, &mut sink, succeeded);
     code
 }
 
