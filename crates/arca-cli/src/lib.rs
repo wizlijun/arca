@@ -23,6 +23,7 @@ pub mod baseline;
 pub mod clock;
 pub mod dataset;
 pub mod doctor;
+pub mod gates;
 pub mod hub;
 pub mod ids;
 pub mod init;
