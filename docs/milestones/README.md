@@ -16,6 +16,7 @@
 | [M1c arca-git](M1c-arca-git.md) | `.gitignore` 反选块 · 追踪冲突检测 · pre-push 钩子 · 噩梦路径 | 6 | ✅ |
 | [M1d CLI 与 file:// 同步闭环](M1d-CLI与file同步闭环.md) | init/register/adopt/sync/status/verify/doctor + plumbing · 批量提交 · trace 落盘 | 12 | ✅ |
 | [M2a tombstone 与删除安全地基](M2a-tombstone与删除安全地基.md) | 下载 fsync · hub journal · tombstone · **删除传播四道闸门** · restore | 12 | ✅ |
+| [M2b arcad 与 HTTP CAS](M2b-arcad与HTTP-CAS.md) | Transport 抽象 · PROTOCOL §1.2 定稿 · arcad 服务端 · CAS 写入 · arca.lock | 4 | ✅ |
 
 后续切片见 [M1a 文档末尾的拆分表](M1a-存储根IO地基.md#m1-的其余切片)。
 
