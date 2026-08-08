@@ -252,6 +252,39 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a st
     first.to_str().map(Some).map_err(|_| ())
 }
 
+/// 把一段阻塞工作（磁盘 IO、`Transport` 调用、`dataset.write_lock` 这把
+/// `std::sync::Mutex`）挪到 tokio 的阻塞线程池——**评审 I6**：本文件的
+/// handler 除了少数几处显式 `.await`（流式接收请求体、`axum::body::to_bytes`、
+/// longpoll 的 `sleep`/`notified`）之外，其余全部是同步阻塞代码，此前直接
+/// 跑在 async worker 线程上——一次大 `batch`/大目录扫描会独占某个 worker
+/// 线程整段处理时长，饿死同一 worker 上排队的其它任务；`write_lock.lock()`
+/// 更是在竞争激烈时把"等锁"这件本该异步等待的事也变成了同步阻塞 worker
+/// 线程。评审实测：12 并发 `batch` 时，一个零 IO 的纯路由 404 首次要等
+/// 4.45 秒才被调度到。`spawn_blocking` 把这类工作挪到独立的阻塞线程池——
+/// 池子远大于 async worker 数量上限（tokio 默认 512），worker 线程因此不会
+/// 被这些同步工作占住，`GET`/`DELETE`/`POST` 这些路由级别的裁决（未知
+/// 数据集 404、路径校验 400 等）不受影响，能立即被调度。
+///
+/// `f` 必须自己产出最终要返回的 `Response`（不是 `Result`）——本文件里
+/// 每个 handler 的内部逻辑本来就是"每条分支各自 `return` 一个 `Response`"，
+/// 这个签名与既有代码形状完全对齐，不需要额外的错误类型转换。`JoinHandle`
+/// 本身失败（`f` 内部 panic）是不该发生的内部不变量被打破，映射为已在
+/// 别处使用过的 `internal.invariant_violated`（`arca_cli`/`arcad` 都不允许
+/// `panic!` 作为正常控制流，走到这里说明有 bug，不是任何一种可预期的失败）。
+async fn blocking<F>(f: F) -> Response
+where
+    F: FnOnce() -> Response + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(resp) => resp,
+        Err(e) => error_body(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal.invariant_violated",
+            format!("处理线程 panic（评审 I6 spawn_blocking 任务失败）：{e}"),
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GET /v1/datasets/{id}/files/{path}
 // ---------------------------------------------------------------------------
@@ -261,11 +294,22 @@ async fn get_file(
     Path((dataset_id, raw_path)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let (_, root) = match open_dataset(&registry, &dataset_id) {
+    // 评审 I6：本 handler 通篇是同步阻塞代码（磁盘 IO），挪到阻塞线程池，
+    // 见 [`blocking`] 文档。
+    blocking(move || get_file_blocking(&registry, &dataset_id, &raw_path, &headers)).await
+}
+
+fn get_file_blocking(
+    registry: &Registry,
+    dataset_id: &str,
+    raw_path: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let (_, root) = match open_dataset(registry, dataset_id) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let path = match checked_path(&raw_path) {
+    let path = match checked_path(raw_path) {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
@@ -323,7 +367,7 @@ async fn get_file(
     // "该 304 的没 304"，不是数据损坏，所以宁可保守地当作"没有提供有效的
     // 缓存校验条件"，直接跳过 304 判断、照常吐出内容，而不是任选一条来信
     // （[`single_header`] 文档）。
-    if let Ok(Some(text)) = single_header(&headers, "if-none-match") {
+    if let Ok(Some(text)) = single_header(headers, "if-none-match") {
         if if_none_match_hits(text, &hash) {
             let mut resp = StatusCode::NOT_MODIFIED.into_response();
             set_cache_headers(resp.headers_mut(), &hash, &version_id);
@@ -342,7 +386,7 @@ async fn get_file(
         // `If-Match` 不能悄悄跳过版本钉住检查去信第一条：那正是续传安全性
         // 唯一的把关，猜错会让客户端拼接出跨版本的半新半旧内容，必须直接
         // 拒绝（400），不当作"没提供"处理。
-        match single_header(&headers, "if-match") {
+        match single_header(headers, "if-match") {
             Ok(Some(claimed)) => {
                 if claimed != version_id.as_str() {
                     return error_body(
@@ -549,7 +593,12 @@ async fn get_state(
     State(registry): State<Arc<Registry>>,
     Path(dataset_id): Path<String>,
 ) -> Response {
-    let (_, root) = match open_dataset(&registry, &dataset_id) {
+    // 评审 I6：见 [`blocking`] 文档。
+    blocking(move || get_state_blocking(&registry, &dataset_id)).await
+}
+
+fn get_state_blocking(registry: &Registry, dataset_id: &str) -> Response {
+    let (_, root) = match open_dataset(registry, dataset_id) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
@@ -636,12 +685,25 @@ async fn get_trash(
     Path((dataset_id, item_id_text)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
-    let (_, root) = match open_dataset(&registry, &dataset_id) {
+    // 评审 I6：见 [`blocking`] 文档。
+    blocking(move || {
+        get_trash_blocking(&registry, &dataset_id, &item_id_text, raw_query.as_deref())
+    })
+    .await
+}
+
+fn get_trash_blocking(
+    registry: &Registry,
+    dataset_id: &str,
+    item_id_text: &str,
+    raw_query: Option<&str>,
+) -> Response {
+    let (_, root) = match open_dataset(registry, dataset_id) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
 
-    let Ok(item_id) = ItemId::parse(&item_id_text) else {
+    let Ok(item_id) = ItemId::parse(item_id_text) else {
         return error_body(
             StatusCode::BAD_REQUEST,
             "request.item_id_invalid",
@@ -649,11 +711,7 @@ async fn get_trash(
         );
     };
 
-    let Some(hash) = raw_query
-        .as_deref()
-        .and_then(find_hash_param)
-        .and_then(parse_hex_hash)
-    else {
+    let Some(hash) = raw_query.and_then(find_hash_param).and_then(parse_hex_hash) else {
         return error_body(
             StatusCode::BAD_REQUEST,
             "request.hash_missing",
@@ -733,11 +791,16 @@ async fn get_blob(
     State(registry): State<Arc<Registry>>,
     Path((dataset_id, raw_hash)): Path<(String, String)>,
 ) -> Response {
-    let (_, root) = match open_dataset(&registry, &dataset_id) {
+    // 评审 I6：见 [`blocking`] 文档。
+    blocking(move || get_blob_blocking(&registry, &dataset_id, &raw_hash)).await
+}
+
+fn get_blob_blocking(registry: &Registry, dataset_id: &str, raw_hash: &str) -> Response {
+    let (_, root) = match open_dataset(registry, dataset_id) {
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let Ok(hash) = ContentHash::parse(&raw_hash) else {
+    let Ok(hash) = ContentHash::parse(raw_hash) else {
         return error_body(
             StatusCode::BAD_REQUEST,
             "request.hash_invalid",
@@ -877,10 +940,39 @@ async fn put_file(
     }
     let hash = hasher.finish();
 
-    // 临界区：拿到锁之后才重新打开存储根、才做 CAS 提交——见 storage.rs
-    // 「write_lock」一节，这是并发正确性的唯一来源。到这里为止全部是
-    // 同步代码（`Transport::commit_streamed` 不是 `async fn`），锁不会
-    // 跨越任何 `.await`。
+    // 评审 I6：CAS 提交（拿 `write_lock` + `Transport::commit_streamed` +
+    // 构造响应）是纯同步阻塞工作，挪到阻塞线程池，见 [`blocking`] 文档。
+    // `spawn_blocking` 要求闭包 `'static`：克隆 `Arc<Registry>` + 拿
+    // `dataset_id` 的所有权，在闭包内部重新查一次登记表——这个 handler
+    // 函数开头已经确认过这个 `dataset_id` 存在，登记表运行期不变（`Registry`
+    // 没有运行时增删数据集的方法），不会变成 `None`。
+    let registry = Arc::clone(&registry);
+    blocking(move || {
+        let dataset = registry
+            .get(&dataset_id)
+            .expect("登记表运行期不变，函数开头已确认过这个 dataset_id 存在");
+        put_file_commit(
+            dataset, &path, item_id, version_id, parent, writer, hash, size, mtime, actor,
+        )
+    })
+    .await
+}
+
+/// [`put_file`] 的 CAS 提交阶段——拿到锁之后才重新打开存储根、才做提交，
+/// 见 storage.rs「write_lock」一节，这是并发正确性的唯一来源。
+#[allow(clippy::too_many_arguments)]
+fn put_file_commit(
+    dataset: &Dataset,
+    path: &str,
+    item_id: ItemId,
+    version_id: VersionId,
+    parent: Option<VersionId>,
+    writer: TmpWriter,
+    hash: ContentHash,
+    size: u64,
+    mtime: String,
+    actor: Actor,
+) -> Response {
     let _guard = dataset.write_lock.lock().unwrap_or_else(|e| e.into_inner());
     let root = match dataset.open() {
         Ok(r) => r,
@@ -892,7 +984,7 @@ async fn put_file(
 
     let transport = LocalTransport::new(&root);
     match transport.commit_streamed(
-        &path,
+        path,
         item_id,
         version_id.clone(),
         parent.clone(),
@@ -1344,9 +1436,9 @@ async fn put_batch(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let Some(dataset) = registry.get(&dataset_id) else {
+    if registry.get(&dataset_id).is_none() {
         return unknown_dataset();
-    };
+    }
 
     // 批量端点用 JSON 信封，不是流式 `PUT`——M2c 尚不为它做流式优化
     // （`PROTOCOL.md` §1.2「批量提交」一节），但仍然沿用同一个体积上限，
@@ -1384,15 +1476,30 @@ async fn put_batch(
         }
     }
 
-    // 挂载检查 + 写锁：与 `put_file` 同一条纪律，见 `storage.rs`
-    // 「`write_lock`」一节；整批只在一次锁的生命周期内完成校验与写入。
+    // 评审 I6：挂载检查 + 写锁 + `commit_batch`（整批的磁盘 IO）是纯同步
+    // 阻塞工作，挪到阻塞线程池，见 [`blocking`] 文档——这正是评审实测
+    // "12 并发 batch 时一个纯路由 404 首次耗时 4.45 秒"的直接原因。
+    let registry = Arc::clone(&registry);
+    blocking(move || {
+        let dataset = registry
+            .get(&dataset_id)
+            .expect("登记表运行期不变，函数开头已确认过这个 dataset_id 存在");
+        put_batch_commit(dataset, &reqs)
+    })
+    .await
+}
+
+/// [`put_batch`] 的 CAS 提交阶段——与 `put_file` 同一条纪律，见
+/// storage.rs「`write_lock`」一节；整批只在一次锁的生命周期内完成校验与
+/// 写入。
+fn put_batch_commit(dataset: &Dataset, reqs: &[arca_cli::transport::CommitRequest]) -> Response {
     let _guard = dataset.write_lock.lock().unwrap_or_else(|e| e.into_inner());
     let root = match dataset.open() {
         Ok(r) => r,
         Err(e) => return mount_error_response(&e),
     };
     let transport = LocalTransport::new(&root);
-    match transport.commit_batch(&reqs) {
+    match transport.commit_batch(reqs) {
         Ok(arca_cli::transport::BatchOutcome::Committed(results)) => {
             // M2c Task 3：批量提交同样要唤醒挂起的 longpoll——不只是单文件
             // `PUT` 才算"有新事件"。
@@ -1460,17 +1567,29 @@ async fn delete_file(
     Path((dataset_id, raw_path)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(dataset) = registry.get(&dataset_id) else {
+    // 评审 I6：本 handler 含 `dataset.write_lock`（`std::sync::Mutex`）与
+    // `Transport::tombstone` 的磁盘 IO，整体挪到阻塞线程池，见 [`blocking`]
+    // 文档。
+    blocking(move || delete_file_blocking(&registry, &dataset_id, &raw_path, &headers)).await
+}
+
+fn delete_file_blocking(
+    registry: &Registry,
+    dataset_id: &str,
+    raw_path: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let Some(dataset) = registry.get(dataset_id) else {
         return unknown_dataset();
     };
-    let path = match checked_path(&raw_path) {
+    let path = match checked_path(raw_path) {
         Ok(p) => p,
         Err(resp) => return *resp,
     };
 
     // Minor 修复：重复且矛盾的 `If-Match` 同样不能悄悄信第一条——DELETE 是
     // CAS 提交，猜错这里比猜错 Range 续传更危险（见 [`single_header`] 文档）。
-    let Ok(Some(if_match)) = single_header(&headers, "if-match") else {
+    let Ok(Some(if_match)) = single_header(headers, "if-match") else {
         return if_match_required();
     };
     let Some(parent) = parse_version_id_header(if_match) else {
@@ -1483,7 +1602,7 @@ async fn delete_file(
     else {
         return metadata_missing("Arca-Item-Id");
     };
-    let actor = match actor_from_headers(&headers) {
+    let actor = match actor_from_headers(headers) {
         Ok(a) => a,
         Err(resp) => return *resp,
     };
@@ -1582,9 +1701,9 @@ async fn post_rename(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let Some(dataset) = registry.get(&dataset_id) else {
+    if registry.get(&dataset_id).is_none() {
         return unknown_dataset();
-    };
+    }
 
     // 请求体不大（两个路径 + 两个短标识符），不需要 `put_file`/`put_batch`
     // 那种流式接收纪律，但仍然沿用同一个体积上限——不给这个新端点开一个
@@ -1630,13 +1749,6 @@ async fn post_rename(
         Err(resp) => return *resp,
     };
 
-    let _guard = dataset.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let root = match dataset.open() {
-        Ok(r) => r,
-        Err(e) => return mount_error_response(&e),
-    };
-    let transport = LocalTransport::new(&root);
-
     let at = arca_cli::clock::now_rfc3339();
     let req = arca_cli::transport::RenameRequest {
         old_path: from,
@@ -1646,6 +1758,29 @@ async fn post_rename(
         actor,
         at,
     };
+
+    // 评审 I6：拿锁 + `Transport::rename` 是纯同步阻塞工作，挪到阻塞线程池，
+    // 见 [`blocking`] 文档。
+    let registry = Arc::clone(&registry);
+    blocking(move || {
+        let dataset = registry
+            .get(&dataset_id)
+            .expect("登记表运行期不变，函数开头已确认过这个 dataset_id 存在");
+        post_rename_commit(dataset, req)
+    })
+    .await
+}
+
+/// [`post_rename`] 的 CAS 提交阶段——与 `put_file`/`put_batch` 同一条纪律，
+/// 见 storage.rs「`write_lock`」一节。
+fn post_rename_commit(dataset: &Dataset, req: arca_cli::transport::RenameRequest) -> Response {
+    let _guard = dataset.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let root = match dataset.open() {
+        Ok(r) => r,
+        Err(e) => return mount_error_response(&e),
+    };
+    let transport = LocalTransport::new(&root);
+
     match transport.rename(&req) {
         Ok(CommitOutcome::Committed {
             item_id,
@@ -1817,8 +1952,10 @@ async fn get_changes(
     // 才值得付一次 `read_all`（`O(journal 大小)`）的代价。`cached` 持有
     // "上一次真正读取"的结果，指纹未变时直接复用，不重新读盘、不重新解析
     // （见 `arca_cli::journal::fingerprint` 文档）。
-    let mut cached_fingerprint: Option<(String, u64, std::time::SystemTime)> = None;
-    let mut cached: Option<(Option<Cursor>, Vec<JournalEvent>)> = None;
+    let mut state = ChangesProbeState {
+        cached_fingerprint: None,
+        cached: None,
+    };
 
     loop {
         // 见 tokio::sync::Notify 文档「notify after check」范式：`notified()`
@@ -1827,91 +1964,50 @@ async fn get_changes(
         let notified = dataset.changes_notify.notified();
         tokio::pin!(notified);
 
-        // 每次重新探测都重新打开存储根——与非 longpoll 端点的"每请求重新
-        // 打开"同一条纪律（`storage.rs` 模块文档）：数据集在挂起期间掉线，
-        // 这里立即发现并返回 503，不会拖到 `wait` 超时才返回（I11：挂到
-        // 超时才返回空增量，在客户端看来与"这本来就是个没有变化的空库"
-        // 无法区分，等价于呈现为空库）。
-        let root = match dataset.open() {
-            Ok(r) => r,
-            Err(e) => return mount_error_response(&e),
-        };
+        let now = tokio::time::Instant::now();
+        let deadline_reached = now >= deadline;
 
-        let fp = match arca_cli::journal::fingerprint(&root) {
-            Ok(v) => v,
+        // 评审 I6：一轮探测（重新打开存储根 + fingerprint + 按需 read_all +
+        // 按需构造响应）是同步阻塞工作——尤其 `read_all` 在 journal 很大
+        // 时是 `O(journal 大小)`，绝不能让它占住 async worker 线程，挪到
+        // 阻塞线程池执行，见 [`blocking`] 文档。`registry`/`dataset_id`
+        // 各自克隆一份供闭包捕获（`spawn_blocking` 要求 `'static`）。
+        let registry_for_probe = Arc::clone(&registry);
+        let dataset_id_for_probe = dataset_id.clone();
+        let since_for_probe = since.clone();
+        let outcome = match tokio::task::spawn_blocking(move || {
+            let dataset = registry_for_probe
+                .get(&dataset_id_for_probe)
+                .expect("登记表运行期不变，函数开头已确认过这个 dataset_id 存在");
+            probe_changes(
+                dataset,
+                &since_for_probe,
+                effective_wait,
+                limit,
+                deadline_reached,
+                state,
+            )
+        })
+        .await
+        {
+            Ok(o) => o,
             Err(e) => {
                 return error_body(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "store.corrupt",
-                    format!("journal 读取失败：{e}"),
+                    "internal.invariant_violated",
+                    format!("处理线程 panic（评审 I6 spawn_blocking 任务失败）：{e}"),
                 )
             }
         };
 
-        if cached.is_none() || fp != cached_fingerprint {
-            let (cursor_now, all_events) = match arca_cli::journal::read_all(&root) {
-                Ok(v) => v,
-                Err(e) => {
-                    return error_body(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "store.corrupt",
-                        format!("journal 读取失败：{e}"),
-                    )
-                }
-            };
-            cached_fingerprint = fp;
-            cached = Some((cursor_now, all_events));
-        }
-        let (cursor_now, all_events) = cached.as_ref().expect("上面已确保至少读取过一次");
+        state = match outcome {
+            ChangesProbeOutcome::Respond(resp) => return resp,
+            ChangesProbeOutcome::Wait(s) => s,
+        };
 
-        // 游标失效判定：语法已经合法，这里判断"是否还在保留区间内"——本
-        // 切片没有 journal 压缩，`epoch` 只在从未初始化过时不存在，一旦
-        // 存在就不会变，所以"`since.epoch` 与数据集当前 epoch 不一致"
-        // 就是"早于保留区间"的完整判据（`PROTOCOL.md` 同一节）。
-        if let Some(want) = &since {
-            let mismatch = match cursor_now {
-                Some(c) => c.epoch != want.epoch,
-                None => true,
-            };
-            if mismatch {
-                return reset_required_response(cursor_now.as_ref());
-            }
-        }
-
-        let start_seq = since.as_ref().map(|s| s.seq).unwrap_or(0);
-        let mut diff: Vec<&JournalEvent> =
-            all_events.iter().filter(|e| e.seq > start_seq).collect();
-        // **评审 C1**：`limit` 分页——积压事件数超过上限时只返回前 `limit`
-        // 条，游标相应地只推进到"这一批最后一条事件"，不是数据集当前最新
-        // 游标；客户端据此用新游标继续发起下一次 `GET`（`PROTOCOL.md` §1.2）。
-        let truncated = diff.len() > limit;
-        diff.truncate(limit);
-
-        if !diff.is_empty() || effective_wait == 0 {
-            let response_cursor = if truncated {
-                let epoch = cursor_now
-                    .as_ref()
-                    .expect("truncated 意味着 diff 非空，意味着 all_events 非空，意味着 cursor_now 是 Some")
-                    .epoch
-                    .clone();
-                let last_seq = diff.last().expect("truncated 意味着 diff 非空").seq;
-                Some(Cursor {
-                    epoch,
-                    seq: last_seq,
-                })
-            } else {
-                cursor_now.clone()
-            };
-            return changes_response(response_cursor.as_ref(), &diff);
-        }
-
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            // 超时：返回空增量与原游标（`cursor_now` 此刻等于 `since`——
-            // 没有任何新事件意味着 `since` 已经是数据集当前的游标），不是
-            // 错误。
-            return changes_response(cursor_now.as_ref(), &diff);
-        }
+        // 到这里意味着 `deadline_reached` 此刻（探测发起前）为假——`probe_changes`
+        // 在 `deadline_reached` 为真时只会产出 `Respond`，不会产出 `Wait`
+        // （见其文档），`deadline - now` 因此必然是正的。
         let remaining = deadline - now;
         let step = remaining.min(LONGPOLL_POLL_INTERVAL);
 
@@ -1928,6 +2024,126 @@ async fn get_changes(
         // 写入发生过"，不保证这次写入命中的就是本请求关心的这个数据集/
         // epoch 文件；指纹比较仍然是判断"值不值得真读"的唯一依据。
     }
+}
+
+/// [`get_changes`] 挂起循环里跨迭代保留的状态——每次探测（[`probe_changes`]）
+/// 消费上一轮的状态、产出下一轮的状态，本身在 `spawn_blocking` 的闭包
+/// 之间搬运（评审 I6），不能像原来那样直接是循环体的局部可变变量。
+struct ChangesProbeState {
+    cached_fingerprint: Option<(String, u64, std::time::SystemTime)>,
+    cached: Option<(Option<Cursor>, Vec<JournalEvent>)>,
+}
+
+/// 一次 [`probe_changes`] 的结果：要么已经有了最终要返回给客户端的
+/// `Response`，要么这一轮没有新事件、还没超时，调用方应该继续等待——
+/// 后一种情形携带更新过的 [`ChangesProbeState`]，供下一轮探测复用。
+enum ChangesProbeOutcome {
+    Respond(Response),
+    Wait(ChangesProbeState),
+}
+
+/// [`get_changes`] 挂起循环的一轮探测——纯同步阻塞代码（评审 I6，见
+/// [`get_changes`] 调用点的文档），从"打开存储根"到"判断这一轮该不该
+/// 返回"的完整逻辑都在这里，与改造前循环体内联的那段代码逐行对应，只是
+/// 签名变成了"吃一份状态、吐一份结果"，不再直接借用外层循环变量。
+fn probe_changes(
+    dataset: &Dataset,
+    since: &Option<Cursor>,
+    effective_wait: u64,
+    limit: usize,
+    deadline_reached: bool,
+    state: ChangesProbeState,
+) -> ChangesProbeOutcome {
+    // 每次重新探测都重新打开存储根——与非 longpoll 端点的"每请求重新
+    // 打开"同一条纪律（`storage.rs` 模块文档）：数据集在挂起期间掉线，
+    // 这里立即发现并返回 503，不会拖到 `wait` 超时才返回（I11：挂到
+    // 超时才返回空增量，在客户端看来与"这本来就是个没有变化的空库"
+    // 无法区分，等价于呈现为空库）。
+    let root = match dataset.open() {
+        Ok(r) => r,
+        Err(e) => return ChangesProbeOutcome::Respond(mount_error_response(&e)),
+    };
+
+    let fp = match arca_cli::journal::fingerprint(&root) {
+        Ok(v) => v,
+        Err(e) => {
+            return ChangesProbeOutcome::Respond(error_body(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store.corrupt",
+                format!("journal 读取失败：{e}"),
+            ))
+        }
+    };
+
+    let ChangesProbeState {
+        mut cached_fingerprint,
+        mut cached,
+    } = state;
+
+    if cached.is_none() || fp != cached_fingerprint {
+        let (cursor_now, all_events) = match arca_cli::journal::read_all(&root) {
+            Ok(v) => v,
+            Err(e) => {
+                return ChangesProbeOutcome::Respond(error_body(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "store.corrupt",
+                    format!("journal 读取失败：{e}"),
+                ))
+            }
+        };
+        cached_fingerprint = fp;
+        cached = Some((cursor_now, all_events));
+    }
+    let (cursor_now, all_events) = cached.as_ref().expect("上面已确保至少读取过一次");
+
+    // 游标失效判定：语法已经合法，这里判断"是否还在保留区间内"——本
+    // 切片没有 journal 压缩，`epoch` 只在从未初始化过时不存在，一旦
+    // 存在就不会变，所以"`since.epoch` 与数据集当前 epoch 不一致"
+    // 就是"早于保留区间"的完整判据（`PROTOCOL.md` 同一节）。
+    if let Some(want) = since {
+        let mismatch = match cursor_now {
+            Some(c) => c.epoch != want.epoch,
+            None => true,
+        };
+        if mismatch {
+            return ChangesProbeOutcome::Respond(reset_required_response(cursor_now.as_ref()));
+        }
+    }
+
+    let start_seq = since.as_ref().map(|s| s.seq).unwrap_or(0);
+    let mut diff: Vec<&JournalEvent> = all_events.iter().filter(|e| e.seq > start_seq).collect();
+    // **评审 C1**：`limit` 分页——积压事件数超过上限时只返回前 `limit`
+    // 条，游标相应地只推进到"这一批最后一条事件"，不是数据集当前最新
+    // 游标；客户端据此用新游标继续发起下一次 `GET`（`PROTOCOL.md` §1.2）。
+    let truncated = diff.len() > limit;
+    diff.truncate(limit);
+
+    // 有新事件、或不打算挂起、或已经等到了超时——三者任一成立都该立即
+    // 返回（超时返回空增量与原游标，不是错误）。
+    if !diff.is_empty() || effective_wait == 0 || deadline_reached {
+        let response_cursor = if truncated {
+            let epoch = cursor_now
+                .as_ref()
+                .expect(
+                    "truncated 意味着 diff 非空，意味着 all_events 非空，意味着 cursor_now 是 Some",
+                )
+                .epoch
+                .clone();
+            let last_seq = diff.last().expect("truncated 意味着 diff 非空").seq;
+            Some(Cursor {
+                epoch,
+                seq: last_seq,
+            })
+        } else {
+            cursor_now.clone()
+        };
+        return ChangesProbeOutcome::Respond(changes_response(response_cursor.as_ref(), &diff));
+    }
+
+    ChangesProbeOutcome::Wait(ChangesProbeState {
+        cached_fingerprint,
+        cached,
+    })
 }
 
 #[cfg(test)]
@@ -3114,6 +3330,76 @@ mod tests {
             .header("arca-session", "20260808T090000Z-0123456789abcdef")
             .body(Body::from(serde_json::to_vec(&entries).unwrap()))
             .unwrap()
+    }
+
+    /// **评审 I6 攻击重跑**：一个耗时的 `PUT .../batch` 不应该阻塞同一
+    /// 进程里其它并发请求的调度——`#[tokio::test]` 默认是单线程
+    /// （`current_thread`）运行时，全部异步任务共享同一根 OS 线程：如果
+    /// `put_batch` 的磁盘 IO 直接跑在这根线程上（修复前的行为），批量
+    /// 请求在完成之前会独占这根线程，同一运行时里"并发"发起的其它任务
+    /// 根本没有机会被调度——一个零 IO 的纯路由 404 也要等批量请求整体
+    /// 处理完才能跑完（评审实测：12 并发 batch 时首次 4.45 秒）。修复后
+    /// `put_batch` 的磁盘 IO 挪到 `spawn_blocking` 的独立线程池，
+    /// `put_batch` 自身的 async 任务在 `.await` 那一刻让出这根线程，
+    /// 404 请求应该几乎立即完成，不必等批量请求收尾。
+    #[tokio::test]
+    async fn batch处理耗时不阻塞同一运行时里并发的404路由_评审i6攻击重跑() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        // 造一个有分量的批量请求——足够多的条目，让磁盘 IO 需要真实、
+        // 可测量的时间，不是一瞬间就完成（不然区分不出"阻塞了/没阻塞"）。
+        let entries: Vec<serde_json::Value> = (0..80)
+            .map(|i| {
+                batch_entry_json(
+                    &format!("f{i}.txt"),
+                    arca_cli::ids::new_item_id(),
+                    &arca_cli::ids::new_version_id(),
+                    None,
+                    format!("content-{i}").as_bytes(),
+                )
+            })
+            .collect();
+        let batch_req = batch_request(id, serde_json::Value::Array(entries));
+
+        // 批量请求作为一个独立任务发起，不在这里 await 它——与它"并发"
+        // 竞争同一根 worker 线程。
+        let batch_app = app.clone();
+        let batch_handle = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let resp = batch_app.oneshot(batch_req).await.unwrap();
+            (resp.status(), start.elapsed())
+        });
+
+        // 让出一次，确保上面的批量任务已经真正开始执行（进了它自己的
+        // `spawn_blocking().await`，让出了这根线程），而不是还没被调度。
+        tokio::task::yield_now().await;
+
+        let unknown_req = Request::builder()
+            .uri("/v1/datasets/0000000000000000000000000000dead/state")
+            .body(Body::empty())
+            .unwrap();
+        let start = std::time::Instant::now();
+        let resp = app.oneshot(unknown_req).await.unwrap();
+        let elapsed_404 = start.elapsed();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            elapsed_404 < std::time::Duration::from_millis(200),
+            "零 IO 的 404 路由不应该被并发的大 batch 请求拖慢，实得 {elapsed_404:?}"
+        );
+
+        let (batch_status, batch_elapsed) = batch_handle.await.unwrap();
+        assert_eq!(batch_status, StatusCode::OK, "批量请求本身仍应正常成功");
+        // 自校验：批量请求本身确实花了明显更长的时间（不是恰好两者都很
+        // 快，测不出区别）——404 的耗时应该远小于批量请求的耗时，证明
+        // 两者是解耦的，不是"凑巧都在 200ms 内完成"。
+        assert!(
+            batch_elapsed > elapsed_404 * 3,
+            "批量请求耗时 {batch_elapsed:?} 应明显长于 404 的 {elapsed_404:?}，\
+             否则这条测试没有真正测到阻塞与否这件事"
+        );
     }
 
     #[tokio::test]
