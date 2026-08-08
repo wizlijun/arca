@@ -217,6 +217,115 @@ fn tmp_本身是符号链接时拒绝清理而不是跟随链接删除别处的�
 }
 
 #[test]
+fn batch写入多个文件后commit全部落盘() {
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path());
+    let root = StorageRoot::open(dir.path(), None).unwrap();
+
+    let mut batch = atomic::Batch::new(&root);
+    batch.write("files/a.txt", b"content a").unwrap();
+    batch.write("files/sub/b.txt", b"content b").unwrap();
+    batch.commit().unwrap();
+
+    assert_eq!(
+        fs::read(dir.path().join("files/a.txt")).unwrap(),
+        b"content a"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("files/sub/b.txt")).unwrap(),
+        b"content b"
+    );
+}
+
+#[test]
+fn batch写入后tmp目录不残留() {
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path());
+    let root = StorageRoot::open(dir.path(), None).unwrap();
+
+    let mut batch = atomic::Batch::new(&root);
+    for i in 0..5 {
+        batch
+            .write(&format!("files/f{i}.txt"), format!("内容{i}").as_bytes())
+            .unwrap();
+    }
+    batch.commit().unwrap();
+
+    let 残留 = fs::read_dir(dir.path().join(".arca/tmp")).unwrap().count();
+    assert_eq!(残留, 0, "批量写入成功后不得在 tmp 留下临时文件");
+}
+
+#[test]
+fn batch对共享同一目录链的写入去重待确认目录数() {
+    // 持久性论证的核心可观察断言：同一批次里若干次写入落在同一个目录（或
+    // 共享同一段祖先链）时，`pending_dirs` 不应随写入次数线性增长——这正是
+    // 批量 API 相对逐文件 `write` 省下来的那部分开销（去重，而不是省略）。
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path());
+    let root = StorageRoot::open(dir.path(), None).unwrap();
+
+    let mut batch = atomic::Batch::new(&root);
+    batch.write("files/shared/a.txt", b"a").unwrap();
+    let after_one = batch.pending_dirs();
+    batch.write("files/shared/b.txt", b"b").unwrap();
+    let after_two = batch.pending_dirs();
+    assert_eq!(
+        after_one, after_two,
+        "写入同一目录下的第二个文件不应增加待确认的目录数"
+    );
+
+    batch.write("files/other/c.txt", b"c").unwrap();
+    let after_three = batch.pending_dirs();
+    assert!(
+        after_three > after_two,
+        "写入一个全新的目录链必须让待确认目录数增加"
+    );
+
+    batch.commit().unwrap();
+}
+
+#[test]
+fn batch未调用commit时写入内容依然完整可读() {
+    // 调用方因为 `?` 提前返回而整体丢弃 `Batch`（未调用 `commit`）时，批次内
+    // 已经 rename 成功的写入不应该被当成"没发生过"——内容级别的持久化（tmp
+    // → fsync 文件 → rename）在 `write` 内已经逐次完成，`commit` 只负责补齐
+    // 目录项落盘的确认，不负责决定内容是否存在（I3：不能因为没提交就丢数据）。
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path());
+    let root = StorageRoot::open(dir.path(), None).unwrap();
+
+    {
+        let mut batch = atomic::Batch::new(&root);
+        batch
+            .write("files/never-committed.txt", b"still here")
+            .unwrap();
+        // 故意不调用 commit，模拟调用方中途失败提前返回。
+    }
+
+    assert_eq!(
+        fs::read(dir.path().join("files/never-committed.txt")).unwrap(),
+        b"still here"
+    );
+}
+
+#[test]
+fn batch内重复写入同一路径最终得到最新版本() {
+    let dir = tempfile::tempdir().unwrap();
+    造存储根(dir.path());
+    let root = StorageRoot::open(dir.path(), None).unwrap();
+
+    let mut batch = atomic::Batch::new(&root);
+    batch.write("files/note.txt", b"old").unwrap();
+    batch.write("files/note.txt", b"new content").unwrap();
+    batch.commit().unwrap();
+
+    assert_eq!(
+        fs::read(dir.path().join("files/note.txt")).unwrap(),
+        b"new content"
+    );
+}
+
+#[test]
 fn tmp_目录不存在时清理是无操作() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".arca")).unwrap();

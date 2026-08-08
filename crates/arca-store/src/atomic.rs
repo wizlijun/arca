@@ -11,11 +11,12 @@
 use crate::root::{RootEscape, StorageRoot};
 use arca_format::hub_layout::layout;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 原子写入失败的失败态。彼此可区分（I5：如实报告失败的性质）。
@@ -58,6 +59,16 @@ pub enum AtomicError {
     /// 判类型也没用，删的其实是链接目标目录里的文件——那可能是任何数据。
     /// 前提不成立时必须停下诊断（I5），绝不做任何删除（I3）。
     UnexpectedTmpState { path: String, reason: &'static str },
+    /// [`Batch::commit`] 收口失败：批次内每一次 `write` 的「tmp → fsync 文件 →
+    /// rename」都已经完成（内容已落盘、目标路径已经是新内容），只是这些写入
+    /// 各自触碰过的目录，其「目录项变化本身已经落盘」这件事尚未被全部确认。
+    ///
+    /// 与 [`AtomicError::CommittedUnsynced`] 是同一件事在批量粒度上的聚合：
+    /// 调用方不应该重试批次里任何一次已经成功的 `write`（重复写入没有意义，
+    /// 内容早已落地），只需要整体把这次批量操作视为失败上报给用户——下一次
+    /// 重跑时，已经成功落地的内容会被判定为 `Noop`/`AdoptBaseline`，不会
+    /// 重复传输。`entries` 逐条记录失败的目录路径与原因，供诊断（I5）。
+    BatchCommitFailed { entries: Vec<(String, String)> },
 }
 
 impl fmt::Display for AtomicError {
@@ -80,6 +91,18 @@ impl fmt::Display for AtomicError {
                 "{path} 不是真实目录（{reason}），拒绝清理——\
                  read_dir 会跟随符号链接，继续下去可能删掉的是链接目标目录里的数据"
             ),
+            AtomicError::BatchCommitFailed { entries } => {
+                write!(
+                    f,
+                    "批量提交收口失败：{} 个目录的 fsync 未成功（批次内的写入本身\
+                     已经全部落盘并 rename 成功，不应重试整个批次）：",
+                    entries.len()
+                )?;
+                for (path, reason) in entries {
+                    write!(f, " [{path}: {reason}]")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -91,7 +114,8 @@ impl std::error::Error for AtomicError {
             AtomicError::Io { .. }
             | AtomicError::CrossDevice { .. }
             | AtomicError::CommittedUnsynced { .. }
-            | AtomicError::UnexpectedTmpState { .. } => None,
+            | AtomicError::UnexpectedTmpState { .. }
+            | AtomicError::BatchCommitFailed { .. } => None,
         }
     }
 }
@@ -226,10 +250,40 @@ fn cleanup_tmp(tmp_path: &Path) {
 /// 首次出现的深层路径（如 `files/京都/鸭川.png`），要求调用方提前手工
 /// `create_dir_all` 不现实，所以第 3 步之前会自动创建（约束 3）。
 pub fn write(root: &StorageRoot, relative_target: &str, bytes: &[u8]) -> Result<(), AtomicError> {
+    let (target, target_parent) = write_and_rename(root, relative_target, bytes)?;
+
+    // rename 成功：tmp_path 这个名字已经不存在了（它被换成了目标名），
+    // 没有自己的临时文件需要清理。剩下要做的是让「这次 rename 发生过」
+    // 以及「create_dir_all 新建的每一层目录都存在」这两件事本身落盘——
+    // 即约束 2 的第四步。从这里往后任何失败都意味着目标已经是新内容、
+    // 只是持久性未确认，必须报 `CommittedUnsynced` 而不是普通 `Io`——
+    // 调用方绝不能因此重试整个写入（见该变体的文档）。
+    sync_dir_chain_to_root(root.path(), &target_parent).map_err(|e| {
+        AtomicError::CommittedUnsynced {
+            target: target.display().to_string(),
+            reason: e.to_string(),
+        }
+    })
+}
+
+/// `write` 与 [`Batch::write`] 共用的核心：tmp → fsync 文件 → rename（约束 2
+/// 的前三步）。返回 `(目标路径, 目标的父目录路径)`，供调用方决定「接下来是
+/// 立刻 fsync 目录链（单次 `write`）还是先记下来、延后到批量收尾一次性
+/// fsync（[`Batch::write`]）」——**内容这一半的持久化保证（文件级 fsync）
+/// 在这里已经完成，两条路径完全一致，绝不因为走批量就打折扣**；两条路径
+/// 唯一的差别只在「目录项变化几时确认落盘」。
+fn write_and_rename(
+    root: &StorageRoot,
+    relative_target: &str,
+    bytes: &[u8],
+) -> Result<(PathBuf, PathBuf), AtomicError> {
     let target = root.join(relative_target)?;
 
-    let target_parent = target.parent().unwrap_or_else(|| root.path());
-    fs::create_dir_all(target_parent).map_err(|e| io_error(target_parent, &e))?;
+    let target_parent = target
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.path().to_path_buf());
+    fs::create_dir_all(&target_parent).map_err(|e| io_error(&target_parent, &e))?;
 
     // `.arca/tmp` 是布局里的固定常量，不是调用方传入的相对路径，不经过
     // `StorageRoot::join` 的逃逸校验——那道校验是为不可信输入准备的。
@@ -258,16 +312,120 @@ pub fn write(root: &StorageRoot, relative_target: &str, bytes: &[u8]) -> Result<
         return Err(mapped);
     }
 
-    // rename 成功：tmp_path 这个名字已经不存在了（它被换成了目标名），
-    // 没有自己的临时文件需要清理。剩下要做的是让「这次 rename 发生过」
-    // 以及「create_dir_all 新建的每一层目录都存在」这两件事本身落盘——
-    // 即约束 2 的第四步。从这里往后任何失败都意味着目标已经是新内容、
-    // 只是持久性未确认，必须报 `CommittedUnsynced` 而不是普通 `Io`——
-    // 调用方绝不能因此重试整个写入（见该变体的文档）。
-    sync_dir_chain_to_root(root.path(), target_parent).map_err(|e| AtomicError::CommittedUnsynced {
-        target: target.display().to_string(),
-        reason: e.to_string(),
-    })
+    Ok((target, target_parent))
+}
+
+/// 批量原子写入：文件自身的「tmp → fsync → rename」逐次立即执行，持久性
+/// 不打折扣；父目录的 fsync **推迟并去重**到 [`Batch::commit`]——批量归档
+/// 场景下（`arca adopt`/`arca sync` 一次处理成千上万个文件），逐文件都做一次
+/// 完整的目录链 fsync 是实测瓶颈：1 万文件基准里，归档占了 308.4 秒，
+/// 全量校验只要 0.49 秒（`crates/arca-cli/tests/bench_10k.rs`）。
+///
+/// # 持久性论证：为什么这不比逐文件 `write` 弱
+///
+/// [`write`] 对单次调用承诺「返回时这次写入已经完全落盘，包括让它可达的
+/// 目录项变化」。`Batch` 把这条承诺的粒度从「每次 `write`」改成「每次
+/// `commit`」，但**没有削弱它**：
+///
+/// - 文件内容的 fsync（约束 2 第 1–2 步）在 [`Batch::write`] 内逐次立即执行，
+///   与单次 `write` 完全一致——崩溃后绝不会看到半截内容，这条底线不变。
+/// - `rename`（约束 2 第 3 步）同样在 `write` 内立即执行——目标路径在
+///   `write` 返回时已经是新内容，只是这一事实尚未确认落盘。
+/// - 目录 fsync（约束 2 第 4 步）延后到 `commit`，但**按目录去重后一个不漏
+///   地补齐**：`Batch` 记录本批次每次写入触碰过的目标父目录及其到 `root`
+///   的祖先链，`commit` 对这个去重后的集合逐一 fsync。一个目录若被十次
+///   写入共享，单次 `write` 会为它重复 fsync 十次；`Batch` 只 fsync 一次——
+///   这正是省下来的开销，而不是被省略的保证：fsync 一个目录的效果与
+///   fsync 它十次相同（都是把该目录当前的目录项状态刷到介质），语义不因
+///   去重而改变。
+/// - **收口是显式的**：`commit()` 之前，本批次已经 rename 成功的写入与
+///   单次 `write` 提前失败在 `sync_dir_chain_to_root` 那一步时的状态完全
+///   同构——都是「内容已落盘、目录项落盘未确认」（[`AtomicError::CommittedUnsynced`]
+///   与 [`AtomicError::BatchCommitFailed`] 是同一件事在两种粒度上的表达）。
+///   调用方（`sync::sync`）必须在报告成功之前调用 `commit()` 并检查其结果，
+///   `commit` 失败则整个操作按失败上报，绝不静默声称成功（I3）。
+///   `Batch` 故意不实现「析构时兜底 fsync」——那会把「提交是否发生」这件
+///   事从调用方的控制流里偷走，变成一个隐式、不可观察、失败了也无法上报
+///   的副作用；显式 `commit()` 才能让「收口失败」如实地成为一个 `Result`。
+///
+/// 因此：单次写入路径不变（[`write`] 本身未改动一行行为）；批量路径整体
+/// 提交完成时，持久性保证与「把这批写入逐个单独调用 `write`」完全等价，
+/// 只是目录 fsync 的**次数**变少，**时机**从"每次"改成"批次收尾"。
+pub struct Batch<'a> {
+    root: &'a StorageRoot,
+    touched_dirs: BTreeSet<PathBuf>,
+}
+
+impl<'a> Batch<'a> {
+    /// 开启一个新批次，绑定到 `root`——批次内所有写入都落在同一个存储根，
+    /// 与 [`write`] 的调用约定一致。
+    pub fn new(root: &'a StorageRoot) -> Self {
+        Self {
+            root,
+            touched_dirs: BTreeSet::new(),
+        }
+    }
+
+    /// 批次内的一次写入：语义与 [`write`] 相同，但目录 fsync 记账到本批次，
+    /// 不在这里执行——必须调用 [`Batch::commit`] 才能确认落盘（见结构体文档）。
+    pub fn write(&mut self, relative_target: &str, bytes: &[u8]) -> Result<(), AtomicError> {
+        let (_target, target_parent) = write_and_rename(self.root, relative_target, bytes)?;
+        insert_dir_chain(self.root.path(), &target_parent, &mut self.touched_dirs);
+        Ok(())
+    }
+
+    /// 本批次目前已经触碰、尚待 `commit` 确认落盘的去重目录数——仅供调用方/
+    /// 测试观察批次规模，不影响提交逻辑。
+    pub fn pending_dirs(&self) -> usize {
+        self.touched_dirs.len()
+    }
+
+    /// 收口：fsync 本批次触碰过的每个目录恰好一次。**调用方必须显式调用
+    /// 这个方法**——不调用就丢弃 `Batch`，批次内已经 rename 成功的写入仍然
+    /// 停留在「内容已落盘、目录项落盘未确认」的状态，等价于单次 `write`
+    /// 在 `sync_dir_chain_to_root` 之前就返回（结构体文档已论证这不构成
+    /// 半截内容，但也绝不能被当作"已确认落盘"上报）。
+    ///
+    /// 尽力对每个目录都尝试 fsync（不因为第一个失败就放弃其余的——多确认
+    /// 一个目录总比少确认好），失败的目录连同原因一并收进
+    /// [`AtomicError::BatchCommitFailed`]。
+    pub fn commit(self) -> Result<(), AtomicError> {
+        let mut failed = Vec::new();
+        for dir in &self.touched_dirs {
+            if let Err(e) = sync_dir(dir) {
+                failed.push((dir.display().to_string(), e.to_string()));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(AtomicError::BatchCommitFailed { entries: failed })
+        }
+    }
+}
+
+/// 把 `from` 到 `root`（含两端）的目录链逐层插入 `touched`，供 [`Batch`] 记账。
+///
+/// 与 [`sync_dir_chain_to_root`] 走同一条路径，但插入去重集合而不是立即
+/// fsync。命中已经在集合里的目录就提前返回：`touched` 里的每一次插入都是
+/// 沿着「从某个目录一路插到 `root`」这条完整链条做的，所以一旦某个目录已在
+/// 集合中，可以归纳地确定它自己到 `root` 的祖先链此前必然也已经插入过，
+/// 不需要重新走一遍——对共享同一批父目录的写入（批量归档里极常见：同一个
+/// 分片目录下有上千个文件）这是一个有意义的常数级剪枝。
+fn insert_dir_chain(root: &Path, from: &Path, touched: &mut BTreeSet<PathBuf>) {
+    let mut current = from;
+    loop {
+        if !touched.insert(current.to_path_buf()) {
+            return;
+        }
+        if current == root {
+            return;
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return,
+        }
+    }
 }
 
 /// fsync `from` 及其在 `root` 内的每一层祖先目录，一路向上到 `root` 本身
@@ -435,5 +593,43 @@ mod tests {
         assert!(msg.contains("不应重试整个写入"));
         // 与 Io 是不同变体，调用方可以按类型区分，不必嗅探字符串。
         assert!(!matches!(err, AtomicError::Io { .. }));
+    }
+
+    /// `BatchCommitFailed` 的消息必须点出失败的目录数与「不应重试整个批次」
+    /// ——与 `CommittedUnsynced` 同一纪律，只是聚合到批次粒度（M1d 批量提交）。
+    #[test]
+    fn batch_commit_failed_消息说明失败目录数且不应重试整个批次() {
+        let err = AtomicError::BatchCommitFailed {
+            entries: vec![
+                ("files/shared".to_string(), "模拟的 fsync 失败".to_string()),
+                ("files/other".to_string(), "另一处模拟失败".to_string()),
+            ],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("2 个目录"));
+        assert!(msg.contains("不应重试整个批次"));
+        assert!(msg.contains("files/shared"));
+        assert!(msg.contains("files/other"));
+    }
+
+    /// `insert_dir_chain` 白盒验证去重不变量：同一目录链的第二次插入应该
+    /// 提前返回而不重复插入祖先，且集合最终恰好是链条本身的长度。
+    #[test]
+    fn insert_dir_chain_对同一条链去重() {
+        let root = Path::new("/root");
+        let mut touched = BTreeSet::new();
+
+        insert_dir_chain(root, Path::new("/root/a/b"), &mut touched);
+        assert_eq!(touched.len(), 3, "应插入 /root、/root/a、/root/a/b 三层");
+
+        insert_dir_chain(root, Path::new("/root/a/b"), &mut touched);
+        assert_eq!(touched.len(), 3, "重复插入同一条链不应增加集合大小");
+
+        insert_dir_chain(root, Path::new("/root/a/c"), &mut touched);
+        assert_eq!(
+            touched.len(),
+            4,
+            "只有 /root/a/c 是新目录，/root 与 /root/a 已经在集合里"
+        );
     }
 }
