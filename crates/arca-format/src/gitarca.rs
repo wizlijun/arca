@@ -87,6 +87,15 @@ impl Registry {
         self.hub.get(name)
     }
 
+    /// 遍历全部已登记的 hub 条目（名字 + 内容），按名字字节序（`BTreeMap` 的
+    /// 天然迭代顺序）。`Registry` 没有原地修改 API（不变数据 + `Registry::new`
+    /// 重建），调用方（`arca-cli` 的 `register`/`init`）想"新增一个 hub、其余
+    /// 保持不变"时，必须先能完整读出现有的 hub 集合，再连同新条目一起传给
+    /// `Registry::new`——`hub()` 只能按名字单点查询，不够用。
+    pub fn hubs(&self) -> impl Iterator<Item = (&str, &HubEntry)> {
+        self.hub.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
     pub fn datasets(&self) -> &[DatasetEntry] {
         &self.dataset
     }
@@ -314,6 +323,15 @@ hub  = "home"
         assert_eq!(reg.datasets()[0].path, "assets\\sub", "原始形式保持不变");
         let normalized = reg.normalized_datasets().unwrap();
         assert_eq!(normalized[0].path, "assets/sub", "归一化视图必须用 / 分隔");
+    }
+
+    #[test]
+    fn hubs_遍历出全部已登记条目() {
+        let reg = Registry::parse(样例).unwrap();
+        let all: Vec<(&str, &HubEntry)> = reg.hubs().collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "home");
+        assert_eq!(all[0].1.url, "https://nas.example.com:8443");
     }
 
     #[test]
