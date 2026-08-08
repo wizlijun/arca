@@ -20,9 +20,147 @@
 
 - 条件请求：If-Match / If-None-Match / 412 Precondition Failed。
 - 断点续传：Range / 206 + If-Match 版本钉住。
-- 变更流：longpoll（30–90 秒挂起）+ SSE（agent 场景）；2 秒短轮询为降级路径。
+- 变更流：longpoll（30–90 秒挂起）+ SSE（agent 场景）；2 秒短轮询为降级路径——**这部分留到 M2c**（游标/longpoll），本节只定 M2b 交付的五个端点。
 - 挂载缺失即离线：数据集离线 → 503，绝不呈现为空库（I11）。
-- TODO：端点表、请求/响应格式、错误码表。
+
+本节定稿于 M2b（`docs/superpowers/plans/2026-08-08-m2b-arcad-cas.md` Task 2）：I10 要求协议先于实现，`arcad` 的 HTTP 表面（Task 3–5）照本节实现。
+
+#### 通用约定
+
+适用于本节全部端点：
+
+- Base path：`/v1/datasets/{dataset_id}` —— `dataset_id` 为 32 位小写十六进制
+  （`format.json` 的 `dataset_id`，与 `item_id` 同一编码纪律，`FORMAT.md` §1）。
+- `{path}` 是数据集内的逻辑路径（`FORMAT.md` §2 路径规则），按标准 URL 路径段
+  编码：`/` 是路径分隔符本身、不编码，其余字符（含非 ASCII）按 RFC 3986
+  百分号编码。**服务端必须先过 `arca_format::path_rules::check` 再落到任何
+  文件系统操作**——HTTP 是不可信输入的入口，一条 `../../etc/passwd` 必须在
+  进文件系统之前被拒（M2b Task 4 的验收点，`code=path.rejected`）。
+- 请求体/响应体为 JSON 时 `Content-Type: application/json`；`PUT` 的内容体为
+  `Content-Type: application/octet-stream`（原始字节，不做任何编码转换，与
+  `arca cat` plumbing 的纪律一致，见 §5.0b）。
+- `Arca-Session: <sid>`：客户端把自己的 trace `sid`（`FORMAT.md` §10.2）放进
+  这个请求头（本节把 §5.2 已经点名的头正式钉进端点表）——可选但强烈建议
+  携带；arcad 把它原样记进对应 journal 事件的 `actor.session`
+  （`FORMAT.md` §3），构成 I8 的审计闭环：一次改动能从客户端 trace 一路
+  追到服务端 journal。缺失时 `actor.session` 记一个空串，不拒绝请求——trace
+  是诊断产物，协议层不应该因为它缺失就中止一次合法的写入。
+- `Authorization`：设备令牌/agent 令牌（spec §9 第四形态）。握手流程是 §4 的
+  TODO，本节只约定这个头出现在这里，不展开认证细节。
+
+#### `If-Match` 认的是版本号，不是 ETag——两个验证器各管一件事
+
+`ETag = BLAKE3 内容哈希`（spec §8 已定），但**CAS（写路径的 `If-Match`）必须
+认版本号，不是 ETag**——这不是随手选的，是 M1b 踩过的真实教训
+（`arca-core/src/state.rs` 顶部 doc comment 有完整推导，这里复述结论）：
+`version_id` 一旦提交即不可变、由**客户端**在提交时刻生成
+（`<紧凑时间戳>-<32 位随机十六进制>`），**不由内容派生**；同一份内容被重新
+上传会产生一个新 `version_id`，但哈希不变。如果 CAS 认的是内容哈希，"同内容
+重新上传"这个完全正常的操作会让 `theirs.hash == 客户端本地已知的 hash`，
+用哈希判定"没有冲突"从而放行覆盖——这恰好掩盖了期间可能发生的、内容恰好
+相同的并发写入；反过来，如果调用方拿着内容哈希当 `If-Match` 提交，一旦
+远端内容真的变了、哈希也跟着变了，命中永远为假，`412` 会在**内容没有真正
+冲突**的场景（例如远端只是把同一份内容重新提交了一次）里错误触发，
+制造死循环——两种方向的错误都源于用错误的验证器做 CAS。
+
+**两个验证器因此分开，各管一件事，不能混用**：
+
+| 用途 | 出现在 | 携带的值 | 目的 |
+| --- | --- | --- | --- |
+| 内容缓存/去重 | `GET` 响应的 `ETag`、`GET` 请求的 `If-None-Match` | BLAKE3 内容哈希（`"blake3:<hex>"`，加引号，RFC 9110 的 opaque 验证器） | "给我内容，除非我手上这份字节已经一样"——同一份内容换了个 `version_id` 也该命中缓存 |
+| CAS / 版本钉住 | `PUT`/`DELETE` 请求的 `If-Match`；`GET` Range 续传请求的 `If-Match` | `version_id`（`FORMAT.md` 编码，不加引号的裸串，与 `Arca-Version-Id` 响应头同一形式） | "仅当远端仍是我认识的这个版本才生效"——推进/终结/续传都钉在同一个版本号上，不受"内容碰巧相同"影响 |
+| 仅创建（RFC 9110 §13.1.2 标准写法） | `PUT` 请求的 `If-None-Match: *` | 字面量 `*` | "仅当这个路径此刻完全不存在时创建"——`arca_core::reconcile::Action::Upload{parent:None}` 的线上形态，复用 HTTP 标准的"创建幂等"惯用法（S3/CalDAV 等同一惯例），不是 arca 自造 |
+
+`GET` 响应因此同时携带两个头：`ETag`（内容哈希，供缓存/去重）与
+`Arca-Version-Id`（版本号，供后续 `If-Match` 钉住）——两者服务不同目的，
+不能相互替代。**这条规则贯穿本节全部端点：出现 `If-Match`/`Arca-Version-Id`
+的地方，值永远是 `version_id`；出现 `ETag`/`If-None-Match`（`GET .../files`
+一处，值不是 `*` 时）的地方，值永远是内容哈希。**
+
+#### 端点表
+
+| 端点 | 请求头 | 请求体 | 成功响应 | 失败响应 |
+| --- | --- | --- | --- | --- |
+| `GET /v1/datasets/{id}/files/{path}` | `If-None-Match: "<hash>"`（可选，缓存校验）；`Range: bytes=...`（可选，续传）；`If-Match: <version_id>`（Range 续传时应携带，钉住版本）；`Arca-Session` | 无 | `200`：全量字节，响应头 `ETag`/`Arca-Version-Id`/`Content-Length`；`206`：区间字节，另加 `Content-Range`；`304`：`If-None-Match` 命中，空体 | `404`：路径此刻没有可下载的内容（`Absent` 与 `Tombstoned` 统一折叠成 404，见下）；`412`：Range 续传时 `If-Match` 与当前版本不符（内容在续传期间被改写）；`503`：数据集离线 |
+| `PUT /v1/datasets/{id}/files/{path}` | **`If-Match: <version_id>` 或 `If-None-Match: *` 二选一必需**（I4：一切写入走 CAS，不允许无条件写）；`Arca-Item-Id: <item_id>` 必需（客户端生成，创建与推进都要带——`item_id` 的分配权在客户端，见 `arca-cli::ids::new_item_id`）；`Arca-Version-Id: <version_id>` 必需（本次要落地的新版本号，客户端生成）；`Arca-Mtime: <rfc3339>` 必需；`Arca-Session` | 原始字节（`application/octet-stream`） | `201`（`If-None-Match: *` 创建）/`200`（`If-Match` 推进）：响应头 `ETag`/`Arca-Version-Id`，体可为空或 `{item_id,version_id,hash,size}` | `400`：两个条件头都未提供（`code=request.if_match_required`），或 `Arca-Item-Id`/`Arca-Version-Id`/`Arca-Mtime` 缺失（`code=request.metadata_missing`）；`412`：CAS 冲突，结构化响应体见下；`503`：数据集离线 |
+| `DELETE /v1/datasets/{id}/files/{path}` | `If-Match: <version_id>` 必需（I4，删除同样是 CAS 提交，没有"仅创建"这种豁免）；`Arca-Item-Id: <item_id>` 必需（单点确认的线上对应：明确对哪个 item 提交 tombstone，闸门第 2 道同一条纪律的服务端版本）；`Arca-Session` | 无 | `204`：tombstone 已提交（`files/<path>` 移入 `.arca/trash/`，服务端同样不得物理销毁，见 M2b Task 5） | `400`：缺 `If-Match`（`code=request.if_match_required`）；`404`：路径此刻不存在，无事可删；`412`：CAS 冲突；`503`：数据集离线 |
+| `GET /v1/datasets/{id}/state` | `Arca-Session` | 无 | `200`：JSON 数组，每条 `{"path","item_id","version_id","hash","size","state"}`（`state` 为 `"present"` 或 `"tombstoned"`；`tombstoned` 条目没有 `hash`/`size`）——字段命名与 `arca ls --json`（§5.0a）同源，`state` 是新增字段（`ls` 的 M1 输出不含 tombstone，见其模块文档）；按路径 UTF-8 字节序排序，供客户端直接构造 `RemoteState` 集合 | `503`：数据集离线，**绝不返回 `200` 加空数组**（I11） |
+| `GET /v1/datasets/{id}/trash/{item_id}?hash=<blake3-hex>` | `Arca-Session` | 无 | `200`：`{"recoverable":true,"hash":"blake3:...","size":1234}`——`hash`/`size` 是现场重算的结果（三方核验：查询参数带的期望哈希 = `.meta` 记录 = 现场重算，与 `Transport::recoverable(item_id, expected_hash)` 同一签名，见 M2b Task 1） | `400`：`hash` 缺失或格式不合法（`code=request.hash_missing`）；`404`：`{"recoverable":false}`（没有匹配的可取回记录——用 JSON 体而不是空 404，闸门第 4 道的调用方不需要额外分支判断"是不是解析失败"）；`503`：数据集离线 |
+
+`GET .../files/{path}` 对 `RemoteState::Tombstoned` 与从未存在过的
+`RemoteState::Absent` 统一报 `404`——都是"这个路径此刻没有可下载的内容"，
+这个端点回答的是"给我内容"，不需要区分两者（要问"是不是被删的、还能不能
+找回"，用 `GET .../trash/{item_id}` 或 `.../state`，那里的 `RemoteState`
+区分是完整的）。
+
+#### `412` 的响应体：结构化冲突，不是一句错误文本
+
+```json
+{
+  "code": "commit.stale_parent",
+  "base":   {"item_id": "8b...", "version_id": "20260805T093012Z-0123456789abcdef", "hash": "blake3:...", "size": 42},
+  "theirs": {"item_id": "8b...", "version_id": "20260805T094500Z-fedcba9876543210", "hash": "blake3:...", "size": 51},
+  "yours":  {"item_id": "8b...", "version_id": "20260805T094501Z-1111222233334444", "hash": "blake3:...", "size": 60}
+}
+```
+
+- `base`：客户端提交时声明的 `If-Match`（它认为的"当前版本"）——`item_id`/
+  `version_id` 取自请求头；`hash`/`size` 是 arcad 记录中这个版本当时的值
+  （这个版本本身已经找不到时——理论上不该发生——只留 `item_id`/`version_id`）。
+- `theirs`：arcad 此刻对这个路径的真实认知，与
+  `crate::transport::CommitOutcome::Conflict` 的 `actual: RemoteState` 同一
+  形状；路径此刻是 tombstone 时换成
+  `{"tombstoned": true, "item_id": "...", "version_id": "..."}`；路径此刻
+  完全不存在时为 `null`。
+- `yours`：客户端这次提交试图落地的版本——`item_id`/`version_id` 取自请求头，
+  `hash`/`size` 由请求体现场算出。
+
+三者合在一起，正是 `arca_core::reconcile::decide` 的三态输入形状（`base` /
+`local`≈`yours` / `remote`≈`theirs`）——agent 收到 `412` 后可以在本地**原样
+跑一遍同一份决策表**，决定"重新下载再试"还是"报冲突"，不需要 arcad 替它做
+这个判断，决策权仍然全部留在 sans-io 的 `arca-core`，HTTP 只是把它需要的
+三个输入原样递过去。**`class=protocol`**（§7）：这是正常的并发信号，客户端
+**不应该**把 `412` 当错误处理、弹出异常中止整轮同步——`Decision::into_outcome`
+已经在这个形状上踩过一次教训（一个冲突文件不该中止整轮 sweep，见
+`arca-core/src/reconcile.rs` 文档），协议层不能重犯。
+
+#### `503`：数据集离线
+
+存储根未挂载、或挂载了但卷身份与 `hub.toml`（`arcad` 的存储根配置，见
+`docs/superpowers/plans/2026-08-08-m2b-arcad-cas.md` Task 3）记录的不符
+（I11）时，这个数据集上的**任何**请求都返回 `503`，响应体二选一：
+
+```json
+{"code": "mount.absent", "message": "..."}
+```
+
+```json
+{"code": "mount.identity_mismatch", "message": "..."}
+```
+
+两个码已在 §7 定义。**绝不返回 `200` 加一个空的 `.../state` 数组、或对
+`.../files/{path}` 返回看似合理的 `404`**——两者都会被客户端误读成"这个
+数据集是空的/这个文件不存在"，进而可能触发不该发生的删除对账（I11 明文
+禁止）。`arcad` 的其它数据集（不同存储根，独立故障域，spec §4.3.2）不受
+影响，照常 `200`。
+
+#### HTTP 状态码 ↔ `code`（§7 表格的 M2 部分，随端点增补，只增不改语义）
+
+| HTTP 状态码 | `code` | 出现在 |
+| --- | --- | --- |
+| `400` | `request.if_match_required` | `PUT`/`DELETE` 缺少必需的条件头 |
+| `400` | `request.metadata_missing` | `PUT` 缺少 `Arca-Item-Id`/`Arca-Version-Id`/`Arca-Mtime` |
+| `400` | `path.rejected` | 路径未通过 `path_rules::check` |
+| `400` | `request.hash_missing` | `GET .../trash/{item_id}` 缺少或格式不合法的 `hash` 查询参数 |
+| `404` | （无 `code`，标准 HTTP 语义已自解释） | 路径/记录此刻不存在 |
+| `412` | `commit.stale_parent` | CAS 冲突，结构化响应体见上 |
+| `503` | `mount.absent` / `mount.identity_mismatch` | 数据集离线（I11） |
+
+`request.if_match_required`/`request.metadata_missing`/`request.hash_missing`
+是本节新增的三个码，`class=needs_human`（调用方的客户端实现有 bug，需要
+人修，不是可以退避重试的瞬时故障，也不是协议层的正常冲突）——按 §7 的
+既有登记纪律补进那张总表。本表只覆盖本节定义的五个端点；longpoll/SSE/
+游标（M2c）与更多端点落地时继续增补，不改动已登记条目的语义（I10）。
 
 ## 2. 上传协议
 
@@ -172,6 +310,11 @@ status`/`arca sync` 据此判断本轮是否会做全量对账）；`reset_reaso
 | `journal.reset_required` | `protocol` | 游标早于保留区间，走全量对账兜底 |
 | `reconcile.needs_human` | `needs_human` | 三态调和判定为模糊终态（`reason=remote_vanished_without_tombstone`）——基线说某个 item 存在过，远端却既无记录也无 tombstone，按 I5 停下，绝不推断成「远端删了」 |
 | `reconcile.conflict` | `protocol` | 三态调和判定为结构化冲突（`reason` 为 `both_new_divergent`/`three_way_divergent`/`modify_vs_delete` 之一）——走 M2 冲突落地流程，不作为错误处理 |
+| `request.if_match_required` | `needs_human` | HTTP `PUT`/`DELETE` 缺少必需的条件头（`If-Match` 或 `If-None-Match: *`）——I4 不允许无条件写，§1.2 |
+| `request.metadata_missing` | `needs_human` | HTTP `PUT` 缺少 `Arca-Item-Id`/`Arca-Version-Id`/`Arca-Mtime` 中的一个或多个，§1.2 |
+| `request.hash_missing` | `needs_human` | HTTP `GET .../trash/{item_id}` 缺少或格式不合法的 `hash` 查询参数，§1.2 |
 | `internal.invariant_violated` | `bug` | 内部不变量被破坏 |
 
-TODO：退出码与 `code` 的映射表（M1）；HTTP 状态码与 `code` 的映射表（M2）。
+TODO：退出码与 `code` 的映射表（M1）。HTTP 状态码与 `code` 的映射表——§1.2
+「HTTP 状态码 ↔ `code`」已覆盖 M2b 交付的五个端点；longpoll/SSE/游标（M2c）
+与后续端点落地时继续在那张表里增补。
