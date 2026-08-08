@@ -85,6 +85,7 @@
 //! 与 `sync.rs`/`scan.rs`/`journal.rs` 顶部同一条先例：brief 落后于实现时
 //! 落地考量的细节，本模块在这里记录偏离之处与理由，不是自行改需求。
 
+pub mod http;
 pub mod local;
 
 use arca_chunk::hash::ContentHash;
@@ -125,6 +126,40 @@ pub struct TombstoneRequest {
     pub item_id: ItemId,
     /// CAS 的 If-Match 对象：决策表给出的、这次要终结的远端当前版本
     /// （`Action::TombstoneRemote` 恒为 `Some`，远端已知该 item 才会走到这格）。
+    pub parent: VersionId,
+    pub actor: Actor,
+    pub at: String,
+}
+
+/// 提交一次改名所需的全部信息——**身份不动、路径映射搬家**（I7，spec §3/§5.3：
+/// 「路径是索引键，不是身份」）。
+///
+/// # 为什么需要这第三个写入原语，不能靠 `commit`/`tombstone` 拼出来
+///
+/// M2c Task 5 落地两机端到端时发现：`commit`/`tombstone` 现有的 C1 身份校验
+/// （评审 C1，`local.rs::validate_commit`）刻意让"一个 item_id 只能同时归属
+/// 一个路径"与"被 tombstone 的 item_id 永不可复用"这两条规则**不可绕过**——
+/// 这是防住"伪造身份接管"攻击的正确设计，但也意味着 `tombstone(旧路径)` +
+/// `commit(新路径, 同一 item_id)` 这种"拼出改名"的组合会被第二步的身份校验
+/// 直接拒绝（旧路径的 tombstone 已经永久终结这个 item_id）。改名因此必须是
+/// 自己的原语：**不产生新版本**（内容没变，`items/<item_id>.jsonl` 链不动），
+/// 只搬 `index/` 的路径→item_id 映射，同时在 journal 追加一条 `op=rename`
+/// 事件（`FORMAT.md` §7.2 早已定义这个操作码与 `from` 字段，只是此前从未被
+/// 写入端触发——与 M2c Task 1 「`commit` 从未写 `Op::Upsert`」是同一类型的
+/// 落地缺口）。
+///
+/// `arca-core` 的决策表（`reconcile::decide`）本身不产生"改名"这个动作——
+/// 三态调和是逐路径独立判断的（spec 设计如此，`arca-core` 这次没有改一行）；
+/// 改名的**检测**（同一次 `sync` 里，一个路径消失、另一个路径以相同内容
+/// 出现）在 `arca-cli::sync` 里用内容哈希匹配完成，检测到之后才调用这个
+/// 原语，不经过 `decide()` 的逐路径决策表。
+#[derive(Debug, Clone)]
+pub struct RenameRequest {
+    pub old_path: String,
+    pub new_path: String,
+    pub item_id: ItemId,
+    /// CAS 的 If-Match 对象：`old_path` 此刻的版本（内容不变，这个版本号
+    /// 在改名成功后原样延续到 `new_path`）。
     pub parent: VersionId,
     pub actor: Actor,
     pub at: String,
@@ -221,6 +256,32 @@ pub enum TransportError {
         path: String,
         reason: String,
     },
+    /// **HTTP 传输特有**（M2c Task 5）：连不上/DNS 解析失败/连接被重置/
+    /// 单次请求超时——网络层面的瞬时故障，与下面的 `Offline`/`Protocol`
+    /// 有本质区别：这类失败**与数据集本身的状态无关**，纯粹是"这次没连上"，
+    /// 退避重试往往就好了（`class()` 为 `Retryable`）。`file://` 传输没有
+    /// 这个变体的对应物——本地文件系统调用不会"连不上"。
+    Network {
+        reason: String,
+    },
+    /// **HTTP 传输特有**：服务端返回 `503`（`mount.absent`/
+    /// `mount.identity_mismatch`，`PROTOCOL.md` §1.2「503：数据集离线」）——
+    /// 数据集离线，不是"这个请求恰好失败了"。**I11**：客户端要如实把它
+    /// 翻译成"离线"，不能当成可重试的网络抖动，也不能当成"这个数据集是
+    /// 空的"（`class()` 为 `NeedsHuman`：需要人去检查存储根挂载状态，
+    /// 重试不会让它自己恢复）。
+    Offline {
+        message: String,
+    },
+    /// **HTTP 传输特有**：服务端返回了一个协议表未覆盖、或响应体形状解析
+    /// 不出来的结果——不是网络故障（连上了、也收到了响应），也不是已知的
+    /// 结构化冲突/身份错误，是"这次交互不符合协议契约"。`class()` 为
+    /// `Bug`：要么是客户端拼错了请求，要么是客户端/服务端协议版本不一致，
+    /// 都不是"退避重试"或"等人工检查存储根"能解决的，需要有人看代码
+    /// （I5：绝不猜测该怎么继续）。
+    Protocol {
+        message: String,
+    },
 }
 
 impl fmt::Display for TransportError {
@@ -233,6 +294,9 @@ impl fmt::Display for TransportError {
             TransportError::Format(e) => write!(f, "{e}"),
             TransportError::Lock(e) => write!(f, "{e}"),
             TransportError::Io { path, reason } => write!(f, "{path}：{reason}"),
+            TransportError::Network { reason } => write!(f, "网络故障：{reason}"),
+            TransportError::Offline { message } => write!(f, "数据集离线：{message}"),
+            TransportError::Protocol { message } => write!(f, "协议错误：{message}"),
         }
     }
 }
@@ -247,6 +311,40 @@ impl std::error::Error for TransportError {
             TransportError::Format(e) => Some(e),
             TransportError::Lock(e) => Some(e),
             TransportError::Io { .. } => None,
+            TransportError::Network { .. } => None,
+            TransportError::Offline { .. } => None,
+            TransportError::Protocol { .. } => None,
+        }
+    }
+}
+
+impl TransportError {
+    /// 该按哪种策略处置——`PROTOCOL.md` §7 定义的四类之一
+    /// （[`arca_format::trace::ErrorClass`]）。M2c Task 5 brief 原话：
+    /// "网络故障按 ErrorClass 分类：连不上/超时是 retryable，协议错误
+    /// （412/409）走结构化流程不是错误，4xx 的参数错误是 bug"——412/409
+    /// 已经在 `CommitOutcome::Conflict`/`IdentityMismatch` 里表达（这两者
+    /// 是 `Ok` 的变体，不经过这个方法，见 `CommitOutcome` 文档），这里只
+    /// 分类真正落进 `Err` 的几类。
+    ///
+    /// 本地存储层的失败（`Hub`/`Trash`/`Journal`/`Atomic`/`Format`/`Lock`/
+    /// `Io`）统一归 `NeedsHuman`：这些都表示存储根本身或其可访问性出了
+    /// 问题（损坏、权限、磁盘满等），与 `arcad::api::store_corrupt`
+    /// （`class=needs_human`，`PROTOCOL.md` §7）同一处置纪律——退避重试
+    /// 不会让损坏的文件自己变好。
+    pub fn class(&self) -> arca_format::trace::ErrorClass {
+        use arca_format::trace::ErrorClass;
+        match self {
+            TransportError::Network { .. } => ErrorClass::Retryable,
+            TransportError::Offline { .. } => ErrorClass::NeedsHuman,
+            TransportError::Protocol { .. } => ErrorClass::Bug,
+            TransportError::Hub(_)
+            | TransportError::Trash(_)
+            | TransportError::Journal(_)
+            | TransportError::Atomic(_)
+            | TransportError::Format(_)
+            | TransportError::Lock(_)
+            | TransportError::Io { .. } => ErrorClass::NeedsHuman,
         }
     }
 }
@@ -312,6 +410,13 @@ pub trait Transport {
 
     /// 提交 tombstone（同样是 CAS，冲突形状与 [`Transport::commit`] 一致）。
     fn tombstone(&self, req: &TombstoneRequest) -> Result<CommitOutcome, TransportError>;
+
+    /// 提交一次改名（同样是 CAS；见 [`RenameRequest`] 文档「为什么需要这第三个
+    /// 写入原语」）：成功时 `CommitOutcome::Committed` 携带的 `version_id` 与
+    /// `req.parent` 相同（不产生新版本）。`new_path` 此刻已被别的 item_id 占用，
+    /// 或 `old_path` 的归属/版本与声明不符，都走 `CommitOutcome::Conflict`/
+    /// `IdentityMismatch`，与 `commit`/`tombstone` 同一套冲突形状，不新增变体。
+    fn rename(&self, req: &RenameRequest) -> Result<CommitOutcome, TransportError>;
 
     /// 第 4 道闸门要问的：`item_id` 对应、内容哈希等于 `expected_hash` 的版本
     /// 此刻是否可从 hub 的回收站取回。`None` 表示不可取回（要么没有这个

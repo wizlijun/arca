@@ -12,8 +12,8 @@
 //! `DELETE` 就应该在服务端真正校验 If-Match。
 
 use super::{
-    BatchOutcome, CommitOutcome, CommitRequest, Recoverable, TombstoneRequest, Transport,
-    TransportError,
+    BatchOutcome, CommitOutcome, CommitRequest, Recoverable, RenameRequest, TombstoneRequest,
+    Transport, TransportError,
 };
 use crate::{hub, journal, trash};
 use arca_chunk::hash::ContentHash;
@@ -601,6 +601,112 @@ impl Transport for LocalTransport<'_> {
         })
     }
 
+    fn rename(&self, req: &RenameRequest) -> Result<CommitOutcome, TransportError> {
+        // 与 `commit`/`tombstone` 同一把跨进程排他锁——见 `RenameRequest`
+        // 文档「为什么需要这第三个写入原语」，同样是"读当前状态 → CAS 校验 →
+        // 写入"的临界区。
+        let _lock = arca_store::lock::acquire(self.root).map_err(TransportError::Lock)?;
+        let remote = self.read_remote()?;
+
+        let old_current = remote
+            .get(&req.old_path)
+            .cloned()
+            .unwrap_or(RemoteState::Absent);
+
+        // 校验 1（与 `validate_commit`/`tombstone` 同一纪律）：`old_path` 此刻
+        // 真正的归属必须与调用方声称的 item_id 一致。
+        if let Some(owner) = owner_item_id(&old_current) {
+            if owner != req.item_id {
+                return Ok(CommitOutcome::IdentityMismatch {
+                    path: req.old_path.clone(),
+                    claimed_item_id: req.item_id,
+                    actual_item_id: Some(owner),
+                });
+            }
+        } else {
+            // `old_path` 此刻根本不存在这个 item——不是"版本过期"（对不上
+            // 任何一个已知版本），是"打错了身份"，与 `validate_commit` 对
+            // "路径此刻完全不存在但调用方声称已知某个 item"的处置一致。
+            return Ok(CommitOutcome::IdentityMismatch {
+                path: req.old_path.clone(),
+                claimed_item_id: req.item_id,
+                actual_item_id: None,
+            });
+        }
+
+        // 校验 2：`new_path` 此刻不能已经被别的 item_id 占用——改名不能
+        // 悄悄践踏另一个身份已经落在那个路径上的记录（与 `validate_commit`
+        // 「校验 2」同一条纪律，只是这里已知要检查的具体路径，不需要
+        // 遍历整个 `remote`）。
+        let new_current = remote
+            .get(&req.new_path)
+            .cloned()
+            .unwrap_or(RemoteState::Absent);
+        if let Some(owner) = owner_item_id(&new_current) {
+            return Ok(CommitOutcome::IdentityMismatch {
+                path: req.new_path.clone(),
+                claimed_item_id: req.item_id,
+                actual_item_id: Some(owner),
+            });
+        }
+
+        // 校验 3：真正的 CAS 比较对象是这个 item 自己的版本链尾（与
+        // `validate_commit`「校验 3」同一条纪律）——内容没变，链本身不会
+        // 因为这次改名而推进，只是用来确认调用方声明的 `parent` 仍然是
+        // 这个 item 此刻唯一存活的版本。
+        let item_last_version =
+            read_item_last_version(self.root, req.item_id)?.map(|v| v.version_id);
+        if item_last_version.as_ref() != Some(&req.parent) {
+            return Ok(CommitOutcome::Conflict {
+                expected_parent: Some(req.parent.clone()),
+                actual: old_current,
+            });
+        }
+
+        // 写入顺序：`files/` 物理内容先搬，index 指针后搬——I1「逃生舱」
+        // 要求 `files/` 永远是路径原样平放的普通文件树（不是 item_id/哈希
+        // 寻址），所以改名必须真的移动这个文件，不能只搬 index 指针。
+        //
+        // 顺序与 `execute_tombstone`（`sync.rs`：先 `move_to_trash` 再
+        // `remove_index_record`）同一条纪律、同一个已被接受的崩溃窗口：
+        // `atomic::rename` 本身对两侧目录链各自 fsync，一旦返回 `Ok` 就已经
+        // 落盘确认；若进程恰好在这一步之后、index 更新完成之前崩溃，
+        // `old_path` 的 index 记录会短暂指向一个物理上已经搬走的文件
+        // （下次读取报 `HubError::MissingContent`），但这与
+        // `execute_tombstone` 现有的崩溃窗口是同一类风险，不是本次改动
+        // 新引入的缺口；`remove_index_record` 先于 `write_index_record`
+        // 执行，是为了让"物理已在新址、index 还没跟上"这个窗口期的下一个
+        // 可能中间态（先删旧后建新）落在"两边都读成 Absent"（安全的保守值）
+        // 而不是"新路径 Present 但内容还没搬到"（同样会触发 MissingContent，
+        // 只是换了一个路径报错）。
+        let old_target = format!("{}/{}", layout::FILES_DIR, req.old_path);
+        let new_target = format!("{}/{}", layout::FILES_DIR, req.new_path);
+        atomic::rename(self.root, &old_target, &new_target).map_err(TransportError::Atomic)?;
+        remove_index_record(self.root, &req.old_path)?;
+        write_index_record(self.root, &req.new_path, req.item_id)?;
+
+        let seq = journal::next_seq(self.root).map_err(TransportError::Journal)?;
+        journal::append(
+            self.root,
+            &JournalEvent {
+                seq,
+                op: Op::Rename,
+                item_id: req.item_id,
+                version_id: req.parent.clone(),
+                path: req.new_path.clone(),
+                from: Some(req.old_path.clone()),
+                actor: req.actor.clone(),
+                at: req.at.clone(),
+            },
+        )
+        .map_err(TransportError::Journal)?;
+
+        Ok(CommitOutcome::Committed {
+            item_id: req.item_id,
+            version_id: req.parent.clone(),
+        })
+    }
+
     fn recoverable(
         &self,
         item_id: ItemId,
@@ -929,6 +1035,189 @@ mod tests {
                 size: 7,
             })
         );
+    }
+
+    // -----------------------------------------------------------------
+    // M2c Task 5：rename——身份不动、路径映射搬家（I7）
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rename成功后item_id与内容不变_旧路径消失新路径出现() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        let item_id = crate::ids::new_item_id();
+
+        let v1 = crate::ids::new_version_id();
+        transport
+            .commit(&CommitRequest {
+                path: "old.txt".to_string(),
+                item_id,
+                version_id: v1.clone(),
+                parent: None,
+                bytes: b"content".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+
+        let outcome = transport
+            .rename(&RenameRequest {
+                old_path: "old.txt".to_string(),
+                new_path: "new.txt".to_string(),
+                item_id,
+                parent: v1.clone(),
+                actor: actor(),
+                at: "2026-08-08T09:10:00Z".to_string(),
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CommitOutcome::Committed {
+                item_id,
+                version_id: v1.clone(),
+            },
+            "改名不产生新版本——version_id 原样延续"
+        );
+
+        let remote = transport.read_remote().unwrap();
+        assert!(
+            !remote.contains_key("old.txt")
+                || matches!(remote.get("old.txt"), Some(RemoteState::Absent)),
+            "旧路径不应再出现在 remote 里"
+        );
+        match remote.get("new.txt") {
+            Some(RemoteState::Present {
+                item_id: got_item,
+                hash,
+                size,
+                ..
+            }) => {
+                assert_eq!(*got_item, item_id, "I7：item_id 必须原样延续");
+                assert_eq!(*hash, ContentHash::from_bytes(b"content"));
+                assert_eq!(*size, 7);
+            }
+            other => panic!("新路径应为 Present，实得 {other:?}"),
+        }
+
+        // 内容本身原地不动（只搬了 index 指针，`files/` 下的物理内容仍是
+        // 同一份，`hub::read_remote` 只是让新路径的 index 指向它）。
+        assert_eq!(
+            transport.read_content("new.txt").unwrap(),
+            b"content".to_vec()
+        );
+    }
+
+    #[test]
+    fn rename带过期parent时报冲突而不动数据() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        let item_id = crate::ids::new_item_id();
+
+        let v1 = crate::ids::new_version_id();
+        transport
+            .commit(&CommitRequest {
+                path: "old.txt".to_string(),
+                item_id,
+                version_id: v1,
+                parent: None,
+                bytes: b"content".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+
+        let stale =
+            arca_format::model::VersionId::new("20260808T090000Z", &"1".repeat(32)).unwrap();
+        let outcome = transport
+            .rename(&RenameRequest {
+                old_path: "old.txt".to_string(),
+                new_path: "new.txt".to_string(),
+                item_id,
+                parent: stale,
+                actor: actor(),
+                at: "2026-08-08T09:10:00Z".to_string(),
+            })
+            .unwrap();
+        assert!(matches!(outcome, CommitOutcome::Conflict { .. }));
+
+        // 拒绝之后旧路径必须原封不动，新路径不应该出现。
+        let remote = transport.read_remote().unwrap();
+        assert!(matches!(
+            remote.get("old.txt"),
+            Some(RemoteState::Present { .. })
+        ));
+        assert!(!remote.contains_key("new.txt"));
+    }
+
+    #[test]
+    fn rename目标路径已被别的item占用时报identity_mismatch且不动数据() {
+        let dir = tempfile::tempdir().unwrap();
+        造存储根(dir.path());
+        let root = open(dir.path());
+        let transport = LocalTransport::new(&root);
+        let item_a = crate::ids::new_item_id();
+        let item_b = crate::ids::new_item_id();
+
+        let va = crate::ids::new_version_id();
+        transport
+            .commit(&CommitRequest {
+                path: "a.txt".to_string(),
+                item_id: item_a,
+                version_id: va.clone(),
+                parent: None,
+                bytes: b"a".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+        transport
+            .commit(&CommitRequest {
+                path: "b.txt".to_string(),
+                item_id: item_b,
+                version_id: crate::ids::new_version_id(),
+                parent: None,
+                bytes: b"b".to_vec(),
+                mtime: "t".to_string(),
+                actor: actor(),
+            })
+            .unwrap();
+
+        // 试图把 a.txt 改名成 b.txt——b.txt 已经被另一个 item 占着。
+        let outcome = transport
+            .rename(&RenameRequest {
+                old_path: "a.txt".to_string(),
+                new_path: "b.txt".to_string(),
+                item_id: item_a,
+                parent: va,
+                actor: actor(),
+                at: "2026-08-08T09:10:00Z".to_string(),
+            })
+            .unwrap();
+        match outcome {
+            CommitOutcome::IdentityMismatch {
+                path,
+                actual_item_id,
+                ..
+            } => {
+                assert_eq!(path, "b.txt");
+                assert_eq!(actual_item_id, Some(item_b));
+            }
+            other => panic!("应为 IdentityMismatch，实得 {other:?}"),
+        }
+
+        let remote = transport.read_remote().unwrap();
+        assert!(matches!(
+            remote.get("a.txt"),
+            Some(RemoteState::Present { item_id, .. }) if *item_id == item_a
+        ));
+        assert!(matches!(
+            remote.get("b.txt"),
+            Some(RemoteState::Present { item_id, .. }) if *item_id == item_b
+        ));
     }
 
     #[test]

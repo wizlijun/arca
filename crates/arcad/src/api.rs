@@ -107,6 +107,7 @@ pub fn router(state: Arc<Registry>) -> Router {
         .route("/v1/datasets/{id}/trash/{item_id}", get(get_trash))
         .route("/v1/datasets/{id}/blobs/{hash}", get(get_blob))
         .route("/v1/datasets/{id}/batch", axum::routing::put(put_batch))
+        .route("/v1/datasets/{id}/rename", axum::routing::post(post_rename))
         .route("/v1/datasets/{id}/changes", get(get_changes))
         .layer(middleware::from_fn(timeout_middleware))
         .layer(middleware::from_fn_with_state(
@@ -799,7 +800,10 @@ async fn put_file(
         Some(m) => m.to_string(),
         None => return metadata_missing("Arca-Mtime"),
     };
-    let actor = actor_from_headers(&headers);
+    let actor = match actor_from_headers(&headers) {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
 
     // 打开存储根——先不拿锁：见下面「锁只包住 CAS 临界区」一节。挂载检查
     // 本身是只读的，不触碰任何需要与并发写入互斥的状态。
@@ -982,20 +986,42 @@ fn metadata_missing(header: &str) -> Response {
 }
 
 /// `Arca-Session` 放进 `Actor.session`——I8 审计闭环（PROTOCOL.md §1.2 通用
-/// 约定：缺失时记一个空串，不拒绝请求，trace 是诊断产物，不应该因为它缺失
-/// 就中止一次合法的写入）。`account`/`device` 留空：设备/账号令牌握手是
-/// §4 的 TODO（`auth.rs`），M2b 尚未接入认证，这里不伪造身份。
-fn actor_from_headers(headers: &HeaderMap) -> Actor {
-    let session = headers
-        .get("arca-session")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    Actor {
+/// 约定）。**缺失记空、非法拒绝**（M2c Task 4）：
+///
+/// - 头缺失、或携带了空字符串 → 视同"没有携带"，`session` 记一个空串，
+///   **不拒绝请求**——trace 是诊断产物，且这是老客户端（尚不知道这个头）
+///   的正常情形，不能因为协议新增了一个头就让旧客户端的写入全部失败。
+/// - 头携带了非空取值，但不是合法 sid（[`arca_format::trace::Sid::parse`]，
+///   与客户端 trace 落盘同一份格式纪律）→ `400 request.session_invalid`，
+///   拒绝这次写入。这个头是不可信输入（任何调用方都能手写它）：格式不合法
+///   要么是客户端 bug 要么是刻意构造，两种情形都不该被"尽力"记进 journal
+///   的 `actor.session`——那是在伪造归因记录，既违反 I8（审计线索要可信）
+///   也违反 I5（缺失与"读不懂"是两种不同的输入形状，不能共用同一个"记空"
+///   的默认值兜底）。
+///
+/// `account`/`device` 留空：设备/账号令牌握手是 §4 的 TODO（`auth.rs`），
+/// M2b 尚未接入认证，这里不伪造身份。
+fn actor_from_headers(headers: &HeaderMap) -> Result<Actor, Box<Response>> {
+    let raw = headers.get("arca-session").and_then(|v| v.to_str().ok());
+    let session = match raw {
+        None => String::new(),
+        Some("") => String::new(),
+        Some(s) => match arca_format::trace::Sid::parse(s) {
+            Ok(sid) => sid.as_str().to_string(),
+            Err(e) => {
+                return Err(Box::new(error_body(
+                    StatusCode::BAD_REQUEST,
+                    "request.session_invalid",
+                    format!("Arca-Session {s:?} 不是合法的 sid：{e}"),
+                )))
+            }
+        },
+    };
+    Ok(Actor {
         account: String::new(),
         device: String::new(),
         session,
-    }
+    })
 }
 
 /// `<紧凑时间戳>-<32 位随机十六进制>` 形式的 `version_id` 解析——与
@@ -1339,7 +1365,10 @@ async fn put_batch(
         }
     };
 
-    let actor = actor_from_headers(&headers);
+    let actor = match actor_from_headers(&headers) {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
     let mut reqs = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         match parse_batch_entry(index, entry, &actor) {
@@ -1447,7 +1476,10 @@ async fn delete_file(
     else {
         return metadata_missing("Arca-Item-Id");
     };
-    let actor = actor_from_headers(&headers);
+    let actor = match actor_from_headers(&headers) {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
 
     let _guard = dataset.write_lock.lock().unwrap_or_else(|e| e.into_inner());
     let root = match dataset.open() {
@@ -1512,6 +1544,150 @@ fn delete_conflict_response(
             "yours": {
                 "item_id": item_id.to_hex(),
                 "tombstoned": true,
+            },
+        })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/datasets/{id}/rename（M2c Task 5：身份不动、路径映射搬家，I7）
+// ---------------------------------------------------------------------------
+
+/// 请求体形状——`PROTOCOL.md` §1.2「`POST .../rename`」一节：`parent` 随
+/// 请求体传递而不是 `If-Match` 头（该节「为什么是 POST body 不是 If-Match
+/// 头」有完整论证）。
+#[derive(serde::Deserialize)]
+struct RenameWire {
+    from: String,
+    to: String,
+    item_id: String,
+    parent: String,
+}
+
+fn rename_malformed(message: impl Into<String>) -> Response {
+    error_body(StatusCode::BAD_REQUEST, "request.rename_malformed", message)
+}
+
+async fn post_rename(
+    State(registry): State<Arc<Registry>>,
+    Path(dataset_id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let Some(dataset) = registry.get(&dataset_id) else {
+        return unknown_dataset();
+    };
+
+    // 请求体不大（两个路径 + 两个短标识符），不需要 `put_file`/`put_batch`
+    // 那种流式接收纪律，但仍然沿用同一个体积上限——不给这个新端点开一个
+    // 更宽松的口子（与 `put_batch` 同一条纪律）。
+    let raw = match axum::body::to_bytes(body, MAX_BODY_BYTES as usize).await {
+        Ok(b) => b,
+        Err(e) => {
+            return error_body(
+                StatusCode::BAD_REQUEST,
+                "request.body_read_failed",
+                format!("读取改名请求体失败：{e}"),
+            )
+        }
+    };
+    let wire: RenameWire = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(e) => return rename_malformed(format!("请求体不是合法 JSON：{e}")),
+    };
+
+    // HTTP 是不可信输入的入口——`from`/`to` 都要先过 `path_rules::check`
+    // 才能碰任何文件系统操作（与 `checked_path` 用于 `files/{path}` 同一
+    // 条纪律，见其文档；`checked_path` 内部已经把 `PathStatus` 翻译成
+    // `path.rejected` 响应，这里直接复用，不再重新实现一遍翻译）。
+    let from = match checked_path(&wire.from) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let to = match checked_path(&wire.to) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let Some(item_id) = ItemId::parse(&wire.item_id).ok() else {
+        return rename_malformed(format!(
+            "item_id {:?} 不是合法的 32 位小写十六进制",
+            wire.item_id
+        ));
+    };
+    let Some(parent) = parse_version_id_header(&wire.parent) else {
+        return rename_malformed(format!("parent {:?} 不是合法的 version_id", wire.parent));
+    };
+    let actor = match actor_from_headers(&headers) {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
+
+    let _guard = dataset.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let root = match dataset.open() {
+        Ok(r) => r,
+        Err(e) => return mount_error_response(&e),
+    };
+    let transport = LocalTransport::new(&root);
+
+    let at = arca_cli::clock::now_rfc3339();
+    let req = arca_cli::transport::RenameRequest {
+        old_path: from,
+        new_path: to,
+        item_id,
+        parent,
+        actor,
+        at,
+    };
+    match transport.rename(&req) {
+        Ok(CommitOutcome::Committed {
+            item_id,
+            version_id,
+        }) => {
+            // M2c Task 3：改名同样是一次"有新事件"，唤醒挂起在这个数据集上
+            // 的 longpoll——与 `put_file`/`put_batch`/`delete_file` 同一条纪律。
+            dataset.notify_changed();
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "item_id": item_id.to_hex(),
+                    "version_id": version_id.as_str(),
+                })),
+            )
+                .into_response()
+        }
+        Ok(CommitOutcome::Conflict {
+            expected_parent,
+            actual,
+        }) => rename_conflict_response(&root, req.item_id, &expected_parent, &actual),
+        Ok(CommitOutcome::IdentityMismatch {
+            path,
+            claimed_item_id,
+            actual_item_id,
+        }) => identity_mismatch_response(&path, claimed_item_id, actual_item_id),
+        Err(e) => transport_error_response(e),
+    }
+}
+
+/// 改名的 412 响应体——与 `conflict_response`/`delete_conflict_response`
+/// 同一形状，`yours` 退化为只带 `item_id`（`PROTOCOL.md` 原文：「改名没有
+/// `这次要落地的新内容`，没有独立的 `yours.hash`/`yours.size` 概念」）。
+fn rename_conflict_response(
+    root: &StorageRoot,
+    item_id: ItemId,
+    expected_parent: &Option<VersionId>,
+    actual: &RemoteState,
+) -> Response {
+    let base = base_json(root, item_id, expected_parent);
+    let theirs = theirs_json(actual);
+    (
+        StatusCode::PRECONDITION_FAILED,
+        axum::Json(json!({
+            "code": "commit.stale_parent",
+            "base": base,
+            "theirs": theirs,
+            "yours": {
+                "item_id": item_id.to_hex(),
             },
         })),
     )
@@ -3073,6 +3249,317 @@ mod tests {
         let (_cursor, events) = arca_cli::journal::read_all(&root).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].actor.session, "20260808T090000Z-0123456789abcdef");
+    }
+
+    // -----------------------------------------------------------------
+    // M2c Task 4：sid 闭环——缺失记空、非法拒绝
+    // -----------------------------------------------------------------
+
+    /// **缺失记空**：老客户端不发 `Arca-Session` 头，写入照常成功，
+    /// journal 事件的 `actor.session` 记一个空串，不拒绝请求。
+    #[tokio::test]
+    async fn put缺失arca_session时写入成功且actor_session为空串() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_id = arca_cli::ids::new_item_id();
+        let version_id = arca_cli::ids::new_version_id();
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/v1/datasets/{id}/files/a.txt"))
+            .header("if-none-match", "*")
+            .header("arca-item-id", item_id.to_hex())
+            .header("arca-version-id", version_id.as_str())
+            .header("arca-mtime", "2026-08-08T09:00:00Z")
+            // 刻意不带 arca-session。
+            .body(Body::from(b"hello".to_vec()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let root = arca_store::root::StorageRoot::open(dir.path(), Some(id)).unwrap();
+        let (_cursor, events) = arca_cli::journal::read_all(&root).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor.session, "");
+    }
+
+    /// **非法拒绝**：`Arca-Session` 携带了不是合法 sid 的取值（不可信输入）——
+    /// `400 request.session_invalid`，且这次写入完全不生效（不落 journal、
+    /// 不落内容），不是"尽力记一个能记的部分"。
+    #[tokio::test]
+    async fn put携带非法arca_session返回400且不落盘任何内容() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_id = arca_cli::ids::new_item_id();
+        let version_id = arca_cli::ids::new_version_id();
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/v1/datasets/{id}/files/a.txt"))
+            .header("if-none-match", "*")
+            .header("arca-item-id", item_id.to_hex())
+            .header("arca-version-id", version_id.as_str())
+            .header("arca-mtime", "2026-08-08T09:00:00Z")
+            .header("arca-session", "not-a-valid-sid")
+            .body(Body::from(b"hello".to_vec()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.session_invalid");
+
+        assert!(!dir.path().join("files/a.txt").exists());
+        let root = arca_store::root::StorageRoot::open(dir.path(), Some(id)).unwrap();
+        let (_cursor, events) = arca_cli::journal::read_all(&root).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete携带非法arca_session返回400() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_id = arca_cli::ids::new_item_id();
+        let v1 = arca_cli::ids::new_version_id();
+        let put = create_request(id, "a.txt", item_id, &v1, b"hello");
+        assert_eq!(
+            app.clone().oneshot(put).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/v1/datasets/{id}/files/a.txt"))
+            .header("if-match", v1.as_str())
+            .header("arca-item-id", item_id.to_hex())
+            .header("arca-session", "20260808T0900-not16hex")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.session_invalid");
+
+        // 拒绝之后这条内容仍然是当前版本——DELETE 没有生效。
+        assert!(dir.path().join("files/a.txt").exists());
+    }
+
+    /// 批量端点复用同一个 `actor_from_headers`——非法 sid 同样整批拒绝，
+    /// 不生效（与 CAS/身份校验的"整批不生效"纪律一致）。
+    #[tokio::test]
+    async fn batch携带非法arca_session返回400且整批不生效() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let entries = json!([batch_entry_json(
+            "a.txt",
+            arca_cli::ids::new_item_id(),
+            &arca_cli::ids::new_version_id(),
+            None,
+            b"x",
+        )]);
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/v1/datasets/{id}/batch"))
+            .header("content-type", "application/json")
+            .header("arca-session", "///")
+            .body(Body::from(entries.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.session_invalid");
+        assert!(!dir.path().join("files/a.txt").exists());
+    }
+
+    // -----------------------------------------------------------------
+    // M2c Task 5：POST .../rename——身份不动、路径映射搬家（I7）
+    // -----------------------------------------------------------------
+
+    fn rename_request(
+        dataset: &str,
+        from: &str,
+        to: &str,
+        item_id: ItemId,
+        parent: &VersionId,
+    ) -> Request<Body> {
+        let body = json!({
+            "from": from,
+            "to": to,
+            "item_id": item_id.to_hex(),
+            "parent": parent.as_str(),
+        });
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/datasets/{dataset}/rename"))
+            .header("content-type", "application/json")
+            .header("arca-session", "20260808T090000Z-0123456789abcdef")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rename成功后item_id不变_journal带上rename事件与sid() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_id = arca_cli::ids::new_item_id();
+        let v1 = arca_cli::ids::new_version_id();
+        let put = create_request(id, "old.txt", item_id, &v1, b"content");
+        assert_eq!(
+            app.clone().oneshot(put).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+
+        let req = rename_request(id, "old.txt", "new.txt", item_id, &v1);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["item_id"], item_id.to_hex());
+        assert_eq!(body["version_id"], v1.as_str(), "改名不产生新版本");
+
+        // 旧路径应该 404，新路径应该能取到原内容。
+        let get_old = Request::builder()
+            .uri(format!("/v1/datasets/{id}/files/old.txt"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(get_old).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        let get_new = Request::builder()
+            .uri(format!("/v1/datasets/{id}/files/new.txt"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(get_new).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, b"content".to_vec());
+
+        // journal 里应该能读到一条 rename 事件，item_id 不变，sid 闭环成立。
+        let root = arca_store::root::StorageRoot::open(dir.path(), Some(id)).unwrap();
+        let (_cursor, events) = arca_cli::journal::read_all(&root).unwrap();
+        let rename_event = events
+            .iter()
+            .find(|e| e.op == arca_format::journal::Op::Rename)
+            .expect("应有一条 rename 事件");
+        assert_eq!(rename_event.item_id, item_id);
+        assert_eq!(rename_event.path, "new.txt");
+        assert_eq!(rename_event.from.as_deref(), Some("old.txt"));
+        assert_eq!(
+            rename_event.actor.session,
+            "20260808T090000Z-0123456789abcdef"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename目标路径已被占用时返回409() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_a = arca_cli::ids::new_item_id();
+        let va = arca_cli::ids::new_version_id();
+        let put_a = create_request(id, "a.txt", item_a, &va, b"a");
+        assert_eq!(
+            app.clone().oneshot(put_a).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        let item_b = arca_cli::ids::new_item_id();
+        let vb = arca_cli::ids::new_version_id();
+        let put_b = create_request(id, "b.txt", item_b, &vb, b"b");
+        assert_eq!(
+            app.clone().oneshot(put_b).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+
+        let req = rename_request(id, "a.txt", "b.txt", item_a, &va);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.item_id_mismatch");
+
+        // 两个路径都应该原封不动。
+        let root = arca_store::root::StorageRoot::open(dir.path(), Some(id)).unwrap();
+        let remote = arca_cli::hub::read_remote(&root).unwrap();
+        assert!(matches!(
+            remote.get("a.txt"),
+            Some(RemoteState::Present { item_id, .. }) if *item_id == item_a
+        ));
+        assert!(matches!(
+            remote.get("b.txt"),
+            Some(RemoteState::Present { item_id, .. }) if *item_id == item_b
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename带过期parent返回412() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let item_id = arca_cli::ids::new_item_id();
+        let v1 = arca_cli::ids::new_version_id();
+        let put = create_request(id, "old.txt", item_id, &v1, b"content");
+        assert_eq!(
+            app.clone().oneshot(put).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+
+        let stale = arca_cli::ids::new_version_id();
+        let req = rename_request(id, "old.txt", "new.txt", item_id, &stale);
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "commit.stale_parent");
+    }
+
+    #[tokio::test]
+    async fn rename请求体不合法json返回400() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        造存储根(dir.path(), id);
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/datasets/{id}/rename"))
+            .header("content-type", "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["code"], "request.rename_malformed");
+    }
+
+    #[tokio::test]
+    async fn rename数据集离线返回503() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "9c41000000000000000000000000abcd";
+        // 不建存储根。
+        let app = build_router(vec![(id, dir.path().to_path_buf())]);
+
+        let req = rename_request(
+            id,
+            "old.txt",
+            "new.txt",
+            arca_cli::ids::new_item_id(),
+            &arca_cli::ids::new_version_id(),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // -----------------------------------------------------------------

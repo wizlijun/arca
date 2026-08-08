@@ -51,10 +51,29 @@
   `arca cat` plumbing 的纪律一致，见 §5.0b）。
 - `Arca-Session: <sid>`：客户端把自己的 trace `sid`（`FORMAT.md` §10.2）放进
   这个请求头（本节把 §5.2 已经点名的头正式钉进端点表）——可选但强烈建议
-  携带；arcad 把它原样记进对应 journal 事件的 `actor.session`
+  携带；arcad 把它记进对应 journal 事件的 `actor.session`
   （`FORMAT.md` §3），构成 I8 的审计闭环：一次改动能从客户端 trace 一路
-  追到服务端 journal。缺失时 `actor.session` 记一个空串，不拒绝请求——trace
-  是诊断产物，协议层不应该因为它缺失就中止一次合法的写入。
+  追到服务端 journal。**缺失记空、非法拒绝**（M2c Task 4，两者分开处理的
+  理由）：
+  - **缺失**（未携带这个头，或携带了空字符串）→ `actor.session` 记一个
+    空串，**不拒绝请求**——trace 是诊断产物，协议层不应该因为它缺失就
+    中止一次合法的写入；这也是老客户端（不发这个头）的正常情形，不能
+    因为协议新增了一个头就让旧客户端全部写入失败。
+  - **携带了、但不是合法 sid**（`arca_format::trace::Sid::parse` 校验，
+    与客户端 trace 落盘同一份格式纪律：`<紧凑时间戳>-<16 位小写十六进制>`，
+    可选以 `/` 分隔的层次化子段，段数上限 8）→ `400
+    request.session_invalid`，**拒绝这次写入**，不是"尽力塞进去"。这个头
+    此刻是**不可信输入**（任何人都能在 HTTP 请求上手写这个头）：一个格式
+    不合法的取值要么是客户端实现有 bug，要么是有意构造——两种情形都不该
+    被静默记入 journal 的 `actor.session`：那是在伪造归因记录，与 I8「每个
+    事件可归因」的本意相反（一个查不出真实来源、格式还不合法的字符串，
+    "记录"下来除了污染审计线索没有别的作用），也与 I5「绝不猜测」相悖——
+    "缺失"与"提供了但读不懂"是两种不同的输入形状，不能用同一个"记空"的
+    默认值兜底。只有 `PUT`/`DELETE`/`PUT .../batch`/`POST .../rename` 四个
+    会落盘 journal 事件的端点执行这条校验并可能因此拒绝（M2c Task 5 新增
+    `POST .../rename` 时随之补入这份名单）；纯读端点（`GET .../files` 等）
+    不落盘 `actor.session`，携带的 `Arca-Session` 值即便格式不合法也不影响
+    读取结果，不在这条校验范围内。
 - `Authorization`：设备令牌/agent 令牌（spec §9 第四形态）。握手流程是 §4 的
   TODO，本节只约定这个头出现在这里，不展开认证细节。
 
@@ -99,6 +118,7 @@
 | `GET /v1/datasets/{id}/blobs/{hash}` | `Arca-Session` | 无 | `200`：全量字节，响应头 `ETag`（内容哈希，与请求路径的 `{hash}` 相同）、`Content-Length`——按内容哈希直接寻址，不经过路径/CAS（`arca cat <hash>` 的传输层对应，M2c Task 1；`Transport::read_by_hash` 同一签名）；多个路径共享同一份内容时结果确定（按路径 UTF-8 字节序取第一个命中，与 `arca cat` plumbing 现有算法一致，见 `commands/plumbing.rs::cat_cmd`） | `400`：`{hash}` 不是合法的 `blake3:<hex>` 形式（`code=request.hash_invalid`）；`404`：hub 侧当前没有任何路径的内容匹配这个哈希（`Absent`/`Tombstoned`/从未出现过统一折叠，与 `GET .../files/{path}` 的 404 同一纪律）；`503`：数据集离线 |
 | `PUT /v1/datasets/{id}/batch` | `Content-Type: application/json`；`Arca-Session` | JSON 数组，每条与单个 `PUT .../files/{path}` 的元数据同构：`{"path","item_id","version_id","parent","mtime","content_base64"}`（`parent` 为 `null` 表示仅创建，语义等价单文件的 `If-None-Match: *`；`content_base64` 是这次要落地的原始字节的标准 Base64——批量端点用 JSON 信封而不是多段 `multipart`，字节内联编码是这个信封形状能表达任意内容最简单的方式，M2c 尚不为批量端点做流式优化，见 Task 1 brief「批量提交」一节） | `200`：JSON 数组，与请求顺序一一对应，每条 `{"item_id","version_id","hash","size"}`（全部成功，`Transport::BatchOutcome::Committed` 的线上形状）——**要么整批成功要么整批不生效**（I5：不做"部分成功"，调用方无法据此判断该从哪里重试） | `400`：请求体不是合法 JSON、或某一条缺少必需字段/`content_base64` 不是合法 Base64（`code=request.batch_malformed`，响应体附 `index` 指出哪一条）；`409`：某一条的 `item_id` 与目标路径/该 item 自身版本链归属不符，或已被 tombstone 终结（`code=request.item_id_mismatch`，响应体附 `index`，整批不生效）；`412`：某一条 CAS 冲突（`code=commit.stale_parent`，结构化冲突体见下，附 `index` 指出哪一条，整批不生效——**CAS 仍逐条校验**，见 Task 1 brief）；`503`：数据集离线 |
 | `GET /v1/datasets/{id}/changes?since=<epoch:seq>&wait=<秒>` | `Arca-Session` | 无 | `200`：`{"events":[...],"cursor":"<epoch:seq>"或null}`——`events` 是该游标之后的 journal 事件（`FORMAT.md` §7.2 字段形状，`from`/`hash`/`size` 视 `op` 而定），`cursor` 是可用于下一次 `since` 的新游标（没有任何历史事件时为 `null`）；省略 `since` 等价于"从头开始"；`wait`（秒，可选，默认 0）大于 0 时挂起等待新事件（longpoll，spec §5.2，M2c Task 3），超时仍返回 `200` 与空 `events`+原游标，**不是错误**；服务端把 `wait` 钳制到 `[0, 90]`，超过上限不报错、静默取 90（资源耗尽面，见下） | `400`：`since` 不是合法的 `<epoch:seq>` 语法（`code=request.cursor_invalid`，**不当作"从头开始"处理**，I5：别猜）；`410`：`since` 携带的 `epoch` 与数据集当前 epoch 不符——本切片没有 journal 压缩，`epoch` 只会在（未来的）压缩后轮转，任何不匹配当前 epoch 的游标都视为"早于保留区间"（spec §5.2 `reset_required`），响应体 `{"code":"journal.reset_required","message":"...","cursor":"<当前有效游标>"}`，客户端应据此做一次全量对账，之后从响应体的 `cursor` 继续增量拉取；`503`：数据集离线（**含挂起期间掉线**——longpoll 等待过程中每次重新探测都会重新校验挂载，掉线立即返回 503，不等到 `wait` 超时才发现，I11） |
+| `POST /v1/datasets/{id}/rename` | `Content-Type: application/json`；`Arca-Session` | JSON 对象 `{"from","to","item_id","parent"}`（`from`/`to` 是改名前后的逻辑路径，`item_id` 是这次改名声称的身份，`parent` 是 `from` 此刻的版本——CAS 的 If-Match 对象，随请求体传而不是请求头，见下「为什么是 POST body 不是 If-Match 头」） | `200`：`{"item_id","version_id"}`——**`version_id` 与请求体的 `parent` 相同**（改名不产生新版本，`Transport::rename` 的文档「为什么需要这第三个写入原语」） | `400`：请求体不是合法 JSON、或 `from`/`to`/`item_id`/`parent` 缺失或格式不合法（`code=request.rename_malformed`）；`400`：`to` 未通过 `path_rules::check`（`code=path.rejected`，与其它端点同一纪律）；`409`：`from` 的实际归属与声称的 `item_id` 不符，或 `to` 此刻已被另一个 item_id 占用（`code=request.item_id_mismatch`，与 `PUT`/`DELETE` 同一个码，响应体额外带 `path` 指出是 `from` 还是 `to` 触发）；`412`：CAS 冲突（`code=commit.stale_parent`，结构化响应体同 `PUT`，`base`/`yours` 退化为只带 `item_id`/`version_id`——改名没有"这次要落地的新内容"，没有独立的 `yours.hash`/`yours.size` 概念，与 `base`/`yours` 描述 Range 续传冲突时的退化写法同一条纪律）；`503`：数据集离线 |
 
 `GET .../files/{path}` 对 `RemoteState::Tombstoned` 与从未存在过的
 `RemoteState::Absent` 统一报 `404`——都是"这个路径此刻没有可下载的内容"，
@@ -200,6 +220,37 @@ longpoll 并发上限**：一次挂起可能占用一个请求处理槽位长达
 等价于 spec 提到的"2 秒短轮询"这条降级路径的极限形式——不算错误，客户端
 按正常的空增量处理，下一次重试即可。
 
+#### `POST .../rename`：为什么是独立端点，为什么请求体带 `parent` 不是 `If-Match` 头（M2c Task 5）
+
+两机端到端落地时发现：`PUT`/`DELETE` 现有的身份校验（评审 C1）刻意让
+"一个 item_id 只能同时归属一个路径"与"被 tombstone 的 item_id 永不可复用"
+两条规则**不可绕过**——这是防住伪造身份接管的正确设计，但也意味着
+"`DELETE from` 再 `PUT to`（同一 item_id）"这种用现有两个端点拼出改名的
+组合，会被第二步的身份校验拒绝（`from` 的 tombstone 已经永久终结这个
+item_id，见 §7 `request.item_id_mismatch` 的注册说明）。改名必须是独立的
+第三个写入原语：**不产生新版本**——内容没有变化，`items/<item_id>.jsonl`
+版本链不动，只搬 `files/<path>` 物理文件与 `index/` 的路径→item_id 映射，
+journal 追加一条 `op=rename` 事件（`FORMAT.md` §7.2 早已定义这个操作码与
+`from` 字段，此前只有读侧实现，从未被任何写入端触发——与 M2c Task 1「`commit`
+从未写 `Op::Upsert`」是同一类型的落地缺口）。客户端侧对应
+`Transport::rename`（`crates/arca-cli/src/transport/mod.rs`），完整论证见
+其文档「为什么需要这第三个写入原语」。
+
+请求体带 `parent` 而不是复用 `If-Match` 请求头：这次 CAS 校验的对象是
+`from` 路径的当前版本，但 URL 只有一个路径段（`{id}`），`from`/`to` 两个
+路径都必须出现在某处——放进 JSON 请求体比"其中一个进 URL、另一个进自定义
+头"更不容易在实现/客户端两端读错谁是谁；`parent` 随请求体传递、不占用
+`If-Match` 头，是这个决定的直接推论（并非不遵守"CAS 认版本号"的既有纪律，
+只是这次传递的载体是请求体字段而不是请求头）。
+
+`arca_core::reconcile::decide` 本身不产生"改名"这个动作——三态调和仍然是
+逐路径独立判断（spec 设计如此，`arca-core` 本切片未改一行）；改名的
+**检测**（同一次 `arca sync` 里，一个路径消失、另一个路径以相同内容出现）
+在客户端 `arca-cli::sync` 里用内容哈希匹配完成，检测到之后才调用这个端点，
+不经过 `decide()` 的逐路径决策表——这条检测规则不是协议的一部分（纯客户端
+启发式，不同客户端实现可以有不同的检测策略），协议只定义"如何提交一次
+已经确定的改名"。
+
 #### HTTP 状态码 ↔ `code`（§7 表格的 M2 部分，随端点增补，只增不改语义）
 
 | HTTP 状态码 | `code` | 出现在 |
@@ -213,6 +264,8 @@ longpoll 并发上限**：一次挂起可能占用一个请求处理槽位长达
 | `400` | `request.hash_invalid` | `GET .../blobs/{hash}` 的 `{hash}` 不是合法的 `blake3:<hex>` 形式（M2c Task 1） |
 | `400` | `request.batch_malformed` | `PUT .../batch` 请求体不是合法 JSON，或某一条的路径/`item_id`/`version_id`/`parent`/`mtime` 不合规、或 `content_base64` 不是合法 Base64（M2c Task 1，响应体附 `index`；批量端点用一个码覆盖全部条目级结构问题，不像单文件端点那样为路径单独区分 `path.rejected`——`index` 已经足够定位，不需要额外的码区分维度） |
 | `400` | `request.cursor_invalid` | `GET .../changes` 的 `since` 不是合法的 `<epoch>:<seq>` 语法（M2c Task 2，I5：不当作"从头开始"处理） |
+| `400` | `request.session_invalid` | `PUT`/`DELETE`/`PUT .../batch` 携带的 `Arca-Session` 不是合法 sid（M2c Task 4，缺失记空、非法拒绝，见上「通用约定」一节） |
+| `400` | `request.rename_malformed` | `POST .../rename` 请求体不是合法 JSON，或 `from`/`to`/`item_id`/`parent` 缺失/格式不合法（M2c Task 5） |
 | `404` | （无 `code`，标准 HTTP 语义已自解释） | 路径/记录此刻不存在 |
 | `409` | `request.item_id_mismatch` | `Arca-Item-Id` 与目标路径/该 item 自身版本链实际归属的身份不符，或该 item_id 已被 tombstone 终结（评审 C1，见 §7 总表）；`PUT .../batch` 某一条命中同一判定时同样用这个 `code`，响应体附 `index` |
 | `410` | `journal.reset_required` | `GET .../changes` 的 `since.epoch` 与数据集当前 epoch 不符——游标早于保留区间（M2c Task 2，spec §5.2） |
@@ -229,7 +282,9 @@ longpoll 并发上限**：一次挂起可能占用一个请求处理槽位长达
 `request.item_id_mismatch`/`store.corrupt`/`request.body_too_large`/
 `request.body_read_failed` 随 M2b 切片评审的 C1/C2/I2 修复补入总表，同样
 `class=needs_human`。`request.hash_invalid`/`request.batch_malformed`/
-`request.cursor_invalid` 随 M2c Task 1/2 补入，同样 `class=needs_human`；
+`request.cursor_invalid` 随 M2c Task 1/2 补入，`request.session_invalid`
+随 M2c Task 4 补入，`request.rename_malformed` 随 M2c Task 5 补入，同样
+`class=needs_human`；
 `journal.reset_required` 早已在 §7 登记（`class=protocol`），本节只是把它
 接到具体的 HTTP 状态码上。longpoll/SSE（`Content-Type: text/event-stream`
 的 agent 场景）与更多端点落地时继续增补，不改动已登记条目的语义（I10）。
@@ -369,8 +424,13 @@ status`/`arca sync` 据此判断本轮是否会做全量对账）；`reset_reaso
 
 - 子进程从环境变量 `ARCA_TRACE_SID` 读父 sid，追加自己的一段（`FORMAT.md` §10.2）；
   变量缺失或不合法则以自身为根，**不报错**——trace 是诊断产物，绝不能因它而使命令失败。
-- HTTP 请求携带 `Arca-Session: <sid>`（§1.2），arcad 记入 journal 事件的 `actor.session`
-  （`FORMAT.md` §3），构成 I8 的审计闭环。
+- HTTP 请求携带 `Arca-Session: <sid>`（§1.2）：`arca-cli` 的 `http::HttpTransport`
+  把本次调用解析出的 sid（同一份 `resolve_sid()`/`ARCA_TRACE_SID` 继承逻辑，
+  `trace_sink.rs`）原样放进这个头，随每个请求发送；arcad 校验格式后记入
+  journal 事件的 `actor.session`（`FORMAT.md` §3，**缺失记空、非法拒绝**，
+  §1.2「通用约定」一节与 `request.session_invalid` 已定），构成 I8 的审计
+  闭环——一次改动能从客户端落盘的 trace 会话文件一路追到服务端 journal 里
+  同一个 sid 的事件（M2c Task 4）。
 
 ## 6. Git LFS 桥（M5）
 
@@ -417,6 +477,8 @@ status`/`arca sync` 据此判断本轮是否会做全量对账）；`reset_reaso
 | `request.body_too_large` | `needs_human` | HTTP `PUT` 请求体超过 `MAX_BODY_BYTES`（`crates/arcad/src/api.rs`）——评审 C2：流式接收，累计超限即中止清理，不等请求体收完才拒绝，`413` |
 | `request.body_read_failed` | `needs_human` | HTTP `PUT` 流式读取请求体本身失败（客户端提前断开、传输层错误），`400`——评审 C2 |
 | `request.header_ambiguous` | `needs_human` | HTTP `Range` 续传的 `If-Match` 重复出现且取值有歧义（评审 M2b 切片评审 Minor 项）——`400`；`PUT`/`DELETE` 的同类歧义复用 `request.if_match_required`，语义已经是"没有提供有效的单一条件" |
+| `request.session_invalid` | `needs_human` | HTTP `PUT`/`DELETE`/`PUT .../batch` 携带的 `Arca-Session` 头不是合法 sid（`arca_format::trace::Sid::parse` 校验失败）——`400`（M2c Task 4，I8/I5：缺失记空是正常情形，格式不合法则是不可信输入，不能静默塞进 journal 的 `actor.session` 伪造归因） |
+| `request.rename_malformed` | `needs_human` | HTTP `POST .../rename` 请求体不是合法 JSON，或 `from`/`to`/`item_id`/`parent` 缺失/格式不合法——`400`（M2c Task 5） |
 
 TODO：退出码与 `code` 的映射表（M1）。HTTP 状态码与 `code` 的映射表——§1.2
 「HTTP 状态码 ↔ `code`」已覆盖 M2b 交付的五个端点；longpoll/SSE/游标（M2c）
