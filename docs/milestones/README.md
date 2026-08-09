@@ -22,6 +22,7 @@
 | [M2e TLS 与 bugreport](M2e-TLS与bugreport.md) | 本地回收站可管理 · **`arca gc`（第一个被授权销毁的命令）** · 健康检查支持 http(s) · TLS 指纹 pin · bugreport | 7 | ✅ |
 | [M3a agentd 自动同步](M3a-agentd自动同步.md) | 单实例锁 · 每数据集独立回路与退避 · **`Transport::changes`（/changes 的第一个客户端消费者）** · 增量游标 · **agentd 崩溃演练** | 5 | ✅ |
 | [M3b 本地 watcher](M3b-本地watcher.md) | 实时事件 → 去抖 → **溢出即全扫** · 四路唤醒 · 监听不可用即降级 · agentd 心跳与 `arca status` 可见性 | 3 | ✅ |
+| [M3c 分级驻留策略](M3c-分级驻留策略.md) | `Intent` 三态 · 8 MiB 阈值/pin/热度 · 水化队列（合并·限流·拒绝） · `Provider` 边界与全量物化 · **§6.3 第 7 条必过测试** | 3 | ✅ |
 
 后续切片见 [M1a 文档末尾的拆分表](M1a-存储根IO地基.md#m1-的其余切片)。
 
