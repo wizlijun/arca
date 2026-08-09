@@ -157,12 +157,19 @@ async fn run(args: Args) -> ExitCode {
         }
     );
 
-    // 3. 停止信号。用 watch 而不是 broadcast：每个回路只关心「当前是不是该停了」
+    // 3. 心跳（M3b Task 4，FORMAT.md §9.7）：让 `arca status` 能回答
+    //    「自动同步在不在跑」。用一个共享的 Mutex 而不是给每个回路一个
+    //    channel——心跳是**当前状态**的快照，不是事件流。
+    let beats: std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, ipc::DatasetBeat>>,
+    > = Default::default();
+
+    // 4. 停止信号。用 watch 而不是 broadcast：每个回路只关心「当前是不是该停了」
     //    这个**状态**，不关心信号历史，watch 的语义正好是状态而非事件。
     let (stop_tx, stop_rx) = watch::channel(false);
     let signals = tokio::spawn(watch_signals(stop_tx));
 
-    // 4. 每个数据集一个 task。一个 task panic **不能**带走其余——`spawn` 的
+    // 5. 每个数据集一个 task。一个 task panic **不能**带走其余——`spawn` 的
     //    `JoinHandle` 把 panic 收进 `Err`，下面 join 时按数据集分别报告。
     let actor = default_actor();
     let mut handles = Vec::new();
@@ -171,10 +178,41 @@ async fn run(args: Args) -> ExitCode {
         let actor = actor.clone();
         let interval = args.interval;
         let once = args.once;
+        let beats = beats.clone();
         handles.push(tokio::spawn(async move {
-            run_loop(lp, resolved, actor, interval, once, &mut rx).await
+            run_loop(lp, resolved, actor, interval, once, &mut rx, beats).await
         }));
     }
+
+    // 心跳写入器：定期把各回路的快照落盘。**它不参与任何决策**，
+    // 写失败也只打一句——一个诊断产物不该有能力让同步停下来。
+    let heartbeat = {
+        let beats = beats.clone();
+        let root = vault_root.clone();
+        let started = arca_cli::clock::now_rfc3339();
+        let mut rx = stop_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                let snapshot: Vec<ipc::DatasetBeat> = beats
+                    .lock()
+                    .map(|m| m.values().cloned().collect())
+                    .unwrap_or_default();
+                let beat = ipc::Heartbeat {
+                    schema: ipc::SCHEMA,
+                    pid: std::process::id(),
+                    started_at: started.clone(),
+                    beat_at: arca_cli::clock::now_rfc3339(),
+                    datasets: snapshot,
+                };
+                if let Err(e) = ipc::write(&root, &beat) {
+                    eprintln!("心跳写入失败（不影响同步）：{e}");
+                }
+                if !syncer::wait_next(ipc::BEAT_INTERVAL, &mut rx).await {
+                    return;
+                }
+            }
+        })
+    };
 
     let mut failed = false;
     for h in handles {
@@ -187,6 +225,11 @@ async fn run(args: Args) -> ExitCode {
         }
     }
     signals.abort();
+    heartbeat.abort();
+    // 优雅退出时删掉心跳——留着它会让 `arca status` 在下一次读取时看见一个
+    // 「刚刚还活着」的心跳，而进程已经走了。被 `kill -9` 时来不及做这件事，
+    // 那种情形由读取方的新鲜度校验兜住（FORMAT.md §9.7）。
+    ipc::remove(&vault_root);
 
     if failed {
         ExitCode::FAILURE
@@ -206,6 +249,7 @@ async fn run_loop(
     interval: Duration,
     once: bool,
     shutdown: &mut watch::Receiver<bool>,
+    beats: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, ipc::DatasetBeat>>>,
 ) -> bool {
     // 增量游标：只对 http(s):// 有意义（`file://` 没有可挂起的对象，
     // 见 `LocalTransport::changes` 的说明）。
@@ -232,6 +276,8 @@ async fn run_loop(
     }
     let mut since = loaded.as_cursor().cloned();
 
+    let watching = local_wakes.is_some();
+    let mut last_ok_at: Option<String> = None;
     let mut healthy;
     loop {
         let outcome = reconcile_once(&resolved, actor.clone()).await;
@@ -273,6 +319,28 @@ async fn run_loop(
             }
         }
         lp.record(&outcome);
+
+        // 更新心跳快照。`last_ok_at` 只在成功时推进——一个停在昨天的
+        // `last_ok_at` 配上今天的 `beat_at`，恰好是「agentd 活着但这个
+        // 数据集同步不动了」这个状态最直白的表达。
+        if let Ok(mut m) = beats.lock() {
+            if healthy {
+                last_ok_at = Some(arca_cli::clock::now_rfc3339());
+            }
+            m.insert(
+                lp.label.clone(),
+                ipc::DatasetBeat {
+                    path: lp.label.clone(),
+                    hub: lp.hub_name.clone(),
+                    watching,
+                    last_ok_at: last_ok_at.clone(),
+                    last_error: match &outcome {
+                        Outcome::Failed { message, .. } => Some(message.clone()),
+                        Outcome::Ok(_) => None,
+                    },
+                },
+            );
+        }
 
         if once {
             // `--once` 也要把游标推进并落盘——否则每次脚本化调用（演练、CI、

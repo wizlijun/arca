@@ -493,10 +493,37 @@ agentd 用它记住「上次已经消费到 journal 的哪里」，重启后从�
 **游标只在一轮调和成功之后才推进。** 中途失败保持原值，下一轮重来——
 宁可重复消费一段已经处理过的事件（调和本身是幂等的），也绝不跳过。
 
-### 9.7 范围之外
+### 9.7 `agentd-status.json`（agentd 心跳，M3b）
+
+路径：`<vault>/.arca/agentd-status.json`。**vault 侧**而不是数据集侧——
+一个 agentd 进程管整个 vault 的全部数据集，心跳是进程级事实。
+
+JSON 单对象，`schema = 1`：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `schema` | 整数 | 恒为 1；更大的值让老读者**拒绝而不是猜测** |
+| `pid` | 整数 | agentd 进程号，供人 `kill`/`ps` 用 |
+| `started_at` | 字符串 | RFC 3339，进程启动时刻 |
+| `beat_at` | 字符串 | RFC 3339，**这次心跳的时刻**——新鲜度判据 |
+| `datasets` | 数组 | 每个数据集一条，见下 |
+
+`datasets[]` 每条：`path`（相对 vault 根）、`hub`、`watching`（布尔，
+本地文件监听是否在用）、`last_ok_at`（可空，上次成功调和时刻）、
+`last_error`（可空，上次失败的一句话）。
+
+**读取侧必须校验新鲜度。** agentd 被 `kill -9` 时来不及删这个文件，
+所以一个存在的心跳文件**不等于** agentd 在运行。判据是 `beat_at`：
+超过若干倍心跳间隔即视为陈旧，此时只能报告「agentd 可能已不在运行」，
+**绝不拿着一个三天前的心跳说「自动同步正常」**（I5：宁可说不知道）。
+
+**读不到不是错误。** 手动模式是基线（spec §3.1），agentd 没在跑是完全正常
+的状态；措辞不得暗示「你应该起一个 agentd」。
+
+### 9.8 范围之外
 
 `<dataset>/.arca/catalog/`（目录卡）与 `<dataset>/.arca/client/` 下除 `role.toml`、
-`trash/`（§9.5）与 `changes-cursor`（§9.6）之外的内容（如 `baseline.jsonl`）
+`trash/`（§9.5）、`changes-cursor`（§9.6）与 `agentd-status.json`（§9.7）之外的内容（如 `baseline.jsonl`）
 不在本文件 v1 范围内：
 catalog 的格式由独立工具 `arca-catalog` 定义（spec §4.4）；这些内容是纯本地、
 可丢弃的投影，不构成跨设备/跨实现的字节级契约——与 9.5/9.6 节明确定稿的

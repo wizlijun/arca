@@ -898,9 +898,102 @@ fn report_replica_warning_if_any(path: &str, dataset_root: &Path) {
 /// `arca status [<path>] [--root <path>]`：带路径报告单个数据集；**不带
 /// 路径报告 vault 里全部已登记数据集**（M2d Task 3）。
 pub fn status_cmd(path: Option<&str>, root: Option<&Path>) -> ExitCode {
+    报告agentd();
     match path {
         Some(p) => ExitCode::from(status_one(p, root)),
         None => status_all(root),
+    }
+}
+
+/// agentd 心跳文件相对 vault 根的位置（FORMAT.md §9.7）。与
+/// `arca-agentd` 的 `ipc` 模块是同一份契约的两侧——`arca-cli` 不依赖
+/// `arca-agentd`（依赖方向是 agentd → cli，反过来会成环），所以这里
+/// 按格式文档读，不共享类型。
+const AGENTD_STATUS_REL: &str = ".arca/agentd-status.json";
+
+/// 心跳超过这么多秒未更新即视为陈旧。agentd 每 15 秒写一次，给 4 倍余量
+/// 覆盖负载高时的抖动。
+const AGENTD_STALE_SECS: i64 = 60;
+
+/// 在状态报告的最前面说一句 agentd 的情况（M3b Task 4）。
+///
+/// # 三条纪律
+///
+/// 1. **读不到不是错误**——手动模式是基线（spec §3.1），agentd 没在跑是
+///    完全正常的状态。所以没有心跳时**一个字都不说**（Rule of Silence），
+///    措辞更不能暗示「你应该起一个 agentd」。
+/// 2. **心跳文件存在 ≠ agentd 在运行**——`kill -9` 时来不及删它。超过
+///    [`AGENTD_STALE_SECS`] 未更新就只能说「可能已不在运行」，绝不拿着一个
+///    三天前的心跳说「自动同步正常」（I5：宁可说不知道）。
+/// 3. **绝不影响退出码**——这是一句旁注，不是判断。`arca status` 的退出码
+///    回答的是「你的库同步好了吗」，与「有没有 daemon 在帮你」无关
+///    （M2d 评审在副本数告警上抓过同构的问题）。
+fn 报告agentd() {
+    let Ok(vault) = vault::open(&cwd()) else {
+        return;
+    };
+    let path = vault.repo.root().join(AGENTD_STATUS_REL);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return; // 没有 agentd 在跑——正常，不说话。
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        eprintln!("agentd 心跳文件读不懂（{}）——本节跳过。", path.display());
+        return;
+    };
+    match v.get("schema").and_then(|x| x.as_u64()) {
+        Some(1) => {}
+        Some(other) => {
+            eprintln!(
+                "agentd 心跳文件的 schema={other} 比本版本认识的 1 更新——不解读它                 （升级 arca 之后再看）。"
+            );
+            return;
+        }
+        None => return,
+    }
+
+    let beat_at = v
+        .get("beat_at")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default();
+    let 陈旧 = match (
+        arca_cli::clock::parse_rfc3339(beat_at),
+        arca_cli::clock::parse_rfc3339(&arca_cli::clock::now_rfc3339()),
+    ) {
+        (Some(b), Some(now)) => now.saturating_sub(b) > AGENTD_STALE_SECS,
+        // 时间解析不出来 → 当作陈旧。宁可少承诺。
+        _ => true,
+    };
+
+    if 陈旧 {
+        eprintln!(
+            "agentd：**可能已不在运行**——心跳停在 {beat_at}（超过 {AGENTD_STALE_SECS} 秒未更新）。             手动命令不受影响；如果你并没有在用 agentd，这个文件是上次运行留下的残留，可以删掉。"
+        );
+        return;
+    }
+
+    let pid = v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0);
+    eprintln!("agentd：运行中（pid {pid}，心跳 {beat_at}）");
+    for d in v
+        .get("datasets")
+        .and_then(|x| x.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+    {
+        let path = d.get("path").and_then(|x| x.as_str()).unwrap_or("?");
+        let watching = d.get("watching").and_then(|x| x.as_bool()).unwrap_or(false);
+        let last_ok = d.get("last_ok_at").and_then(|x| x.as_str());
+        let last_err = d.get("last_error").and_then(|x| x.as_str());
+        let 监听 = if watching {
+            "实时监听"
+        } else {
+            // 这一行是「本地改动为什么要等一会儿才同步」的答案。
+            "纯周期（本地文件监听不可用）"
+        };
+        match (last_ok, last_err) {
+            (_, Some(e)) => eprintln!("  {path}：{监听}，**上次失败**：{e}"),
+            (Some(t), None) => eprintln!("  {path}：{监听}，上次成功 {t}"),
+            (None, None) => eprintln!("  {path}：{监听}，尚未完成过一轮"),
+        }
     }
 }
 

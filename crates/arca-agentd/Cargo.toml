@@ -19,6 +19,8 @@ arca-cli = { path = "../arca-cli" }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
 fs4 = "1.1.0"
 notify = "8.2.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 # 计划依赖（实现时启用）：rusqlite（投影，M3c）, notify（watcher，M3b）
 
 [dev-dependencies]

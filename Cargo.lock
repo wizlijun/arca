@@ -72,6 +72,8 @@ dependencies = [
  "arca-store",
  "fs4",
  "notify",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
