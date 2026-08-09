@@ -1606,7 +1606,7 @@ pub fn import_lfs_cmd(path: Option<&str>, yes: bool) -> ExitCode {
     let git_dir = repo.root().join(".git");
 
     let report = arca_cli::import_lfs::import(repo.root(), &git_dir, yes);
-    if report.files.is_empty() {
+    if report.files.is_empty() && report.lfs_attrs.is_empty() {
         eprintln!("没有找到任何 LFS 指针文件——这个仓库大概本来就没在用 Git LFS。");
         return ExitCode::SUCCESS;
     }
@@ -1624,6 +1624,32 @@ pub fn import_lfs_cmd(path: Option<&str>, yes: bool) -> ExitCode {
                 println!("lfs-skipped	{path}");
                 eprintln!("{path}：{reason}");
             }
+        }
+    }
+
+    // `.gitattributes` 里的 LFS filter 规则——**只换指针是不够的**：
+    // 留着它，用户下一次 `git add` 就会让 git 的 clean filter 把文件重新
+    // 变回指针，整个迁入被静默撤销。所以这一节必须显眼。
+    if !report.lfs_attrs.is_empty() {
+        eprintln!();
+        for r in &report.lfs_attrs {
+            eprintln!("{}:{}：{}", r.file, r.line_no, r.line.trim());
+        }
+        if yes {
+            eprintln!(
+                "以上 {} 条 `.gitattributes` 规则已被**注释掉**（不是删掉——\
+                 那是你的配置，注释保留了原文也能改回去）。留着它们的话，\
+                 下一次 `git add` 会让 git 把这些文件重新变回 LFS 指针，\
+                 整个迁入就白做了。",
+                report.attrs_disabled
+            );
+        } else {
+            eprintln!(
+                "**注意**：以上 {} 条 `.gitattributes` 规则仍然把文件交给 LFS filter。\
+                 不处理它们的话，下一次 `git add` 会让 git 把这些文件重新变回指针——\
+                 迁入会被静默撤销。`--yes` 会把它们注释掉。",
+                report.lfs_attrs.len()
+            );
         }
     }
 

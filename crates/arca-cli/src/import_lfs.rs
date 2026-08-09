@@ -158,11 +158,37 @@ impl fmt::Display for SkipReason {
     }
 }
 
+/// `.gitattributes` 里一条把文件交给 LFS filter 的规则。
+///
+/// # 为什么必须处理它
+///
+/// 只把指针换回内容是**不够的**：只要 `.gitattributes` 里还留着
+/// `*.png filter=lfs diff=lfs merge=lfs`，用户下一次 `git add` 就会让 git 的
+/// clean filter 把文件**重新变回指针**——整个迁入在下一次提交时被静默撤销，
+/// 而且没有任何征兆。
+///
+/// 这也正是 spec §1.2 不做 clean/smudge filter 的理由的反面注脚：
+/// **寄生 git 管道正是 LFS 的失败根源**，而它的粘性就体现在这里——
+/// 迁出去比迁进来难。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LfsAttrRule {
+    /// `.gitattributes` 相对仓库根的路径。
+    pub file: String,
+    /// 1 起的行号。
+    pub line_no: usize,
+    pub line: String,
+}
+
 /// 一次迁入的完整结果。
 #[derive(Debug, Default)]
 pub struct Report {
     /// (vault 内相对路径, 结论)，按路径排序（确定性）。
     pub files: Vec<(String, Outcome)>,
+    /// 仍然把文件交给 LFS filter 的 `.gitattributes` 规则。
+    /// **非空即意味着迁入会在下次 `git add` 时被撤销。**
+    pub lfs_attrs: Vec<LfsAttrRule>,
+    /// `apply` 且真的注释掉了多少条。
+    pub attrs_disabled: usize,
 }
 
 impl Report {
@@ -197,7 +223,101 @@ pub fn import(root: &Path, git_dir: &Path, apply: bool) -> Report {
     let mut report = Report::default();
     walk(root, root, git_dir, apply, &mut report);
     report.files.sort_by(|a, b| a.0.cmp(&b.0));
+    scan_attrs(root, root, &mut report);
     report
+        .lfs_attrs
+        .sort_by(|a, b| (&a.file, a.line_no).cmp(&(&b.file, b.line_no)));
+    if apply {
+        report.attrs_disabled = disable_attrs(root, &report.lfs_attrs);
+    }
+    report
+}
+
+/// 扫描所有 `.gitattributes`，找出仍把文件交给 LFS filter 的规则。
+fn scan_attrs(root: &Path, dir: &Path, report: &mut Report) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.filter_map(|e| e.ok()) {
+        let path = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        if name == ".git" || name == ".arca" {
+            continue;
+        }
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
+            scan_attrs(root, &path, report);
+        } else if name == ".gitattributes" {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            for (i, line) in text.lines().enumerate() {
+                if is_lfs_attr(line) {
+                    report.lfs_attrs.push(LfsAttrRule {
+                        file: rel.clone(),
+                        line_no: i + 1,
+                        line: line.to_string(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// 这一行是不是把文件交给 LFS clean/smudge filter。
+///
+/// 判据是 **`filter=lfs` 这个属性**，不是「这行里出现了 lfs 三个字母」——
+/// `diff=lfs`/`merge=lfs` 单独出现不会把文件变成指针（它们只影响 diff/merge
+/// 的呈现），而一条注释掉的行更不该被算上。
+fn is_lfs_attr(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return false;
+    }
+    line.split_whitespace().any(|tok| tok == "filter=lfs")
+}
+
+/// 把这些行**注释掉**（而不是删掉）。
+///
+/// 注释而非删除是有意的：`.gitattributes` 是用户的配置，删掉一行等于
+/// 销毁信息——而注释保留了「这里原来配过什么」，用户能一眼看懂发生了什么、
+/// 也能改回去。与 I3「物理销毁只经显式操作」同一条精神。
+fn disable_attrs(root: &Path, rules: &[LfsAttrRule]) -> usize {
+    use std::collections::BTreeMap;
+    let mut by_file: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for r in rules {
+        by_file.entry(&r.file).or_default().push(r.line_no);
+    }
+    let mut done = 0;
+    for (file, line_nos) in by_file {
+        let path = root.join(file);
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut out = String::with_capacity(text.len() + line_nos.len() * 40);
+        for (i, line) in text.lines().enumerate() {
+            if line_nos.contains(&(i + 1)) {
+                out.push_str("# 已由 arca import lfs 注释：这条规则会让 git 在下次 add 时把文件变回 LFS 指针\n");
+                out.push_str("# ");
+                out.push_str(line);
+                out.push('\n');
+                done += 1;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        let tmp = path.with_extension("gitattributes-arca-tmp");
+        if fs::write(&tmp, &out).is_ok() && fs::rename(&tmp, &path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+    done
 }
 
 fn walk(root: &Path, dir: &Path, git_dir: &Path, apply: bool, report: &mut Report) {
@@ -313,7 +433,9 @@ mod tests {
         let git = d.path().join(".git");
         for (name, content, 放对象) in files {
             let oid = hex(&Sha256::digest(content));
-            fs::write(d.path().join(name), 指针(&oid, content.len() as u64)).unwrap();
+            let target = d.path().join(name);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(&target, 指针(&oid, content.len() as u64)).unwrap();
             if *放对象 {
                 let obj = d
                     .path()
@@ -525,6 +647,88 @@ mod tests {
             fs::read_to_string(d.path().join("笔记.md")).unwrap(),
             "# 标题\n正文"
         );
+    }
+
+    // ---------------- .gitattributes ----------------
+
+    /// **只换指针是不够的。** `.gitattributes` 里留着 `filter=lfs` 时，
+    /// 用户下一次 `git add` 会让 git 的 clean filter 把文件重新变回指针——
+    /// 整个迁入在下一次提交时被静默撤销，且没有任何征兆。
+    #[test]
+    fn 检出仍会把文件变回指针的gitattributes规则() {
+        let d = 造仓库(&[("a.png", b"REAL", true)]);
+        fs::write(
+            d.path().join(".gitattributes"),
+            "*.png filter=lfs diff=lfs merge=lfs -text\n*.md text\n",
+        )
+        .unwrap();
+        let r = import(d.path(), &d.path().join(".git"), false);
+        assert_eq!(r.lfs_attrs.len(), 1, "{:?}", r.lfs_attrs);
+        assert_eq!(r.lfs_attrs[0].line_no, 1);
+        assert!(r.lfs_attrs[0].line.contains("filter=lfs"));
+    }
+
+    /// 判据是 `filter=lfs` 这个**属性**，不是「这行里有 lfs 三个字母」。
+    /// `diff=lfs`/`merge=lfs` 单独出现不会把文件变成指针；注释行更不算。
+    #[test]
+    fn 只认filter_lfs而不是任何带lfs的行() {
+        let d = 造仓库(&[("a.png", b"REAL", true)]);
+        fs::write(
+            d.path().join(".gitattributes"),
+            "*.psd diff=lfs merge=lfs\n# *.mov filter=lfs\n*.txt text\n",
+        )
+        .unwrap();
+        let r = import(d.path(), &d.path().join(".git"), false);
+        assert!(r.lfs_attrs.is_empty(), "{:?}", r.lfs_attrs);
+    }
+
+    /// dry-run 下只报告，**不动 `.gitattributes`**。
+    #[test]
+    fn dry_run不改动gitattributes() {
+        let d = 造仓库(&[("a.png", b"REAL", true)]);
+        let 原文 = "*.png filter=lfs diff=lfs merge=lfs\n";
+        fs::write(d.path().join(".gitattributes"), 原文).unwrap();
+        let r = import(d.path(), &d.path().join(".git"), false);
+        assert_eq!(r.attrs_disabled, 0);
+        assert_eq!(
+            fs::read_to_string(d.path().join(".gitattributes")).unwrap(),
+            原文
+        );
+    }
+
+    /// `--yes` 下把规则**注释掉而不是删掉**——`.gitattributes` 是用户的配置，
+    /// 删一行等于销毁信息；注释保留了「这里原来配过什么」，也能改回去。
+    #[test]
+    fn yes下注释掉规则而不是删掉() {
+        let d = 造仓库(&[("a.png", b"REAL", true)]);
+        fs::write(
+            d.path().join(".gitattributes"),
+            "*.png filter=lfs diff=lfs merge=lfs\n*.md text\n",
+        )
+        .unwrap();
+        let r = import(d.path(), &d.path().join(".git"), true);
+        assert_eq!(r.attrs_disabled, 1);
+
+        let text = fs::read_to_string(d.path().join(".gitattributes")).unwrap();
+        assert!(
+            text.contains("# *.png filter=lfs"),
+            "原行应当被注释保留：{text}"
+        );
+        assert!(text.contains("arca import lfs"), "要说明是谁改的：{text}");
+        assert!(text.contains("*.md text"), "无关的行不该被动：{text}");
+        // 注释之后这条规则对 git 不再生效——再扫一次应当认不出它。
+        let r2 = import(d.path(), &d.path().join(".git"), false);
+        assert!(r2.lfs_attrs.is_empty(), "{:?}", r2.lfs_attrs);
+    }
+
+    #[test]
+    fn 子目录里的gitattributes也被扫到() {
+        let d = 造仓库(&[("assets/a.png", b"REAL", true)]);
+        fs::create_dir_all(d.path().join("assets")).unwrap();
+        fs::write(d.path().join("assets/.gitattributes"), "*.png filter=lfs\n").unwrap();
+        let r = import(d.path(), &d.path().join(".git"), false);
+        assert_eq!(r.lfs_attrs.len(), 1, "{:?}", r.lfs_attrs);
+        assert!(r.lfs_attrs[0].file.contains("assets"));
     }
 
     /// 迁入之后不留 `.arca-lfs-tmp` 残留。
