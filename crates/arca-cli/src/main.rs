@@ -187,6 +187,20 @@ enum Command {
     /// 路径与 arca 自己的诊断结论，绝不读取任何受管文件的内容**；输出直接
     /// 打到 stdout，不落盘、不上传——你在按回车之前就能把收了什么看个遍
     Bugreport,
+    /// 产出站点生成器消费的 publish-map.json（spec §4.9）。**只产出映射，
+    /// 绝不改写 vault 里的 md**；映射完全由清单构造，**一个 blob 都不读**——
+    /// CI 可以在不下载任何二进制的前提下构建出图片可访问的静态站
+    #[command(name = "publish-map")]
+    PublishMap {
+        /// 全量公开整个数据集。**默认只收录被 md 引用到的资源**——直接公开
+        /// 整个数据集会暴露没被任何已发布笔记引用的文件，那是隐私事故的常见
+        /// 来源（spec §4.9 ③）。扩大暴露面必须是显式动作
+        #[arg(long)]
+        all: bool,
+        /// 写到这个文件；不给就打到 stdout
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
     /// hub 端点的本机操作（目前只有 TLS 证书 pin，spec §9）
     Hub {
         #[command(subcommand)]
@@ -376,6 +390,9 @@ fn main() -> std::process::ExitCode {
                 retention_days,
                 root.as_deref(),
             )
+        }
+        Command::PublishMap { all, out } => {
+            commands::porcelain::publish_map_cmd(all, out.as_deref())
         }
         Command::Bugreport => commands::porcelain::bugreport_cmd(),
         Command::Hub { action } => match action {

@@ -1568,6 +1568,141 @@ pub fn restore_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
+// `arca publish-map`（M5a，spec §4.9）
+// ---------------------------------------------------------------------------
+
+/// `arca publish-map [--all] [--out <路径>]`。
+///
+/// 产出站点生成器消费的 `publish-map.json`（spec §4.9 约束 ①：
+/// **arca 只产出映射，绝不改写 vault 里的 md**）。
+///
+/// # 这条命令一个 blob 都不读
+///
+/// 映射完全由 `<dataset>/.arca/manifest` 构造——路径、哈希、大小三样，
+/// 正是链接重写需要的全部。所以 CI 可以在**不下载任何二进制**的前提下
+/// 构建出图片可访问的静态站：100 GB 的图库，一个字节都不用拉。
+///
+/// # 默认 `--referenced-only`
+///
+/// 直接公开整个数据集会暴露没被任何已发布笔记引用的文件——这是隐私事故的
+/// 常见来源（§4.9 约束 ③）。所以默认扫描 vault 里的 `.md`，只收录被引用到
+/// 的资源；`--all` 必须显式给出。**扩大暴露面必须是显式动作。**
+pub fn publish_map_cmd(all: bool, out: Option<&Path>) -> ExitCode {
+    let vault = match vault::open(&cwd()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let vault_root = vault.repo.root().to_path_buf();
+
+    // `--referenced-only`（默认）：先把 vault 里所有 md 的引用抽出来。
+    let refs = if all {
+        None
+    } else {
+        let mut set = std::collections::BTreeSet::new();
+        if let Err(e) = 收集md引用(&vault_root, &vault_root, &mut set) {
+            eprintln!("扫描 md 引用失败：{e}");
+            return ExitCode::from(1);
+        }
+        Some(set)
+    };
+
+    let mut map = arca_publish::map::PublishMap::default();
+    for entry in vault.registry.datasets() {
+        let resolved = match arca_cli::dataset::resolve(&vault_root, &entry.path, None) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("数据集 {} 解析失败：{e}", entry.path);
+                return ExitCode::from(1);
+            }
+        };
+        let manifest_path = resolved.dataset_dir.join(".arca").join("manifest");
+        let text = match std::fs::read_to_string(&manifest_path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 从未同步过的数据集没有清单。**跳过并说明**，不是失败——
+                // 一个 vault 里有个新注册还没同步的数据集是很正常的状态。
+                eprintln!("数据集 {} 还没有清单（未同步过），本次跳过。", entry.path);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("读取 {} 失败：{e}", manifest_path.display());
+                return ExitCode::from(1);
+            }
+        };
+        let manifest = match arca_format::manifest::Manifest::parse(&text) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("{} 解析失败：{e}", manifest_path.display());
+                return ExitCode::from(1);
+            }
+        };
+
+        let scoped = refs
+            .as_ref()
+            .map(|r| arca_publish::referenced::scope_to_dataset(r, &resolved.normalized_path));
+        if let Err(e) = arca_publish::map::add_dataset(
+            &mut map,
+            &resolved.normalized_path,
+            &resolved.cfg,
+            &manifest,
+            scoped.as_ref(),
+        ) {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    }
+
+    let json = arca_publish::map::to_json(&map);
+    match out {
+        None => print!("{json}"),
+        Some(p) => {
+            if let Err(e) = std::fs::write(p, &json) {
+                eprintln!("写入 {} 失败：{e}", p.display());
+                return ExitCode::from(1);
+            }
+        }
+    }
+    if !all {
+        eprintln!(
+            "已按 --referenced-only（默认）产出映射：{} 个数据集、{} 个被引用的资源。\
+             未被任何 md 引用的文件**不在其中**——要全量公开请显式 `--all`。",
+            map.datasets.len(),
+            map.items.len()
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// 递归收集 vault 里所有 `.md` 的引用。**跳过 `.git/` 与 `.arca/`**。
+fn 收集md引用(
+    vault_root: &Path,
+    dir: &Path,
+    out: &mut std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}：{e}", dir.display()))?;
+    for e in entries.filter_map(|e| e.ok()) {
+        let path = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        if name == ".git" || name == ".arca" {
+            continue;
+        }
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
+            收集md引用(vault_root, &path, out)?;
+        } else if path.extension().is_some_and(|x| x == "md") {
+            // 只读 `.md`——**受管二进制一个字节都不读**（那正是本命令的卖点）。
+            let text =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}：{e}", path.display()))?;
+            arca_publish::referenced::extract_refs(&text, out);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // `arca bugreport`（M2e Task 5，spec §3.3）
 // ---------------------------------------------------------------------------
 
