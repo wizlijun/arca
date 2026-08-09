@@ -573,11 +573,15 @@ fn status_one(path: &str, root: Option<&Path>) -> u8 {
         }
     };
 
+    // M2d Task 4（spec §4.5）：副本数告警，低于阈值即警告——见
+    // `known_server_copies` 文档，措辞刻意强调"已知"而不是宣称全局真相。
+    let mut level = report_replica_warning_if_any(path, &resolved.dataset_dir);
+
     let mut sink = NullSink;
     match status_lib::status(&resolved.dataset_dir, &store_root, &mut sink) {
         Ok(report) => {
             if report.is_silent() {
-                return 0;
+                return level;
             }
             if report.baseline_reset {
                 eprintln!("基线已重建（此前缺失或损坏）——本轮是一次全量对账");
@@ -606,12 +610,58 @@ fn status_one(path: &str, root: Option<&Path>) -> u8 {
             for (p, reason) in &report.scan_rejected {
                 eprintln!("扫描阶段被拒绝（{}）：{p}", reason.as_str());
             }
-            1
+            level = level.max(1);
+            level
         }
         Err(e) => {
             eprintln!("{e}");
+            level.max(1)
+        }
+    }
+}
+
+/// M2d Task 4（spec §4.5）：「`arca status` 报告每个数据集的 server 副本数，
+/// 低于阈值（默认 2）即告警——致敬 git-annex 的 numcopies。」
+const DEFAULT_MIN_SERVER_COPIES: u32 = 2;
+
+/// 算出**本设备目前能知道的下限**，不是全局真相——诚实的边界（M2d Task 4
+/// brief 原话）：hub 自己的存储根即隐式 server 角色（spec §4.7），记 1 份；
+/// 本设备若把这个数据集也声明为 server 角色（`crate::role`），再记 1 份。
+/// **本切片没有办法知道其它设备的角色**——那需要 hub 侧登记每个绑定设备的
+/// 角色（属 M2e 或更后的切片），所以这里算出来的数字只是"已知的下界"，
+/// 不代表"全局一共有几份"；调用方（[`report_replica_warning_if_any`]）的
+/// 措辞必须把这个边界讲清楚，不能让用户误以为这是权威计数。
+fn known_server_copies(dataset_root: &Path) -> Result<u32, role::RoleError> {
+    let mut copies = 1; // hub 自己的存储根
+    if role::read(dataset_root)? == role::Role::Server {
+        copies += 1; // 本设备也承诺永久保留一份
+    }
+    Ok(copies)
+}
+
+/// 副本数低于阈值时打一条 stderr 警告，返回应叠加的严重度（0 或 1）。
+/// 角色声明本身读不出来（role.toml 损坏）也算一种需要用户知道的问题——
+/// 不静默吞掉（I5），照样叠加严重度，但按 `client`（未声明的默认角色）
+/// 继续算下限，不因为这一步失败就放弃整个副本数提示。
+fn report_replica_warning_if_any(path: &str, dataset_root: &Path) -> u8 {
+    let copies = match known_server_copies(dataset_root) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("数据集 {path} 的角色声明读取失败，副本数按未声明（client）估算：{e}");
             1
         }
+    };
+    if copies < DEFAULT_MIN_SERVER_COPIES {
+        eprintln!(
+            "数据集 {path}：已知的 server 副本数为 {copies}，低于阈值 {DEFAULT_MIN_SERVER_COPIES}\
+             ——这只是本设备目前能看到的下限（hub 自己的存储根记 1 份，本设备若是 server 角色\
+             再记 1 份），并非全局真相：其它设备是否也承诺了 server 角色，本版本还没有办法\
+             得知（需要 hub 侧登记每个绑定设备的角色，未实现）。如果这台设备应该作为一份永久\
+             保留的副本，运行 `arca role {path} --set server`。"
+        );
+        1
+    } else {
+        0
     }
 }
 
