@@ -367,16 +367,24 @@ fn print_sync_report(report: &sync_lib::SyncReport) -> bool {
 /// 该做的事，见其文档），只保证"离线"这一种情形不会被和"随便什么问题"
 /// 混在同一个退出码里，与 `status_cmd`/`verify_cmd` 对 `StorageRoot::open`
 /// 失败的既有处置保持一致的信号强度。
-fn sync_error_exit_code(e: &SyncError) -> ExitCode {
+/// `SyncError` → 退出码严重度（0 干净不可能出现在这里/1 有问题/2 身份不明）
+/// ——返回 `u8` 而不是直接返回 `ExitCode`：`std::process::ExitCode` 不透明，
+/// 取不出内部值，没法在 [`sync_all`] 里跟其它数据集的结果比大小取"最严重
+/// 的那个"。所有单数据集内部逻辑改用 `u8`，只在最外层命令壳边界转一次
+/// `ExitCode`（M2d Task 3）。
+fn sync_error_exit_level(e: &SyncError) -> u8 {
     match e {
-        SyncError::Transport(TransportError::Offline { .. }) => ExitCode::from(2),
-        _ => ExitCode::from(1),
+        SyncError::Transport(TransportError::Offline { .. }) => 2,
+        _ => 1,
     }
 }
 
-/// `arca sync <path> [--root <path>]`——对一个已 `arca register`/`arca adopt`
-/// 过的数据集再跑一轮调和闭环。**不引导全新存储根**（那是 `adopt` 的职责）：
-/// 存储根打不开/数据集离线一律按 I11 视为身份不明。
+/// `arca sync <path> [--root <path>]` 单个数据集的核心逻辑——对一个已
+/// `arca register`/`arca adopt` 过的数据集再跑一轮调和闭环。**不引导全新
+/// 存储根**（那是 `adopt` 的职责）：存储根打不开/数据集离线一律按 I11
+/// 视为身份不明。返回严重度而不是 `ExitCode`，理由见
+/// [`sync_error_exit_level`]；[`sync_cmd`]（单数据集）与 [`sync_all`]
+/// （M2d Task 3，全部数据集）都调用这一个函数，不重复实现。
 ///
 /// # M2c Task 5：`file://` 与 `http://` 分流
 ///
@@ -387,12 +395,12 @@ fn sync_error_exit_code(e: &SyncError) -> ExitCode {
 /// 这次命令解析出的 `sid`（M2c Task 4 sid 闭环：客户端 trace 里的 sid 与
 /// 服务端 journal 里的 `actor.session` 由此串起来）。两条路径共享
 /// [`print_sync_report`]，用户看到的输出格式不因 hub 类型而分裂。
-pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
+fn sync_one(path: &str, root: Option<&Path>) -> u8 {
     let resolved = match dataset::resolve(&cwd(), path, root) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::from(1);
+            return 1;
         }
     };
 
@@ -412,9 +420,9 @@ pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("{e}");
+                    eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
                     flush_trace_if_needed(&sid, &mut sink, false);
-                    return ExitCode::from(2);
+                    return 2;
                 }
             };
             sync_lib::sync(
@@ -436,34 +444,116 @@ pub fn sync_cmd(path: &str, root: Option<&Path>) -> ExitCode {
         }
     };
 
-    let (code, succeeded) = match result {
+    let (level, succeeded) = match result {
         Ok(report) => {
             let clean = print_sync_report(&report);
             if clean {
-                (ExitCode::SUCCESS, true)
+                (0, true)
             } else {
-                (ExitCode::from(1), false)
+                (1, false)
             }
         }
         Err(e) => {
-            eprintln!("{e}");
-            (sync_error_exit_code(&e), false)
+            if matches!(e, SyncError::Transport(TransportError::Offline { .. })) {
+                eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
+            } else {
+                eprintln!("{e}");
+            }
+            (sync_error_exit_level(&e), false)
         }
     };
 
     flush_trace_if_needed(&sid, &mut sink, succeeded);
-    code
+    level
 }
 
-/// `arca status <path> [--root <path>]`（M1d Task 7）：跑扫描与调和但**不
-/// 执行**——Rule of Silence，全同步时完全安静、退出码 0；有待办（含结构化
-/// 问题）时把分类结果打到 stderr（诊断，不是数据）、退出码 1。
-pub fn status_cmd(path: &str, root: Option<&Path>) -> ExitCode {
-    let resolved = match dataset::resolve(&cwd(), path, root) {
+/// `arca sync [<path>] [--root <path>]`：带路径同步单个数据集；**不带路径
+/// 同步 vault 里全部已登记数据集**（M2d Task 3，spec §4.3.2）。
+pub fn sync_cmd(path: Option<&str>, root: Option<&Path>) -> ExitCode {
+    match path {
+        Some(p) => ExitCode::from(sync_one(p, root)),
+        None => sync_all(root),
+    }
+}
+
+/// `arca sync`（不带路径）：对 vault 里全部已登记数据集各跑一轮同步。
+///
+/// spec §4.3.2：「daemon 为每个数据集维护独立的绑定、独立的 journal 游标、
+/// 独立的传输队列与退避状态。一个 hub 不可达时，只有它承载的数据集进入
+/// 离线态（I11），其余数据集完全不受影响。」——这里是这条纪律在**客户端**
+/// 手动同步下的体现（arcad 侧的独立故障域已在 M2b 验证）。
+///
+/// **循环体绝不能用 `?`/`return` 提前退出**——那是这类"多个独立单元、一个
+/// 失败不该拖累其它"场景最容易写错的形态（M1b 在 `into_result` 上踩过同构
+/// 的问题：一个冲突文件中止了整轮 sweep）。每个数据集的结果都要被
+/// [`sync_one`] 完整跑完并捕获，循环体本身不包含任何可能提前退出的
+/// `?`/`return`；最终退出码取全体数据集里最严重的那个（0 < 1 < 2），
+/// 不是"第一个失败就代表全部"。
+///
+/// # 对 Rule of Silence 的一处刻意收窄
+///
+/// `sync_one`（单数据集）继续 100% 遵守 Rule of Silence——`arca sync <path>`
+/// 全同步时不打印任何东西，这条路径完全不变。这里（`arca sync` 不带路径、
+/// 真的有 2+ 个数据集）额外给每个数据集打一行 `== path ==` 头，哪怕那个
+/// 数据集本身干净：当"一个单元"变成"N 个独立单元各自成败"时，完全沉默会
+/// 制造新的歧义——用户分不清"扫过了 3 个数据集且都干净"与"注册表是空的、
+/// 根本没扫到东西"，这正是 `git submodule foreach` 类工具即便子模块干净也
+/// 打印 `Entering '<name>'` 的同一个理由。只有单数据集恰好等于 1 个时不打
+/// （`paths.len() > 1`），保持与"单数据集命令"完全一致的观感。
+fn sync_all(root_override: Option<&Path>) -> ExitCode {
+    if root_override.is_some() {
+        eprintln!(
+            "--root 只在指定单个数据集路径时生效——全量同步（不带路径）请对需要覆盖存储根的\
+             数据集单独运行 `arca sync <path> --root <path>`"
+        );
+        return ExitCode::from(1);
+    }
+
+    let vault = match vault::open(&cwd()) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(1);
+        }
+    };
+
+    let paths: Vec<String> = vault
+        .registry
+        .datasets()
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    if paths.is_empty() {
+        // Rule of Silence：还没有任何已登记的数据集，没什么可同步的。
+        return ExitCode::SUCCESS;
+    }
+
+    let mut worst: u8 = 0;
+    for path in &paths {
+        if paths.len() > 1 {
+            eprintln!("== {path} ==");
+        }
+        // 关键纪律（见本函数文档）：这里只累积严重度，绝不因为某个数据集
+        // 的结果就跳过或中止其余数据集的循环。
+        let level = sync_one(path, None);
+        worst = worst.max(level);
+    }
+    ExitCode::from(worst)
+}
+
+/// `arca status <path> [--root <path>]` 单个数据集的核心逻辑（M1d Task 7）：
+/// 跑扫描与调和但**不执行**——Rule of Silence，全同步时完全安静、退出码 0；
+/// 有待办（含结构化问题）时把分类结果打到 stderr（诊断，不是数据）、
+/// 退出码 1；数据集离线（I11）退出码 2，且明确点出是哪个 hub（M2d Task 3）。
+/// 返回严重度而不是 `ExitCode`，理由与 [`sync_error_exit_level`] 一致：
+/// [`status_cmd`]（单数据集）与 [`status_all`]（M2d Task 3，全部数据集）
+/// 都调用这一个函数。
+fn status_one(path: &str, root: Option<&Path>) -> u8 {
+    let resolved = match dataset::resolve(&cwd(), path, root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
         }
     };
     // M2c Task 5：`status` 尚未 Transport 化，`http://` hub 报明确的
@@ -472,14 +562,14 @@ pub fn status_cmd(path: &str, root: Option<&Path>) -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
-            return ExitCode::from(1);
+            return 1;
         }
     };
     let store_root = match StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(2);
+            eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
+            return 2;
         }
     };
 
@@ -487,7 +577,7 @@ pub fn status_cmd(path: &str, root: Option<&Path>) -> ExitCode {
     match status_lib::status(&resolved.dataset_dir, &store_root, &mut sink) {
         Ok(report) => {
             if report.is_silent() {
-                return ExitCode::SUCCESS;
+                return 0;
             }
             if report.baseline_reset {
                 eprintln!("基线已重建（此前缺失或损坏）——本轮是一次全量对账");
@@ -516,13 +606,65 @@ pub fn status_cmd(path: &str, root: Option<&Path>) -> ExitCode {
             for (p, reason) in &report.scan_rejected {
                 eprintln!("扫描阶段被拒绝（{}）：{p}", reason.as_str());
             }
-            ExitCode::from(1)
+            1
         }
         Err(e) => {
             eprintln!("{e}");
-            ExitCode::from(1)
+            1
         }
     }
+}
+
+/// `arca status [<path>] [--root <path>]`：带路径报告单个数据集；**不带
+/// 路径报告 vault 里全部已登记数据集**（M2d Task 3）。
+pub fn status_cmd(path: Option<&str>, root: Option<&Path>) -> ExitCode {
+    match path {
+        Some(p) => ExitCode::from(status_one(p, root)),
+        None => status_all(root),
+    }
+}
+
+/// `arca status`（不带路径）：按数据集分别报告健康度——与 [`sync_all`]
+/// 同一条纪律（M2d Task 3，spec §4.3.2）：一个 hub 离线只让它承载的数据集
+/// 离线，循环体不因此中止，其余数据集照常报告；退出码取全体里最严重的
+/// 那个；对 Rule of Silence 的收窄与 [`sync_all`] 同一处理——`status_one`
+/// 单数据集调用路径不变，只有真的 2+ 个数据集时才逐个打 `== path ==` 头。
+fn status_all(root_override: Option<&Path>) -> ExitCode {
+    if root_override.is_some() {
+        eprintln!(
+            "--root 只在指定单个数据集路径时生效——全量状态查看（不带路径）请对需要覆盖存储根的\
+             数据集单独运行 `arca status <path> --root <path>`"
+        );
+        return ExitCode::from(1);
+    }
+
+    let vault = match vault::open(&cwd()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let paths: Vec<String> = vault
+        .registry
+        .datasets()
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect();
+    if paths.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+
+    let mut worst: u8 = 0;
+    for path in &paths {
+        if paths.len() > 1 {
+            eprintln!("== {path} ==");
+        }
+        let level = status_one(path, None);
+        worst = worst.max(level);
+    }
+    ExitCode::from(worst)
 }
 
 /// `arca verify <path> [--root <path>]`（M1d Task 7）：fixity 巡检，复用

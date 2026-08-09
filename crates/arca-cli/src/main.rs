@@ -74,17 +74,19 @@ enum Command {
     },
     /// 对一个已纳管的数据集跑一轮 file:// 调和闭环
     Sync {
-        /// 数据集路径，相对 vault 根
-        path: String,
-        /// 覆盖从 .gitarca 解析出的存储根路径
+        /// 数据集路径，相对 vault 根；省略则同步 vault 内全部已登记数据集
+        /// （M2d Task 3：一个 hub 不可达只让它承载的数据集离线，不影响其余）
+        path: Option<String>,
+        /// 覆盖从 .gitarca 解析出的存储根路径（只在指定单个数据集路径时有效）
         #[arg(long)]
         root: Option<std::path::PathBuf>,
     },
     /// 比对本地与 hub，不动数据；全同步时安静，退出码 0
     Status {
-        /// 数据集路径，相对 vault 根
-        path: String,
-        /// 覆盖从 .gitarca 解析出的存储根路径
+        /// 数据集路径，相对 vault 根；省略则报告 vault 内全部已登记数据集
+        /// （M2d Task 3）
+        path: Option<String>,
+        /// 覆盖从 .gitarca 解析出的存储根路径（只在指定单个数据集路径时有效）
         #[arg(long)]
         root: Option<std::path::PathBuf>,
     },
@@ -234,8 +236,12 @@ fn main() -> std::process::ExitCode {
             root,
             create_root,
         } => commands::porcelain::adopt_cmd(&path, root.as_deref(), create_root),
-        Command::Sync { path, root } => commands::porcelain::sync_cmd(&path, root.as_deref()),
-        Command::Status { path, root } => commands::porcelain::status_cmd(&path, root.as_deref()),
+        Command::Sync { path, root } => {
+            commands::porcelain::sync_cmd(path.as_deref(), root.as_deref())
+        }
+        Command::Status { path, root } => {
+            commands::porcelain::status_cmd(path.as_deref(), root.as_deref())
+        }
         Command::Verify { path, root } => commands::porcelain::verify_cmd(&path, root.as_deref()),
         Command::Role { path, set, root } => {
             commands::porcelain::role_cmd(&path, set.as_deref(), root.as_deref())

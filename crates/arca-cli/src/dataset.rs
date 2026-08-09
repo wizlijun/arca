@@ -47,6 +47,13 @@ pub struct ResolvedDataset {
     /// 归一化后的、相对 vault 根的路径（`/` 分隔）。
     pub normalized_path: String,
     pub cfg: DatasetConfig,
+    /// 这个数据集在 `.gitarca` 里绑定的 hub 名（`[hub.<名>]` 的键名，与
+    /// `target` 是同一份绑定的两个视角：这个是人类认得的符号名，`target`
+    /// 是据此解析出的连接地址）。M2d Task 3：多 hub 独立故障域下，命令壳
+    /// 报告"哪个数据集离线"时必须同时说清"是哪个 hub"，不能只报路径——
+    /// 一个 vault 有多个数据集分属不同 hub 时，光报路径不足以让用户判断
+    /// 该去检查哪个 hub 的可达性。
+    pub hub_name: String,
     /// 这个数据集绑定的 hub——本地存储根路径或 `http://` 基址，见
     /// [`HubTarget`]。
     pub target: HubTarget,
@@ -191,6 +198,7 @@ pub fn resolve(
         dataset_dir,
         normalized_path,
         cfg,
+        hub_name: entry.hub.clone(),
         target,
     })
 }
