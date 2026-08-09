@@ -10,12 +10,13 @@
 //! [`StatusReport::is_silent`] 为真，命令壳据此完全不打印任何东西、退出码 0；
 //! 否则把分类结果打到 stderr（诊断，不是数据）。
 
+use crate::transport::{Transport, TransportError};
 use crate::{baseline, hub, scan};
 use arca_core::reconcile::{decide_traced, Action};
 use arca_core::state::{LocalState, RemoteState};
 use arca_format::trace::TraceSink;
 use arca_store::root::StorageRoot;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
@@ -67,6 +68,11 @@ pub enum StatusError {
     Scan(scan::ScanError),
     Baseline(baseline::BaselineError),
     Hub(hub::HubError),
+    /// M2e Task 3：经 [`Transport`] 读远端状态失败（`http(s)://` hub）。
+    /// **保留完整的 [`TransportError`]，不折成字符串**——命令壳要靠它区分
+    /// `Offline`（I11，退出码 2）与其它失败（退出码 1），折成字符串就没法
+    /// 再分辨了。
+    Transport(TransportError),
 }
 
 impl fmt::Display for StatusError {
@@ -75,23 +81,55 @@ impl fmt::Display for StatusError {
             StatusError::Scan(e) => write!(f, "{e}"),
             StatusError::Baseline(e) => write!(f, "{e}"),
             StatusError::Hub(e) => write!(f, "{e}"),
+            StatusError::Transport(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for StatusError {}
 
-/// 跑一次只读的三态调和：`dataset_root` ↔ `root`。**不修改任何文件**——不写
-/// 本地文件、不写存储根、不落盘基线（与 `sync::sync` 的关键差别）。
+/// 跑一次只读的三态调和：`dataset_root` ↔ 本地存储根。**不修改任何文件**
+/// ——不写本地文件、不写存储根、不落盘基线（与 `sync::sync` 的关键差别）。
 pub fn status(
     dataset_root: &Path,
     root: &StorageRoot,
     sink: &mut dyn TraceSink,
 ) -> Result<StatusReport, StatusError> {
+    status_with(dataset_root, sink, |_| {
+        hub::read_remote(root).map_err(StatusError::Hub)
+    })
+}
+
+/// 同一次只读调和，但远端状态经 [`Transport`] 读取（M2e Task 3：`arcad` 是
+/// M2 的主线，主健康检查命令必须对主 hub 类型工作）。
+///
+/// 与 [`status`] 共用**同一段** [`status_with`] 判断逻辑，只换远端状态的
+/// 来源——`status` 与 `sync` 不许各写一套判断（CLAUDE.md 架构约束），
+/// `file://` 与 `http://` 之间同理：两种传输下"这个数据集有什么待办"的
+/// 答案必须出自同一段代码。
+pub fn status_transport(
+    dataset_root: &Path,
+    transport: &dyn Transport,
+    sink: &mut dyn TraceSink,
+) -> Result<StatusReport, StatusError> {
+    status_with(dataset_root, sink, |_| {
+        transport.read_remote().map_err(StatusError::Transport)
+    })
+}
+
+/// 两种传输共用的判断本体。`read_remote` 是个闭包而不是一个已经算好的
+/// map：**读远端要发生在扫描与基线加载之后**（与 M1d 起的既有顺序逐字
+/// 一致），这样"本地就已经读不下去"这类失败不会被一次可能很慢、可能超时
+/// 的网络往返挡在后面才报出来。
+fn status_with(
+    dataset_root: &Path,
+    sink: &mut dyn TraceSink,
+    read_remote: impl FnOnce(&mut dyn TraceSink) -> Result<BTreeMap<String, RemoteState>, StatusError>,
+) -> Result<StatusReport, StatusError> {
     let scan_result = scan::scan_dataset(dataset_root, sink).map_err(StatusError::Scan)?;
     let baseline = baseline::load(dataset_root).map_err(StatusError::Baseline)?;
     let baseline_reset = baseline.was_reset();
-    let remote = hub::read_remote(root).map_err(StatusError::Hub)?;
+    let remote = read_remote(sink)?;
 
     let mut report = StatusReport {
         scan_rejected: scan_result.rejected.clone(),

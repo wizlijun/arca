@@ -90,10 +90,20 @@ enum Command {
         #[arg(long)]
         root: Option<std::path::PathBuf>,
     },
-    /// fixity 巡检（BLAKE3 重算对账），复用 arca fsck 的巡检逻辑
+    /// fixity 巡检（BLAKE3 重算对账）。file:// hub 默认就是全量 fixity
+    /// （逐文件重算哈希）；http(s):// hub 默认**只校验元数据一致性**——
+    /// 把 hub 声明的哈希/大小与本地基线对照，**不重算任何内容字节**，
+    /// 因此发现不了 hub 上的位腐或被外部改写的内容；要真正验内容加
+    /// --deep（会把整个数据集的字节从网络上拉一遍），或者更省事：在 hub
+    /// 那台机器上直接对存储根跑 `arca fsck <存储根>`
     Verify {
         /// 数据集路径，相对 vault 根
         path: String,
+        /// 拉取全部内容重算 BLAKE3 与 hub 声明的哈希比对（只对 http(s)://
+        /// hub 有意义；file:// 默认就已经是这一档）。代价是整个数据集的
+        /// 字节都要过一遍网络
+        #[arg(long)]
+        deep: bool,
         /// 覆盖从 .gitarca 解析出的存储根路径
         #[arg(long)]
         root: Option<std::path::PathBuf>,
@@ -284,7 +294,9 @@ fn main() -> std::process::ExitCode {
         Command::Status { path, root } => {
             commands::porcelain::status_cmd(path.as_deref(), root.as_deref())
         }
-        Command::Verify { path, root } => commands::porcelain::verify_cmd(&path, root.as_deref()),
+        Command::Verify { path, deep, root } => {
+            commands::porcelain::verify_cmd(&path, deep, root.as_deref())
+        }
         Command::Role { path, set, root } => {
             commands::porcelain::role_cmd(&path, set.as_deref(), root.as_deref())
         }

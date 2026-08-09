@@ -590,26 +590,32 @@ fn status_one(path: &str, root: Option<&Path>) -> u8 {
     // 还会通过 `status_all`/`sync_all` 的取最大值传染到整个 vault。
     report_replica_warning_if_any(path, &resolved.dataset_dir);
 
-    // M2c Task 5：`status` 尚未 Transport 化，`http://` hub 报明确的
-    // "这条命令不支持"（`dataset::ResolvedDataset::local_root` 文档）。
-    let root_path = match resolved.local_root() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{e}");
-            return 1;
+    // M2e Task 3：两种 hub 类型都走同一段 `status_lib` 判断（M2d 评审：
+    // 「arcad 是 M2 的主线，而主健康检查命令对主 hub 类型不工作」）。
+    // `file://` 仍先按已知身份 `StorageRoot::open` 一次（I11）；`http://`
+    // 的离线由 `TransportError::Offline`（503）表达，翻译成同一个退出码 2、
+    // 同一句措辞——拔盘演练脚本对三个命令做同一种断言，措辞分裂会让它要么
+    // 漏判要么各写一套规则。
+    let mut sink = NullSink;
+    let result = match &resolved.target {
+        HubTarget::Local(root_path) => {
+            let store_root = match StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
+                    return 2;
+                }
+            };
+            status_lib::status(&resolved.dataset_dir, &store_root, &mut sink)
         }
-    };
-    let store_root = match StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
-            return 2;
+        HubTarget::Http { base_url } => {
+            let transport = HttpTransport::new(base_url, &resolved.cfg.dataset_id, None);
+            status_lib::status_transport(&resolved.dataset_dir, &transport, &mut sink)
         }
     };
 
     let mut level: u8 = 0;
-    let mut sink = NullSink;
-    match status_lib::status(&resolved.dataset_dir, &store_root, &mut sink) {
+    match result {
         Ok(report) => {
             if report.is_silent() {
                 return level;
@@ -643,6 +649,18 @@ fn status_one(path: &str, root: Option<&Path>) -> u8 {
             }
             level = level.max(1);
             level
+        }
+        // I11：`http(s)://` hub 回 503（数据集离线）与本地存储根打不开是
+        // 同一严重性，走同一个退出码 2、同一句措辞。其它 `Transport` 失败
+        // （连不上、协议错）是命令本身的失败，退出码 1——与 `sync_one` 的
+        // `sync_error_exit_level` 完全一致的分类。
+        Err(status_lib::StatusError::Transport(TransportError::Offline { message })) => {
+            eprintln!("数据集 {path}（hub={}）离线：{message}", resolved.hub_name);
+            2
+        }
+        Err(e @ status_lib::StatusError::Transport(_)) => {
+            eprintln!("数据集 {path}（hub={}）：{e}", resolved.hub_name);
+            level.max(1)
         }
         Err(e) => {
             eprintln!("{e}");
@@ -759,9 +777,32 @@ fn status_all(root_override: Option<&Path>) -> ExitCode {
     ExitCode::from(worst)
 }
 
-/// `arca verify <path> [--root <path>]`（M1d Task 7）：fixity 巡检，复用
-/// `arca_store::fsck::check_path`。
-pub fn verify_cmd(path: &str, root: Option<&Path>) -> ExitCode {
+/// `arca verify <path> [--deep] [--root <path>]`（M1d Task 7；M2e Task 3
+/// 补 `http(s)://`）：fixity 巡检。
+///
+/// # 两种 hub 类型下"verify 到底验了什么"完全不同——这一条必须讲清楚
+///
+/// 「一个自称 verify 却只对了对元数据的命令，比没有更危险」（M2e Task 3
+/// brief 原话）。所以本命令**永远在 stderr 说明这次验了什么、没验什么**，
+/// 即便结果是干净的（这是对 Rule of Silence 的一处刻意收窄，与
+/// `sync_all` 的 `== path ==` 同一先例：当"成功"有多种强度时，沉默本身
+/// 就是歧义）。
+///
+/// | hub | 默认 | `--deep` |
+/// | --- | --- | --- |
+/// | `file://` | **全量 fixity**：逐文件重算 BLAKE3 与版本链比对（`arca_store::fsck`） | 同左（本地读取不经网络，默认就已经是最强的那档，没有可省的余地） |
+/// | `http(s)://` | **只验元数据一致性**：`GET .../state` 能读通、每条记录结构合法、本地基线与 hub 的哈希/大小声明一致。**不重算任何内容**——位腐、被外部改写的 `files/` 字节，这一档一个都发现不了 | **全量 fixity**：把每个路径的内容**整份拉下来**重算 BLAKE3，与 hub 声明的哈希比对 |
+///
+/// `http(s)://` 默认不做深度校验是一个明确的取舍而不是遗漏：一次深度巡检
+/// 要把整个数据集的字节从网络上拉一遍（个人照片库轻易上百 GB），把它设成
+/// 默认会让 `arca verify` 变成一条没人敢跑的命令，最终效果是根本没人巡检。
+/// 代价是默认这一档**验不出位腐**——所以它必须被说出来，而不是让用户从
+/// 一个安静的 exit 0 里自行推断。
+///
+/// 真正的 fixity 权威永远在 hub 那台机器上：在那里直接对存储根跑
+/// `arca fsck <存储根>` 比隔着网络拉全部字节便宜几个数量级，输出里也会这么
+/// 建议。
+pub fn verify_cmd(path: &str, deep: bool, root: Option<&Path>) -> ExitCode {
     let resolved = match dataset::resolve(&cwd(), path, root) {
         Ok(v) => v,
         Err(e) => {
@@ -770,45 +811,49 @@ pub fn verify_cmd(path: &str, root: Option<&Path>) -> ExitCode {
         }
     };
 
-    // M2c Task 5：`verify` 尚未 Transport 化——`http://` hub 报明确的
-    // "这条命令不支持"。
-    let root_path = match resolved.local_root() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::from(1);
+    match &resolved.target {
+        HubTarget::Local(root_path) => {
+            // I11：先按已知身份打开一次，确认挂载的是期望的那个数据集——
+            // `fsck::check_path` 本身不预设期望身份（诊断工具的设计，服务于
+            // 任意存储根路径），但 `verify` 是针对一个具体已登记数据集的巡检，
+            // 必须先做这道身份检查；否则挂错了别的空盘会被 `check_path`
+            // 老老实实巡检出"零个问题"，把"身份不明"误判成"库是空的、
+            // 一切正常"（I11）。
+            //
+            // M2d Task 5（拔盘演练）：诊断文案与 `status_one`/`sync_one` 统一
+            // 用"数据集 {path}（hub=...）离线：{e}"这个形状——拔盘演练脚本
+            // 需要对三个命令做同一种断言（都报"离线"、都点名哪个 hub），
+            // 措辞分裂会让演练脚本要么漏判、要么各写一套匹配规则。
+            if let Err(e) = StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
+                eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
+                return ExitCode::from(2);
+            }
+            verify_local(path, root_path)
         }
-    };
-
-    // I11：先按已知身份打开一次，确认挂载的是期望的那个数据集——
-    // `fsck::check_path` 本身不预设期望身份（诊断工具的设计，服务于任意
-    // 存储根路径），但 `verify` 是针对一个具体已登记数据集的巡检，必须先
-    // 做这道身份检查；否则挂错了别的空盘会被 `check_path` 老老实实巡检出
-    // "零个问题"，把"身份不明"误判成"库是空的、一切正常"（I11）。
-    //
-    // M2d Task 5（拔盘演练）：诊断文案与 `status_one`/`sync_one` 统一用
-    // "数据集 {path}（hub=...）离线：{e}" 这个形状——拔盘演练脚本需要对
-    // 三个命令做同一种断言（都报"离线"、都点名哪个 hub），措辞分裂会让
-    // 演练脚本要么漏判、要么各写一套匹配规则。
-    if let Err(e) = StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
-        eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
-        return ExitCode::from(2);
+        HubTarget::Http { base_url } => {
+            let transport = HttpTransport::new(base_url, &resolved.cfg.dataset_id, None);
+            verify_remote(path, &resolved, &transport, deep)
+        }
     }
+}
 
+/// `file://`：沿用 M1d 起的全量 fixity（`arca_store::fsck`）——`--deep`
+/// 对它是空操作，因为默认就已经是最强的那一档。
+fn verify_local(path: &str, root_path: &Path) -> ExitCode {
     match arca_store::fsck::check_path(root_path) {
         Ok(report) => {
+            eprintln!(
+                "已对 {path} 做**全量 fixity 巡检**：逐文件重算 BLAKE3 与版本链比对，\
+                 检查 {} 个文件、{} 个块。",
+                report.checked_files, report.checked_chunks
+            );
             if report.problems.is_empty() {
                 ExitCode::SUCCESS
             } else {
                 for problem in &report.problems {
                     eprintln!("{problem:?}");
                 }
-                eprintln!(
-                    "检查 {} 个文件、{} 个块，发现 {} 个问题",
-                    report.checked_files,
-                    report.checked_chunks,
-                    report.problems.len()
-                );
+                eprintln!("发现 {} 个问题", report.problems.len());
                 ExitCode::from(1)
             }
         }
@@ -816,6 +861,158 @@ pub fn verify_cmd(path: &str, root: Option<&Path>) -> ExitCode {
             eprintln!("{e}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// 一个把写入的字节直接喂给 BLAKE3、**不保留任何一份内容**的 `io::Write`
+/// ——`Transport::read_content_into` 要的是 `&mut dyn Write`，而
+/// `arca_chunk::hash::Hasher` 只有 `update`/`finish`，两者之间需要这一层。
+///
+/// 存在的意义是让深度巡检的内存占用与文件体积**完全无关**：`read_content`
+/// 那条路会把整份内容攒成 `Vec<u8>`，一个 2 GB 的视频就是 2 GB 常驻。
+struct HashingSink(arca_chunk::hash::Hasher);
+
+impl HashingSink {
+    fn new() -> Self {
+        HashingSink(arca_chunk::hash::ContentHash::hasher())
+    }
+    fn finish(self) -> arca_chunk::hash::ContentHash {
+        self.0.finish()
+    }
+}
+
+impl std::io::Write for HashingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `http(s)://`：默认只验元数据一致性，`--deep` 才拉内容重算——两档各自
+/// 验了什么、没验什么，见 [`verify_cmd`] 的表格。
+fn verify_remote(
+    path: &str,
+    resolved: &dataset::ResolvedDataset,
+    transport: &HttpTransport,
+    deep: bool,
+) -> ExitCode {
+    use arca_cli::transport::Transport;
+    use arca_core::state::RemoteState;
+
+    let remote = match transport.read_remote() {
+        Ok(r) => r,
+        Err(TransportError::Offline { message }) => {
+            // I11：与 file:// 侧逐字同一句措辞（拔盘演练脚本靠它做统一断言）。
+            eprintln!("数据集 {path}（hub={}）离线：{message}", resolved.hub_name);
+            return ExitCode::from(2);
+        }
+        Err(e) => {
+            eprintln!("数据集 {path}（hub={}）：{e}", resolved.hub_name);
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut problems: Vec<String> = Vec::new();
+    let mut present = 0usize;
+
+    // 第一档：元数据一致性——把 hub 声明的哈希/大小与**本地基线**记的那份
+    // 对照。这两份数据来自完全独立的两条通路（基线是上次同步时本地算出来
+    // 并落盘的，hub 的声明来自它自己的 index/items），不一致就意味着其中
+    // 一侧被改过。发现不了的是"两侧记录一致、但 hub 的 files/ 字节已经腐
+    // 烂"——那需要重算内容，是 `--deep` 那一档的事。
+    let baseline = match arca_cli::baseline::load(&resolved.dataset_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("读取本地基线失败，无法做元数据对照：{e}");
+            return ExitCode::from(1);
+        }
+    };
+    for (p, state) in &remote {
+        let RemoteState::Present { hash, size, .. } = state else {
+            continue;
+        };
+        present += 1;
+        if let arca_core::state::BaseState::Present {
+            hash: base_hash,
+            size: base_size,
+            ..
+        } = baseline.get(p)
+        {
+            if base_hash != *hash {
+                problems.push(format!(
+                    "{p}：hub 声明的哈希 {} 与本地基线记录的 {} 不一致",
+                    hash.to_text(),
+                    base_hash.to_text()
+                ));
+            } else if base_size != *size {
+                problems.push(format!(
+                    "{p}：hub 声明的大小 {size} 与本地基线记录的 {base_size} 不一致"
+                ));
+            }
+        }
+    }
+
+    // 第二档（`--deep`）：整份拉下来重算 BLAKE3 与 hub 声明的哈希比对——
+    // 这一档才真的能发现位腐。
+    let mut deep_checked = 0usize;
+    let mut deep_bytes = 0u64;
+    if deep {
+        for (p, state) in &remote {
+            let RemoteState::Present { hash, .. } = state else {
+                continue;
+            };
+            // 流式读：不把整份内容攒在内存里（`read_content_into` 的存在
+            // 理由，见 `transport/mod.rs` 缺口第 1 条）；哈希是增量算的，
+            // 内存占用与文件体积无关——一次深度巡检可能要过几百 GB，
+            // 这一点不是优化而是可行性前提。
+            let mut sink = HashingSink::new();
+            match transport.read_content_into(p, &mut sink) {
+                Ok(n) => {
+                    deep_checked += 1;
+                    deep_bytes += n;
+                    let actual = sink.finish();
+                    if actual != *hash {
+                        problems.push(format!(
+                            "{p}：hub 上的内容重算得到 {}，与它自己声明的 {} 不一致\
+                             （位腐或被外部改写）",
+                            actual.to_text(),
+                            hash.to_text()
+                        ));
+                    }
+                }
+                Err(e) => problems.push(format!("{p}：拉取内容失败，无法校验：{e}")),
+            }
+        }
+    }
+
+    // 无论干净与否都说明这次验了什么、没验什么（见 `verify_cmd` 文档）。
+    if deep {
+        eprintln!(
+            "已对 {path} 做**深度 fixity 巡检**（--deep）：拉取并重算了 {deep_checked} 个\
+             文件、共 {deep_bytes} 字节的 BLAKE3，与 hub 声明的哈希逐一比对。"
+        );
+    } else {
+        eprintln!(
+            "已对 {path} 做**元数据一致性检查**（默认档）：hub 报告 {present} 个存活路径，\
+             逐条与本地基线记录的哈希/大小对照。\
+             **这一档不重算任何内容字节**——hub 上的位腐、被外部工具改写过的 \
+             files/ 内容，它一个都发现不了。要真正验内容：加 `--deep`（会把整个\
+             数据集的字节从网络上拉一遍），或者更省事的办法——在 hub 那台机器上\
+             直接对存储根运行 `arca fsck <存储根>`。"
+        );
+    }
+
+    if problems.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        for p in &problems {
+            eprintln!("{p}");
+        }
+        eprintln!("发现 {} 个问题", problems.len());
+        ExitCode::from(1)
     }
 }
 
@@ -854,6 +1051,7 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
                 possible_lost_server_role,
                 local_trash_usage,
                 local_trash_issues,
+                hub_trash_scan_skipped,
             } => {
                 if !local_only.is_empty() {
                     eprintln!();
@@ -885,6 +1083,16 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
                 // 文件，不能只笼统报"删除/restore --list 已失效"。
                 for issue in trash_issues {
                     eprintln!("数据集 {path} 的 .arca/trash/ 记录损坏：{issue}");
+                }
+                // M2e Task 3：I5——"没查"绝不能被呈现成"查过了没问题"。
+                if *hub_trash_scan_skipped {
+                    eprintln!(
+                        "数据集 {path}：hub 侧回收站（.arca/trash/）的逐条巡检**未执行**\
+                         ——这个数据集绑定的是 http(s):// hub，而协议里没有「枚举回收站\
+                         全部记录」这个端点（PROTOCOL.md §1.2）。这不代表那边没问题，\
+                         只代表这次没查；要巡检它请在 hub 那台机器上直接对存储根运行\
+                         `arca fsck <存储根>`。"
+                    );
                 }
                 // 评审 Minor #1：本地回收站非空但角色声明缺失——大概率是
                 // `role.toml` 意外丢失，而不是用户主动把 server 降级成

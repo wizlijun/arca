@@ -43,7 +43,7 @@ use arca_format::manifest::Manifest;
 use arca_format::trace::NullSink;
 use arca_git::repo::Repo;
 use arca_git::tracking::{self, Issue};
-use arca_store::root::{MountError, StorageRoot};
+use arca_store::root::StorageRoot;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -174,12 +174,27 @@ pub enum DatasetHealth {
         /// 懂的 `.meta` 会让 `arca restore --local`/`arca gc --local` 对整个
         /// 数据集失效，必须点名具体文件。这一项**参与** `is_clean`。
         local_trash_issues: Vec<trash::TrashIssue>,
+        /// M2e Task 3：hub 侧回收站（`.arca/trash/`）的巡检**没有跑**。
+        /// `http(s)://` hub 下恒为真——`PROTOCOL.md` §1.2 没有"枚举回收站
+        /// 全部记录并逐条校验"这个端点（`GET .../trash/{item_id}` 只回答
+        /// 单个 item 是否可取回，是删除闸门用的，不是巡检面）。
+        ///
+        /// 单开一个字段而不是让 `trash_issues` 空着蒙混过去：空列表的意思
+        /// 是"查过了，没问题"，跳过的意思是"没查"——把后者呈现成前者正是
+        /// I5 禁止的那种静默降级（`DatasetHealth::Offline` 与
+        /// `Checked{local_only: vec![]}` 必须分开，是同一条道理）。
+        hub_trash_scan_skipped: bool,
     },
-    /// 存储根打不开（I11：未挂载或卷身份不符）——数据集离线。**绝不能因此
-    /// 假装"本地没有未同步文件"**：那本该是 `local_only` 检查要回答的问题，
-    /// 离线状态下这项检查根本没跑，必须与 `Checked{local_only: vec![]}`
-    /// 明确区分，不能静默退化成后者（I5、I11）。
-    Offline { path: String, reason: MountError },
+    /// 存储根打不开（I11：未挂载或卷身份不符），或 `http(s)://` hub 明确
+    /// 回答"数据集离线"（503，`TransportError::Offline`）——数据集离线。
+    /// **绝不能因此假装"本地没有未同步文件"**：那本该是 `local_only` 检查
+    /// 要回答的问题，离线状态下这项检查根本没跑，必须与
+    /// `Checked{local_only: vec![]}` 明确区分，不能静默退化成后者（I5、I11）。
+    ///
+    /// `reason` 从 `MountError` 放宽成 `String`（M2e Task 3）：离线现在有
+    /// 两个来源（本地挂载失败 / 远端 503），它们没有共同的结构化类型，而
+    /// 这个字段的唯一消费者是命令壳的一行 stderr 输出。
+    Offline { path: String, reason: String },
     /// 扫描本地或读远端失败——真正的 IO/格式故障，与"检出了问题"是不同
     /// 性质的结果。
     CheckFailed { path: String, reason: String },
@@ -266,57 +281,132 @@ pub fn doctor(repo: &Repo, registry: &Registry, root_override: Option<&Path>) ->
             }
         };
 
-        // M2c Task 5：`doctor` 尚未 Transport 化——`http://` hub 报同一套
-        // `ResolveFailed`（`local_root()` 的 `LocalOnlyCommand` 错误信息
-        // 已经讲清楚原因），不是本切片的范围（见 `dataset::ResolvedDataset::local_root`
-        // 文档）。
-        let root_path = match resolved.local_root() {
-            Ok(p) => p,
-            Err(e) => {
-                datasets.push(DatasetHealth::ResolveFailed {
-                    path: resolved.normalized_path.clone(),
-                    reason: e.to_string(),
+        // M2e Task 3：两种 hub 类型走同一套巡检——差别只在"远端状态从哪里
+        // 读"与"hub 侧回收站能不能巡检"这两点上（见 `RemoteSource`）。
+        // M2d 评审原话：「arcad 是 M2 的主线，而主健康检查命令对主 hub
+        // 类型不工作」。
+        let source = match remote_source(&resolved) {
+            Ok(s) => s,
+            Err(reason) => {
+                datasets.push(DatasetHealth::Offline {
+                    path: resolved.normalized_path,
+                    reason,
                 });
                 continue;
             }
         };
+
         let mut sink = NullSink;
-        match StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
-            Ok(store_root) => {
-                let health = match check_dataset(
-                    repo,
-                    &resolved.normalized_path,
-                    &resolved.dataset_dir,
-                    &store_root,
-                    &mut sink,
-                ) {
-                    Ok(details) => DatasetHealth::Checked {
-                        path: resolved.normalized_path,
-                        local_only: details.local_only,
-                        ignore_issues: details.ignore_issues,
-                        manifest_issue: details.manifest_issue,
-                        trash_issues: details.trash_issues,
-                        possible_lost_server_role: details.possible_lost_server_role,
-                        local_trash_usage: details.local_trash_usage,
-                        local_trash_issues: details.local_trash_issues,
-                    },
-                    Err(reason) => DatasetHealth::CheckFailed {
-                        path: resolved.normalized_path,
-                        reason,
-                    },
-                };
-                datasets.push(health);
-            }
-            Err(e) => datasets.push(DatasetHealth::Offline {
+        let health = match check_dataset(
+            repo,
+            &resolved.normalized_path,
+            &resolved.dataset_dir,
+            &source,
+            &mut sink,
+        ) {
+            Ok(details) => DatasetHealth::Checked {
                 path: resolved.normalized_path,
-                reason: e,
-            }),
-        }
+                local_only: details.local_only,
+                ignore_issues: details.ignore_issues,
+                manifest_issue: details.manifest_issue,
+                trash_issues: details.trash_issues,
+                possible_lost_server_role: details.possible_lost_server_role,
+                local_trash_usage: details.local_trash_usage,
+                local_trash_issues: details.local_trash_issues,
+                hub_trash_scan_skipped: source.hub_trash_scan_skipped(),
+            },
+            Err(CheckFailure::Offline(reason)) => DatasetHealth::Offline {
+                path: resolved.normalized_path,
+                reason,
+            },
+            Err(CheckFailure::Failed(reason)) => DatasetHealth::CheckFailed {
+                path: resolved.normalized_path,
+                reason,
+            },
+        };
+        datasets.push(health);
     }
 
     DoctorReport {
         vault_issues,
         datasets,
+    }
+}
+
+/// doctor 需要向 hub 问的两件事的来源——`file://` 与 `http(s)://` 的唯一
+/// 差别就在这里（M2e Task 3）。
+///
+/// 刻意不做成 `Box<dyn Transport>` 一把梭：本地这一侧 doctor 除了
+/// `read_remote` 还要跑 `trash::scan_issues`（**逐条**巡检回收站记录，
+/// 遇损坏不整体放弃），而 `Transport` trait 上没有、也不该有这个方法——
+/// 它是磁盘级的诊断面，不是客户端与 hub 的协议面（`PROTOCOL.md` §1.2 里
+/// 没有对应端点）。硬塞进 trait 会逼着 `http.rs` 实现一个只能返回"没查过"
+/// 的方法，把"没查"伪装成"查过了没问题"。
+enum RemoteSource {
+    Local(StorageRoot),
+    Http(crate::transport::http::HttpTransport),
+}
+
+/// [`check_dataset`] 内部的失败分流——`Offline` 必须一路传到
+/// [`DatasetHealth::Offline`]，不能被折进 `CheckFailed`：前者是 I11 的
+/// "身份不明/离线"（命令壳退出码 2），后者是"巡检本身出错"（退出码 1），
+/// 两者的处置完全不同。
+enum CheckFailure {
+    Offline(String),
+    Failed(String),
+}
+
+/// 建立远端来源。`Err` 一律是 **I11 意义上的离线**（本地存储根未挂载/身份
+/// 不符）——`http(s)://` 这一侧建立 `HttpTransport` 只是构造一个客户端，不
+/// 发任何请求，因此永远成功；它的离线要等到真的 `read_remote()` 收到 503
+/// 才知道（见 `RemoteSource::read_remote`）。
+fn remote_source(resolved: &dataset::ResolvedDataset) -> Result<RemoteSource, String> {
+    match &resolved.target {
+        dataset::HubTarget::Local(root_path) => {
+            // I11：先按已知身份打开一次，身份不符/未挂载即离线。
+            StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id))
+                .map(RemoteSource::Local)
+                .map_err(|e| e.to_string())
+        }
+        dataset::HubTarget::Http { base_url } => Ok(RemoteSource::Http(
+            // doctor 是一次性巡检，不携带 sid（它不产生 journal 事件，
+            // sid 闭环对它没有意义）。
+            crate::transport::http::HttpTransport::new(base_url, &resolved.cfg.dataset_id, None),
+        )),
+    }
+}
+
+impl RemoteSource {
+    fn read_remote(&self) -> Result<BTreeMap<String, arca_core::state::RemoteState>, CheckFailure> {
+        match self {
+            RemoteSource::Local(root) => {
+                hub::read_remote(root).map_err(|e| CheckFailure::Failed(e.to_string()))
+            }
+            RemoteSource::Http(t) => {
+                use crate::transport::{Transport, TransportError};
+                t.read_remote().map_err(|e| match e {
+                    // I11：503 是"数据集离线"，绝不能当成"库是空的"，也不能
+                    // 折成一句普通的巡检失败。
+                    TransportError::Offline { .. } => CheckFailure::Offline(e.to_string()),
+                    other => CheckFailure::Failed(other.to_string()),
+                })
+            }
+        }
+    }
+
+    /// hub 侧回收站的逐条巡检——只有本地存储根能做，见 [`RemoteSource`]
+    /// 的文档与 [`DatasetHealth::Checked::hub_trash_scan_skipped`]。
+    fn scan_hub_trash(&self) -> Result<Vec<trash::TrashIssue>, CheckFailure> {
+        match self {
+            RemoteSource::Local(root) => {
+                trash::scan_issues(root).map_err(|e| CheckFailure::Failed(e.to_string()))
+            }
+            RemoteSource::Http(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn hub_trash_scan_skipped(&self) -> bool {
+        matches!(self, RemoteSource::Http(_))
     }
 }
 
@@ -338,11 +428,12 @@ fn check_dataset(
     repo: &Repo,
     normalized_path: &str,
     dataset_dir: &Path,
-    store_root: &StorageRoot,
+    source: &RemoteSource,
     sink: &mut dyn arca_format::trace::TraceSink,
-) -> Result<CheckedDetails, String> {
-    let scan_result = scan::scan_dataset(dataset_dir, sink).map_err(|e| e.to_string())?;
-    let remote = hub::read_remote(store_root).map_err(|e| e.to_string())?;
+) -> Result<CheckedDetails, CheckFailure> {
+    let scan_result =
+        scan::scan_dataset(dataset_dir, sink).map_err(|e| CheckFailure::Failed(e.to_string()))?;
+    let remote = source.read_remote()?;
     let local_only = scan_result
         .files
         .keys()
@@ -350,11 +441,12 @@ fn check_dataset(
         .cloned()
         .collect();
 
-    let ignore_issues = check_ignore_block(repo, normalized_path)?;
-    let manifest_issue = check_manifest(dataset_dir)?;
-    let trash_issues = trash::scan_issues(store_root).map_err(|e| e.to_string())?;
+    let ignore_issues = check_ignore_block(repo, normalized_path).map_err(CheckFailure::Failed)?;
+    let manifest_issue = check_manifest(dataset_dir).map_err(CheckFailure::Failed)?;
+    let trash_issues = source.scan_hub_trash()?;
     let possible_lost_server_role = check_lost_server_role(dataset_dir);
-    let (local_trash_usage, local_trash_issues) = check_local_trash(dataset_dir)?;
+    let (local_trash_usage, local_trash_issues) =
+        check_local_trash(dataset_dir).map_err(CheckFailure::Failed)?;
 
     Ok(CheckedDetails {
         local_only,
