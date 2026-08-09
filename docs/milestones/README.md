@@ -23,8 +23,15 @@
 | [M3a agentd 自动同步](M3a-agentd自动同步.md) | 单实例锁 · 每数据集独立回路与退避 · **`Transport::changes`（/changes 的第一个客户端消费者）** · 增量游标 · **agentd 崩溃演练** | 5 | ✅ |
 | [M3b 本地 watcher](M3b-本地watcher.md) | 实时事件 → 去抖 → **溢出即全扫** · 四路唤醒 · 监听不可用即降级 · agentd 心跳与 `arca status` 可见性 | 3 | ✅ |
 | [M3c 分级驻留策略](M3c-分级驻留策略.md) | `Intent` 三态 · 8 MiB 阈值/pin/热度 · 水化队列（合并·限流·拒绝） · `Provider` 边界与全量物化 · **§6.3 第 7 条必过测试** | 3 | ✅ |
+| [M5a 发布映射](M5a-发布映射.md) | `arca publish-map` · md 引用提取 · **默认只发布被引用的资源** · **生成映射时一个 blob 都不读** | 3 | ✅ |
 
 后续切片见 [M1a 文档末尾的拆分表](M1a-存储根IO地基.md#m1-的其余切片)。
+
+**M3d（`arca-winfs` CfAPI）与 M4（`arca-macfs` File Provider）需要各自的目标平台
+环境才能推进**——前者是 Windows-only 的 unsafe FFI、也是全项目唯一的 unsafe 边界，
+后者是 Swift 工程且不在 cargo workspace 内。在其它平台上可以写出代码，但无法编译、
+运行、证明它对，而本项目一贯的验收标准是实机攻击而不是读代码。详见
+[M3a 归档末尾](M3a-agentd自动同步.md#m3d-的环境依赖如实记录)。
 
 ## 阅读顺序建议
 
