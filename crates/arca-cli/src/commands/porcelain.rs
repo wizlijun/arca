@@ -28,6 +28,7 @@ use arca_cli::adopt::{self, AdoptOptions};
 use arca_cli::clock;
 use arca_cli::dataset::{self, HubTarget};
 use arca_cli::doctor;
+use arca_cli::gc;
 use arca_cli::init::{self, HookOutcome};
 use arca_cli::local_trash;
 use arca_cli::register::{self, RegisterOptions};
@@ -184,8 +185,10 @@ pub fn role_cmd(path: &str, set: Option<&str>, root: Option<&Path>) -> ExitCode 
                         eprintln!(
                             "{path} 已设为 server 角色：本设备承诺为这个数据集永久保留一份完整\
                              副本——远端删除到达、过闸门之后，本地副本只会移入本地回收站\
-                             （.arca/client/trash/），不释放空间，物理销毁只经未来的显式清理\
-                             命令（本版本尚未提供）。"
+                             （.arca/client/trash/），不释放空间。物理销毁只经显式的\
+                             `arca gc {path} --local --yes`（默认只出清单，绝不自动触发，I3）；\
+                             要找回用 `arca restore {path} <文件> --local`，要查看占用用\
+                             `arca doctor`。"
                         );
                     }
                     ExitCode::SUCCESS
@@ -1081,6 +1084,198 @@ pub fn restore_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
             eprintln!("{e}");
             ExitCode::from(1)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `arca gc`（M2e Task 2，spec §7、I3）
+// ---------------------------------------------------------------------------
+
+/// `arca gc <dataset> [--local] [--dry-run] [--yes] [--include-unexpired]
+/// [--retention-days N] [--root <path>]`
+///
+/// **本项目第一个被授权物理销毁数据的命令。** 纪律与判断全部在
+/// [`arca_cli::gc`]，这里只负责"把参数翻译成 [`gc::GcOptions`]、把
+/// [`gc::GcReport`] 呈现给人"，命令壳里**没有任何一处**自己决定要不要删。
+///
+/// # 退出码
+///
+/// - `0`：本次没有任何需要人处理的东西（dry-run 出了清单也算 0——预览不是
+///   问题，用户就是来看清单的）。
+/// - `1`：有 blocker（gc 停手了，什么都没销毁），或参数组合本身不合法。
+/// - `2`：数据集离线（I11），与 `status`/`verify`/`sync` 同一信号。
+pub fn gc_cmd(
+    dataset_path: &str,
+    local: bool,
+    yes: bool,
+    include_unexpired: bool,
+    retention_days: Option<i64>,
+    root: Option<&Path>,
+) -> ExitCode {
+    let resolved = match dataset::resolve(&cwd(), dataset_path, root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let retention = retention_days.unwrap_or(trash::DEFAULT_RETENTION_DAYS);
+    if retention < 0 {
+        eprintln!("--retention-days 不接受负数（实得 {retention}）");
+        return ExitCode::from(1);
+    }
+    let opts = gc::GcOptions {
+        now: clock::now_rfc3339(),
+        retention_days: retention,
+        confirmed: yes,
+        include_unexpired,
+    };
+
+    // 最响的那条提示，放在最前面：这个组合会销毁**还在保留期内**的内容。
+    if include_unexpired && yes {
+        eprintln!(
+            "！！！--include-unexpired 已生效：本次会连**仍在保留期内**的回收站条目一起\
+             物理销毁。保留期（{retention} 天）存在的意义就是给「删错了」留一段可以反悔的\
+             时间，越过它之后这些内容在本地就**再也找不回来**了（除非另一台设备或备份里\
+             还有）。如果你只是想清掉过期的东西，去掉这个开关重跑。"
+        );
+    }
+
+    let report = if local {
+        gc::local(&resolved.dataset_dir, &opts)
+    } else {
+        let root_path = match resolved.local_root() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "{e}\n（`arca gc` 的 hub 侧回收站清理必须直接操作存储根文件系统，\
+                     没有对应的 HTTP 端点——请在 hub 那台机器上运行，或改用 `--local` \
+                     清理本机工作区侧的回收站）"
+                );
+                return ExitCode::from(1);
+            }
+        };
+        // I11：销毁是最重的写操作，绝不能在身份不明的挂载点上执行。
+        let store_root = match StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "数据集 {dataset_path}（hub={}）离线：{e}",
+                    resolved.hub_name
+                );
+                return ExitCode::from(2);
+            }
+        };
+        gc::hub(&store_root, &opts)
+    };
+
+    let report = match report {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    print_gc_report(dataset_path, local, &report, &opts)
+}
+
+/// 呈现一次 [`gc::GcReport`]。
+///
+/// 清单走 **stdout**（这是用户明确请求的数据，可脚本消费：
+/// `gc-plan`/`gc-destroyed` 两种 tag + trash_id + 路径 + 字节数 + 删除时刻）；
+/// 解释性文字与警告走 stderr。dry-run 与真跑打的是**同一份清单**，只有 tag
+/// 不同——见 `gc` 模块顶部纪律 3。
+fn print_gc_report(
+    dataset_path: &str,
+    local: bool,
+    report: &gc::GcReport,
+    opts: &gc::GcOptions,
+) -> ExitCode {
+    let 侧 = if local {
+        "本地回收站（.arca/client/trash/）"
+    } else {
+        "hub 回收站（.arca/trash/）"
+    };
+
+    // 1. blocker 优先——它决定了这次什么都不会被销毁（I5）。
+    if !report.blockers.is_empty() {
+        for blocker in &report.blockers {
+            eprintln!("{blocker}");
+        }
+        eprintln!(
+            "`arca gc {dataset_path}` 已停止：{侧} 里有 {} 处无法解释的状态，\
+             本次**一个字节都没有销毁**（包括那些本身健康、已经过期的条目）。\
+             gc 只销毁它能完整解释的东西——先处理以上问题再重跑。",
+            report.blockers.len()
+        );
+        // 清单仍然打出来，让用户知道修好之后能回收多少。
+        print_gc_candidates(report, false);
+        return ExitCode::from(1);
+    }
+
+    if report.executed {
+        print_gc_candidates(report, true);
+        eprintln!(
+            "已从 {侧} 物理销毁 {} 条已过保留期的记录，回收 {} 字节。\
+             这些内容**已经不可恢复**。",
+            report.destroyed.len(),
+            report.freed_bytes()
+        );
+    } else {
+        print_gc_candidates(report, false);
+        if report.candidates.is_empty() {
+            // Rule of Silence：没有任何可清理的东西就安静。
+            if report.retained.is_empty() {
+                return ExitCode::SUCCESS;
+            }
+            eprintln!(
+                "{侧} 里的 {} 条记录全部仍在保留期内（{} 天），没有可清理的条目——\
+                 本次什么都没做。",
+                report.retained.len(),
+                opts.retention_days
+            );
+        } else {
+            eprintln!(
+                "以上是 **dry-run** 清单：{} 条已过保留期的记录、共 {} 字节，\
+                 本次**没有销毁任何东西**。确认无误后加 `--yes` 重跑才会真的销毁。",
+                report.candidates.len(),
+                report.reclaimable_bytes()
+            );
+        }
+        if !report.retained.is_empty() {
+            eprintln!(
+                "另有 {} 条仍在保留期内（{} 天），**即使加 `--yes` 也不会被销毁**。",
+                report.retained.len(),
+                opts.retention_days
+            );
+        }
+    }
+
+    if report.chunks_untouched > 0 {
+        eprintln!(
+            "注意：`.arca/chunks/` 下有 {} 个块，本版本**一个都不会回收**——\
+             块级引用模型（每个版本用了哪些块）在写入侧还不存在，凭现有信息判断\
+             「哪个块失引用」必然出错，因此这里选择不猜（I5）。",
+            report.chunks_untouched
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// 逐条打印清单到 stdout。`destroyed` 为真时打的是"已销毁"的那份。
+fn print_gc_candidates(report: &gc::GcReport, destroyed: bool) {
+    let (tag, list) = if destroyed {
+        ("gc-destroyed", &report.destroyed)
+    } else {
+        ("gc-plan", &report.candidates)
+    };
+    for c in list {
+        println!(
+            "{tag}\t{}\t{}\t{}\t{}",
+            c.trash_id, c.path, c.bytes, c.deleted_at
+        );
     }
 }
 

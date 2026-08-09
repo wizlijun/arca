@@ -138,6 +138,39 @@ enum Command {
         #[arg(long)]
         root: Option<std::path::PathBuf>,
     },
+    /// 物理销毁已过保留期的回收站条目（spec §7、I3）——arca 里唯一一条会
+    /// 真的删掉你的字节的命令。默认是 dry-run：只出清单，什么都不销毁；
+    /// 只有显式加 --yes 才会动手。绝不会被任何东西自动触发：cron 里写
+    /// `arca gc` 是你自己的决定
+    Gc {
+        /// 数据集路径，相对 vault 根
+        dataset: String,
+        /// 清理**本机工作区侧**的本地回收站（<dataset>/.arca/client/trash/，
+        /// server 角色下远端删除过闸门后本地副本的落点），而不是默认的
+        /// hub 侧回收站（<存储根>/.arca/trash/）。纯本地操作，hub 离线也能跑
+        #[arg(long)]
+        local: bool,
+        /// 显式承认默认行为（只出清单不销毁）。不给这个开关行为也一样——
+        /// 它存在是为了让脚本能把"我确实只想预览"写出来
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// 真的物理销毁清单里的条目。没有这个开关时一个字节都不会被删
+        #[arg(long)]
+        yes: bool,
+        /// 连**仍在保留期内**的条目也一起销毁。保留期存在的意义就是给
+        /// "删错了"留一段可以反悔的时间；越过它之后这些内容在本机就再也
+        /// 找不回来了（除非另一台设备或备份里还有）。必须与 --yes 同时
+        /// 给出才有效，单独给它不会销毁任何东西
+        #[arg(long = "include-unexpired")]
+        include_unexpired: bool,
+        /// 保留期天数，默认 180（spec §7）。调小它会让更多条目变成销毁
+        /// 候选——同样只在 --yes 下才真的销毁
+        #[arg(long = "retention-days")]
+        retention_days: Option<i64>,
+        /// 覆盖从 .gitarca 解析出的存储根路径
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
     /// plumbing：hub 侧当前清单（--json 输出，格式见 PROTOCOL.md §5）
     Ls {
         /// 数据集路径，相对 vault 根
@@ -276,6 +309,34 @@ fn main() -> std::process::ExitCode {
                 }
             },
         },
+        Command::Gc {
+            dataset,
+            local,
+            dry_run,
+            yes,
+            include_unexpired,
+            retention_days,
+            root,
+        } => {
+            // `--dry-run` 与 `--yes` 同时给出是矛盾的意图——绝不"取其一"
+            // 继续（I5）：这是一条会销毁数据的命令，任何一点关于用户到底
+            // 想要什么的猜测都不可接受。
+            if dry_run && yes {
+                eprintln!(
+                    "`--dry-run` 与 `--yes` 不能同时给出：前者是「只看不动」，后者是\
+                     「真的销毁」，两者矛盾。已停止，什么都没做。"
+                );
+                return std::process::ExitCode::from(1);
+            }
+            commands::porcelain::gc_cmd(
+                &dataset,
+                local,
+                yes,
+                include_unexpired,
+                retention_days,
+                root.as_deref(),
+            )
+        }
         Command::Ls {
             path,
             root,

@@ -24,6 +24,7 @@ pub mod clock;
 pub mod dataset;
 pub mod doctor;
 pub mod gates;
+pub mod gc;
 pub mod hub;
 pub mod ids;
 pub mod init;
