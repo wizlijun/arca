@@ -18,6 +18,7 @@
 | [M2a tombstone 与删除安全地基](M2a-tombstone与删除安全地基.md) | 下载 fsync · hub journal · tombstone · **删除传播四道闸门** · restore | 12 | ✅ |
 | [M2b arcad 与 HTTP CAS](M2b-arcad与HTTP-CAS.md) | Transport 抽象 · PROTOCOL §1.2 定稿 · arcad 服务端 · CAS 写入 · arca.lock | 4 | ✅ |
 | [M2c journal 与 longpoll](M2c-journal与longpoll.md) | Transport 补四缺口 · /changes 游标 · longpoll · sid 闭环 · **HttpTransport 与两机端到端** | 9 | ✅ |
+| [M2d 角色与拔盘演练](M2d-角色与拔盘演练.md) | server/client 副本角色 · 多 hub 独立故障域 · 副本数告警 · **带反面夹具的拔盘演练** | 6 | ✅ |
 
 后续切片见 [M1a 文档末尾的拆分表](M1a-存储根IO地基.md#m1-的其余切片)。
 
