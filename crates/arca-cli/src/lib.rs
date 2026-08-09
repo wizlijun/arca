@@ -27,6 +27,7 @@ pub mod gates;
 pub mod gc;
 pub mod hub;
 pub mod ids;
+pub mod import_lfs;
 pub mod init;
 pub mod journal;
 pub mod local_trash;

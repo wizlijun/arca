@@ -187,6 +187,11 @@ enum Command {
     /// 路径与 arca 自己的诊断结论，绝不读取任何受管文件的内容**；输出直接
     /// 打到 stdout，不落盘、不上传——你在按回车之前就能把收了什么看个遍
     Bugreport,
+    /// 从既有仓库迁入（spec §8）
+    Import {
+        #[command(subcommand)]
+        action: ImportCommand,
+    },
     /// 产出站点生成器消费的 publish-map.json（spec §4.9）。**只产出映射，
     /// 绝不改写 vault 里的 md**；映射完全由清单构造，**一个 blob 都不读**——
     /// CI 可以在不下载任何二进制的前提下构建出图片可访问的静态站
@@ -241,6 +246,21 @@ enum Command {
     State {
         #[command(subcommand)]
         action: StateCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportCommand {
+    /// 把 Git LFS 指针文件换回真实内容（spec §8）。**默认只出清单**——
+    /// 这条命令会就地改写用户的文件，看清楚了再加 --yes。校验通过之前
+    /// 一个字节都不写：LFS 的 oid 就是内容的 SHA-256，对不上就跳过并说明，
+    /// 指针原封不动
+    Lfs {
+        /// 仓库路径，缺省为当前目录
+        path: Option<String>,
+        /// 真的改写文件。不给这个开关时只出清单
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -391,6 +411,11 @@ fn main() -> std::process::ExitCode {
                 root.as_deref(),
             )
         }
+        Command::Import { action } => match action {
+            ImportCommand::Lfs { path, yes } => {
+                commands::porcelain::import_lfs_cmd(path.as_deref(), yes)
+            }
+        },
         Command::PublishMap { all, out } => {
             commands::porcelain::publish_map_cmd(all, out.as_deref())
         }

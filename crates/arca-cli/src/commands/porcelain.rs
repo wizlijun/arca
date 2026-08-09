@@ -1568,6 +1568,88 @@ pub fn restore_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
+// `arca import lfs`（M5c，spec §8）
+// ---------------------------------------------------------------------------
+
+/// `arca import lfs [<路径>] [--yes]`——把既有 LFS 仓库里的指针文件换回真实内容。
+///
+/// # 默认是 dry-run
+///
+/// 与 `arca gc` 同一条纪律：这条命令会**就地改写用户的文件**，所以默认只出
+/// 清单。看清楚了再加 `--yes`。
+///
+/// # 校验通过之前一个字节都不写
+///
+/// LFS 的 `oid` 就是内容的 SHA-256——「厂商提供的校验和」（spec §8）。
+/// 对不上就跳过并把原因写进报告，**指针原封不动**：覆盖它会同时毁掉指针
+/// （oid 是找回原内容的唯一线索）并留下一份看起来迁移成功的错误文件。
+///
+/// # 退出码
+///
+/// 有任何文件被跳过 → 非 0。「一半迁成功了」不该看起来像全成功。
+pub fn import_lfs_cmd(path: Option<&str>, yes: bool) -> ExitCode {
+    let root = match path {
+        Some(p) => cwd().join(p),
+        None => cwd(),
+    };
+    // 仓库根用 git 自己的说法，不猜——`.git` 也可能是 worktree 的一个文件。
+    let repo = match arca_git::repo::Repo::open(&root) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "{}：不是一个 git 仓库（{e}）——LFS 迁入要在仓库里跑",
+                root.display()
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let git_dir = repo.root().join(".git");
+
+    let report = arca_cli::import_lfs::import(repo.root(), &git_dir, yes);
+    if report.files.is_empty() {
+        eprintln!("没有找到任何 LFS 指针文件——这个仓库大概本来就没在用 Git LFS。");
+        return ExitCode::SUCCESS;
+    }
+
+    // 数据走 stdout（可脚本消费），诊断走 stderr。
+    for (path, outcome) in &report.files {
+        match outcome {
+            arca_cli::import_lfs::Outcome::Migrated { size } => {
+                println!("lfs-migrated	{path}	{size}")
+            }
+            arca_cli::import_lfs::Outcome::Ready { size } => {
+                println!("lfs-ready	{path}	{size}")
+            }
+            arca_cli::import_lfs::Outcome::Skipped(reason) => {
+                println!("lfs-skipped	{path}");
+                eprintln!("{path}：{reason}");
+            }
+        }
+    }
+
+    if yes {
+        eprintln!(
+            "迁入完成：{} 个文件已换成真实内容，{} 个被跳过。\
+             接下来用 `arca adopt <数据集>` 把它们纳管进 arca。",
+            report.migrated(),
+            report.skipped()
+        );
+    } else {
+        eprintln!(
+            "以上是 **dry-run** 清单：{} 个可迁入、{} 个被跳过，本次**没有改动任何文件**。\
+             确认无误后加 `--yes` 重跑。",
+            report.ready(),
+            report.skipped()
+        );
+    }
+    if report.skipped() > 0 {
+        // 「一半迁成功了」不该看起来像全成功。
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // `arca publish-map`（M5a，spec §4.9）
 // ---------------------------------------------------------------------------
 
