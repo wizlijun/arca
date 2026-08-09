@@ -144,6 +144,20 @@ pub enum DatasetHealth {
         /// 数据集的删除与 `restore --list` 永久失效，且不指出到底是哪一条
         /// 坏的——这里用 `trash::scan_issues` 逐条累积，点名具体的文件。
         trash_issues: Vec<trash::TrashIssue>,
+        /// 评审 Minor #1：`<dataset>/.arca/client/trash/` 非空、但
+        /// `<dataset>/.arca/client/role.toml` 缺失——`role::read` 把文件缺失
+        /// 吸收成默认角色 `client`（这本身是正确设计，见 `role.rs` 模块顶部
+        /// 「与 baseline 刻意不同的错误处理策略」），但 `trash/` 目录本身就是
+        /// "这台设备曾经把这个数据集声明为 server"的物证——`server` 角色的
+        /// `DeleteLocal` 才会往这里放东西（见 `sync.rs` 的
+        /// `execute_delete_local`），`client` 角色从不写入这个目录。二者同时
+        /// 出现，说明 `role.toml` 大概率是意外丢失（磁盘故障、误删、
+        /// `.arca/client/` 整个投影被当成"可丢弃"清空——它其实不是，见
+        /// `role.rs`），而不是用户主动降级；`doctor` 完全不认识角色，此前没
+        /// 有任何代码路径检测这种不一致。不是数据丢失（hub 侧 trash 保留期
+        /// 仍持有内容，见 `crate::trash`），但如果不提醒，设备下次收到删除
+        /// 事件会真的按 `client` 角色移除本地副本。
+        possible_lost_server_role: bool,
     },
     /// 存储根打不开（I11：未挂载或卷身份不符）——数据集离线。**绝不能因此
     /// 假装"本地没有未同步文件"**：那本该是 `local_only` 检查要回答的问题，
@@ -186,12 +200,14 @@ impl DoctorReport {
                     ignore_issues,
                     manifest_issue,
                     trash_issues,
+                    possible_lost_server_role,
                     ..
                 } => {
                     local_only.is_empty()
                         && ignore_issues.is_empty()
                         && manifest_issue.is_none()
                         && trash_issues.is_empty()
+                        && !possible_lost_server_role
                 }
                 DatasetHealth::Offline { .. }
                 | DatasetHealth::CheckFailed { .. }
@@ -259,6 +275,7 @@ pub fn doctor(repo: &Repo, registry: &Registry, root_override: Option<&Path>) ->
                         ignore_issues: details.ignore_issues,
                         manifest_issue: details.manifest_issue,
                         trash_issues: details.trash_issues,
+                        possible_lost_server_role: details.possible_lost_server_role,
                     },
                     Err(reason) => DatasetHealth::CheckFailed {
                         path: resolved.normalized_path,
@@ -286,6 +303,7 @@ struct CheckedDetails {
     ignore_issues: Vec<IgnoreIssue>,
     manifest_issue: Option<ManifestIssue>,
     trash_issues: Vec<trash::TrashIssue>,
+    possible_lost_server_role: bool,
 }
 
 /// 扫描本地 + 读远端 +（评审新增）实测 `.gitignore` 反选块 + 比对清单与
@@ -310,13 +328,33 @@ fn check_dataset(
     let ignore_issues = check_ignore_block(repo, normalized_path)?;
     let manifest_issue = check_manifest(dataset_dir)?;
     let trash_issues = trash::scan_issues(store_root).map_err(|e| e.to_string())?;
+    let possible_lost_server_role = check_lost_server_role(dataset_dir);
 
     Ok(CheckedDetails {
         local_only,
         ignore_issues,
         manifest_issue,
         trash_issues,
+        possible_lost_server_role,
     })
+}
+
+/// 评审 Minor #1：`<dataset>/.arca/client/trash/` 非空、但
+/// `<dataset>/.arca/client/role.toml` 缺失——见 `DatasetHealth::Checked::
+/// possible_lost_server_role` 文档的完整论证。这里直接拼路径而不是复用
+/// `role`/`local_trash` 模块的私有常量：两个模块都没有导出它们，doctor 只
+/// 关心磁盘上这两个相对路径是否存在，不需要走它们各自的读写语义（尤其是
+/// `role::read` 会把"缺失"吸收成默认值——doctor 恰恰要分辨的正是"缺失"
+/// 这件事本身，不能吸收掉）。
+fn check_lost_server_role(dataset_dir: &Path) -> bool {
+    let role_file = dataset_dir.join(".arca/client/role.toml");
+    if role_file.exists() {
+        return false;
+    }
+    let trash_dir = dataset_dir.join(".arca/client/trash");
+    fs::read_dir(&trash_dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }
 
 /// 实测 `.gitignore` 反选块（评审 Important #1，模块顶部「债三」）：断言
@@ -817,5 +855,94 @@ mod tests {
             !report.is_clean(),
             "损坏的 trash 记录必须让 doctor 判定为不干净"
         );
+    }
+
+    /// 评审 Minor #1 的核心复现测试：本地回收站（`.arca/client/trash/`）
+    /// 非空、但角色声明（`.arca/client/role.toml`）缺失——大概率是
+    /// `role.toml` 意外丢失（不是用户主动把 server 降级成 client，那种情况
+    /// 不会往 trash/ 里留东西）。`doctor` 此前完全不认识角色，这里驱动的是
+    /// 从未被覆盖的检测路径。
+    #[test]
+    fn 本地回收站非空但role_toml缺失时doctor检出可能丢失的server声明() {
+        let (vault_dir, _store_dir) = 建已登记的数据集(&[("a.txt", b"hello")]);
+        引导存储根(vault_dir.path());
+
+        // 手工模拟"本地回收站里留有条目，但 role.toml 不在了"——不需要真的
+        // 跑一轮 server 角色的 DeleteLocal，doctor 的检测只看这两个路径此刻
+        // 是否存在，与它们是怎么来的无关（与
+        // `trash里损坏的meta被doctor点名具体文件` 同一手法）。
+        let local_trash_dir = vault_dir.path().join("assets/.arca/client/trash");
+        fs::create_dir_all(&local_trash_dir).unwrap();
+        fs::write(local_trash_dir.join("deadbeef.data"), "曾经存在过的内容").unwrap();
+        // role.toml 故意不写——模拟"从未写过，或写过之后丢了"。
+
+        let vault = crate::vault::open(vault_dir.path()).unwrap();
+        let report = doctor(&vault.repo, &vault.registry, None);
+
+        assert_eq!(report.datasets.len(), 1);
+        match &report.datasets[0] {
+            DatasetHealth::Checked {
+                possible_lost_server_role,
+                ..
+            } => {
+                assert!(
+                    *possible_lost_server_role,
+                    "本地回收站非空但 role.toml 缺失，应被检出为可能丢失了 server 声明"
+                );
+            }
+            other => panic!("应为 Checked，实得 {other:?}"),
+        }
+        assert!(
+            !report.is_clean(),
+            "可能丢失的 server 声明必须让 doctor 判定为不干净"
+        );
+    }
+
+    /// 反例：本地回收站不存在（正常的 client 角色数据集，从没触发过
+    /// server 角色的 DeleteLocal）——`role.toml` 缺失本身完全正常（默认
+    /// 角色就是 client，见 `role.rs`），不该被误报成"可能丢失了声明"。用
+    /// "干净的vault且已同步的数据集没有任何问题" 同一套已同步、无 local_only
+    /// 噪音的前置条件，这样能顺带断言 `report.is_clean()`——只要
+    /// `possible_lost_server_role` 被误报成 `true`，这个断言就会失败。
+    #[test]
+    fn 本地回收站为空时role_toml缺失不被误报() {
+        let (vault_dir, _store_dir) = 建已登记的数据集(&[("a.txt", b"hello")]);
+
+        let vault = crate::vault::open(vault_dir.path()).unwrap();
+        let entry = &vault.registry.datasets()[0];
+        let hub = vault.registry.hub(&entry.hub).unwrap();
+        let root_path = crate::vault::resolve_hub_root(hub, None).unwrap();
+        let cfg_text =
+            fs::read_to_string(vault_dir.path().join("assets/.arca/dataset.toml")).unwrap();
+        let cfg = arca_format::dataset::DatasetConfig::parse(&cfg_text).unwrap();
+        let store_root = arca_store::root::StorageRoot::create(
+            &root_path,
+            &cfg.dataset_id,
+            "2026-08-09T09:00:00Z",
+        )
+        .unwrap();
+        let mut sink = NullSink;
+        sync::sync(
+            &vault_dir.path().join("assets"),
+            &store_root,
+            &actor(),
+            &mut sink,
+        )
+        .unwrap();
+
+        let report = doctor(&vault.repo, &vault.registry, None);
+        match &report.datasets[0] {
+            DatasetHealth::Checked {
+                possible_lost_server_role,
+                ..
+            } => {
+                assert!(
+                    !possible_lost_server_role,
+                    "没有本地回收站条目时不该误报丢失了 server 声明"
+                );
+            }
+            other => panic!("应为 Checked，实得 {other:?}"),
+        }
+        assert!(report.is_clean(), "{report:?}");
     }
 }

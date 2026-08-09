@@ -97,6 +97,16 @@ assert_clean "首次 sync（盘在场）" "$arca_bin" sync assets
 assert_clean "status（盘在场，应为干净）" "$arca_bin" status assets
 assert_clean "verify（盘在场）" "$arca_bin" verify assets
 
+echo "== 1b. 拔盘前置断言：hub 确实已经有字节了 =="
+# 评审 Minor #4：此前只靠"插回之后 assert_clean 通过"间接兜住"拔盘前 hub
+# 有数据"这件事——间接推断，不是直接断言。这里直接看一眼存储根，让第 5 步
+# 「绝不能把离线误判成空库」这句话不依赖后续步骤，自己就能立住：如果 hub
+# 这时候其实是空的，"拔盘后报离线"就可能只是碰巧——离线判断（I11）与
+# "库是空的"两种情形在盘被拔走之前必须先被区分开。
+[ -f "$store_dir/files/note.txt" ] || fail "拔盘之前 hub 的 files/note.txt 应该已经存在——\
+如果这里就是空的，后面'报离线'可能只是巧合，不能证明区分开了'离线'与'空库'"
+echo "  OK：拔盘前 hub 的 files/note.txt 确实存在（下面的离线断言不是在测一个空库）"
+
 echo "== 2. 拔盘：把存储根整个移走 =="
 mv "$store_dir" "$unplugged_dir"
 [ ! -e "$store_dir" ] || fail "拔盘后 $store_dir 不应再存在"

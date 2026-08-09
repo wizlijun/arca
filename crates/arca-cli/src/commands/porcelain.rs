@@ -454,10 +454,26 @@ fn sync_one(path: &str, root: Option<&Path>) -> u8 {
             }
         }
         Err(e) => {
-            if matches!(e, SyncError::Transport(TransportError::Offline { .. })) {
-                eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
-            } else {
-                eprintln!("{e}");
+            // 评审 Minor #3：此前只有 `Offline` 点名数据集与 hub，其它
+            // `Transport` 失败（例如 http:// hub 进程根本没起来，连接被拒绝，
+            // 分类为 `TransportError::Network`）打出的是一句光秃秃的
+            // "网络故障：Connection refused"，没有数据集名也没有 hub 名——
+            // `sync_all` 靠 `== path ==` 表头兜底，但单数据集调用
+            // （`arca sync <path>`）没有这层兜底，用户拿到的诊断无法归因是
+            // 哪个数据集出的问题。`Transport` 这一类失败本就都与"这个数据集
+            // 绑定的 hub 打交道"相关，统一带上归属；只有 `Offline` 才额外
+            // 加"离线"这个更具体的判词（I11 语义，其它 `Transport` 变体不是
+            // "离线"，不能张冠李戴）。
+            match &e {
+                SyncError::Transport(TransportError::Offline { .. }) => {
+                    eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
+                }
+                SyncError::Transport(_) => {
+                    eprintln!("数据集 {path}（hub={}）：{e}", resolved.hub_name);
+                }
+                _ => {
+                    eprintln!("{e}");
+                }
             }
             (sync_error_exit_level(&e), false)
         }
@@ -556,6 +572,20 @@ fn status_one(path: &str, root: Option<&Path>) -> u8 {
             return 1;
         }
     };
+    // 修复 I2：`known_server_copies` 只读 `role::read(dataset_root)`，从不碰
+    // `StorageRoot`，因此这道副本告警不需要等到 `local_root()`/
+    // `StorageRoot::open` 都通过才跑。提到这两道 gate 之前，`http://` 绑定
+    // 的数据集（M2b/M2c 的主线配置，此前 `local_root()` 直接 bail 导致告警
+    // 永远走不到）与卷离线的数据集（此前同样被跳过）都能收到 spec §4.5
+    // 承诺的告警，不再是 file:// 且在线时才有的特权。
+    //
+    // 修复 I1：只打印，不再把返回值折进 `level`——理由见
+    // `report_replica_warning_if_any` 的文档：这条告警不是"命令本身失败"，
+    // 也不是"有待办"，混进退出码会让一个刚 `adopt`、完全同步的默认角色
+    // 数据集的 `arca status` 也退出非零，破坏 PROTOCOL.md 记载的三态语义，
+    // 还会通过 `status_all`/`sync_all` 的取最大值传染到整个 vault。
+    report_replica_warning_if_any(path, &resolved.dataset_dir);
+
     // M2c Task 5：`status` 尚未 Transport 化，`http://` hub 报明确的
     // "这条命令不支持"（`dataset::ResolvedDataset::local_root` 文档）。
     let root_path = match resolved.local_root() {
@@ -573,10 +603,7 @@ fn status_one(path: &str, root: Option<&Path>) -> u8 {
         }
     };
 
-    // M2d Task 4（spec §4.5）：副本数告警，低于阈值即警告——见
-    // `known_server_copies` 文档，措辞刻意强调"已知"而不是宣称全局真相。
-    let mut level = report_replica_warning_if_any(path, &resolved.dataset_dir);
-
+    let mut level: u8 = 0;
     let mut sink = NullSink;
     match status_lib::status(&resolved.dataset_dir, &store_root, &mut sink) {
         Ok(report) => {
@@ -639,11 +666,25 @@ fn known_server_copies(dataset_root: &Path) -> Result<u32, role::RoleError> {
     Ok(copies)
 }
 
-/// 副本数低于阈值时打一条 stderr 警告，返回应叠加的严重度（0 或 1）。
-/// 角色声明本身读不出来（role.toml 损坏）也算一种需要用户知道的问题——
-/// 不静默吞掉（I5），照样叠加严重度，但按 `client`（未声明的默认角色）
-/// 继续算下限，不因为这一步失败就放弃整个副本数提示。
-fn report_replica_warning_if_any(path: &str, dataset_root: &Path) -> u8 {
+/// 副本数低于阈值时打一条 stderr 警告——**只打印，不影响退出码**（修复
+/// I1）。这条告警既不是"命令本身失败"，也不是"有待办要处理"（PROTOCOL.md
+/// §3.2 记载的三态语义：0 干净 / 1 有问题待办 / 2 身份不明），它是一条独立
+/// 于"这次调和跑得干不干净"的、关于长期数据安全策略的建议——`arca sync`
+/// 从不因为它退出非零，`status` 不该在这一点上分裂出不同的信号强度。
+///
+/// 之前的实现把返回值（0/1）叠加进 `status_one` 的 `level`，后果是一个刚
+/// `adopt`、完全同步的默认角色（`client`）数据集 `arca status` 也退出 1，
+/// 且 `status_all`/`sync_all` 取最大值会让**一个**默认角色的数据集拖累整个
+/// vault 的退出码——反过来变相强迫用户为了消掉这个退出码去声明 `server`
+/// （一个"永不主动释放空间"的强承诺），本末倒置。选择"打印但不动 level"
+/// 而不是"加一个显式开关"：默认就该看到告警（Rule of Silence 只保证干净
+/// 时安静，这条告警恰恰是在提醒一件本该被注意到的事），开关只会制造"新装
+/// 用户默认看不到这条提示"的新问题，不值得为此多一个 flag。
+///
+/// 角色声明本身读不出来（role.toml 损坏）也一并打印（I5：不静默吞掉），但
+/// 同样不影响退出码——按 `client`（未声明的默认角色）继续算下限，不因为
+/// 这一步失败就放弃整个副本数提示。
+fn report_replica_warning_if_any(path: &str, dataset_root: &Path) {
     let copies = match known_server_copies(dataset_root) {
         Ok(c) => c,
         Err(e) => {
@@ -659,9 +700,6 @@ fn report_replica_warning_if_any(path: &str, dataset_root: &Path) -> u8 {
              得知（需要 hub 侧登记每个绑定设备的角色，未实现）。如果这台设备应该作为一份永久\
              保留的副本，运行 `arca role {path} --set server`。"
         );
-        1
-    } else {
-        0
     }
 }
 
@@ -809,6 +847,7 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
                 ignore_issues,
                 manifest_issue,
                 trash_issues,
+                possible_lost_server_role,
             } => {
                 if !local_only.is_empty() {
                     eprintln!();
@@ -840,6 +879,20 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
                 // 文件，不能只笼统报"删除/restore --list 已失效"。
                 for issue in trash_issues {
                     eprintln!("数据集 {path} 的 .arca/trash/ 记录损坏：{issue}");
+                }
+                // 评审 Minor #1：本地回收站非空但角色声明缺失——大概率是
+                // `role.toml` 意外丢失，而不是用户主动把 server 降级成
+                // client（后者不会留下这种组合）；不是数据丢失（hub 侧 trash
+                // 保留期仍持有内容），但设备下次收到删除事件会真的移除本地
+                // 副本，必须提醒用户核实。
+                if *possible_lost_server_role {
+                    eprintln!(
+                        "数据集 {path}：本地回收站（.arca/client/trash/）非空，但角色声明\
+                         （.arca/client/role.toml）缺失——这台设备可能曾经是 server 角色、\
+                         声明意外丢失了（不是数据丢失，hub 侧保留期内的内容仍在）；如果这台\
+                         设备本该继续承诺永久保留一份完整副本，请重新运行\
+                         `arca role {path} --set server`"
+                    );
                 }
             }
             doctor::DatasetHealth::Offline { path, reason } => {

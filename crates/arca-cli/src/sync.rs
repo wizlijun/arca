@@ -654,10 +654,23 @@ fn execute_delete_local(
                 role::Role::Server => {
                     // 不 unlink：移进本地回收站，物理销毁只经未来显式的
                     // 清理命令（I3，本切片不实现、不新增任何销毁路径）。
+                    //
+                    // 评审 Minor #2：`move_to_trash` 在源已不存在时返回
+                    // `Ok(None)`（与 client 分支对 `fs::remove_file` 的
+                    // `NotFound` 同一条幂等纪律：这次调用之前源就已经不在了，
+                    // 不是错误）——此前这里无条件 push 进
+                    // `deleted_to_local_trash`，用户会看到一行
+                    // `delete-local-trash <path>` 与"已移入本地回收站"的说明，
+                    // 但那个路径根本没有对应的 `.data`/`.meta`，恢复指引指向
+                    // 一个不存在的文件。按 `Option` 分流：只有真的移动了什么，
+                    // 才计入这个桶。
                     let at = clock::now_rfc3339();
-                    local_trash::move_to_trash(dataset_root, &local_path, path, item_id, &at)
-                        .map_err(SyncError::LocalTrash)?;
-                    report.deleted_to_local_trash.push(path.to_string());
+                    if local_trash::move_to_trash(dataset_root, &local_path, path, item_id, &at)
+                        .map_err(SyncError::LocalTrash)?
+                        .is_some()
+                    {
+                        report.deleted_to_local_trash.push(path.to_string());
+                    }
                 }
             }
             baseline.remove(path);
@@ -1812,6 +1825,73 @@ mod tests {
                 .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".data"));
             assert!(trash_has_data, "hub 的权威副本必须仍在 .arca/trash/ 里");
         }
+    }
+
+    /// 评审 Minor #2 的核心复现测试：`server` 角色下，如果本地文件在
+    /// `DeleteLocal` 真正执行之前就已经不在了（用户手动删了/这次调用是重跑），
+    /// `local_trash::move_to_trash` 如实返回 `None`——这个路径不该出现在
+    /// `report.deleted_to_local_trash` 里。此前无条件 push，用户会看到一行
+    /// `delete-local-trash j.txt` 与"已移入本地回收站"的说明，但
+    /// `.arca/client/trash/` 下根本没有对应的 `.data`/`.meta`，恢复指引指向
+    /// 一个不存在的文件。
+    #[test]
+    fn server角色下源已不存在时deleted_to_local_trash不空报() {
+        let dataset = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        造存储根(store.path());
+        fs::create_dir_all(store.path().join(".arca/trash")).unwrap();
+        fs::create_dir_all(store.path().join(".arca/journal")).unwrap();
+        fs::write(dataset.path().join("j.txt"), b"content").unwrap();
+        role::write(dataset.path(), role::Role::Server).unwrap();
+
+        let root = open_root(store.path());
+        let mut sink = NullSink;
+        sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+
+        let remote_before = hub::read_remote(&root).unwrap();
+        let (item_id, version_id) = match remote_before.get("j.txt").unwrap() {
+            RemoteState::Present {
+                item_id,
+                version_id,
+                ..
+            } => (*item_id, version_id.clone()),
+            other => panic!("应为 Present，实得 {other:?}"),
+        };
+        crate::trash::move_to_trash(&root, "j.txt", item_id, "2026-08-08T09:20:00Z").unwrap();
+        let next_seq = crate::journal::next_seq(&root).unwrap();
+        crate::journal::append(
+            &root,
+            &arca_format::journal::JournalEvent {
+                seq: next_seq,
+                op: arca_format::journal::Op::Tombstone,
+                item_id,
+                version_id,
+                path: "j.txt".to_string(),
+                from: None,
+                actor: actor(),
+                at: "2026-08-08T09:20:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        // 关键：在 DeleteLocal 真正执行之前，本地文件已经不在了（模拟用户
+        // 手动删除，或这次调用是重跑）——`decide` 仍会因为基线记录了这个
+        // path 而产出 `DeleteLocal`，但 `local_path` 此刻已经没有内容可挪。
+        fs::remove_file(dataset.path().join("j.txt")).unwrap();
+
+        let report = sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+        assert!(
+            report.deleted_to_local_trash.is_empty(),
+            "源已不存在，不该假装挪了一份可恢复的回收站记录：{report:?}"
+        );
+        let local_trash_dir = dataset.path().join(".arca/client/trash");
+        assert!(
+            !local_trash_dir.exists()
+                || fs::read_dir(&local_trash_dir)
+                    .map(|mut it| it.next().is_none())
+                    .unwrap_or(true),
+            "本地回收站不该留下任何条目（没有内容被真的移进来）"
+        );
     }
 
     /// 端到端闭环（M2a tombstone 计划收尾）：两台设备**只通过 `sync()` 调用**
