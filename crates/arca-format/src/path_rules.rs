@@ -6,7 +6,11 @@
 //!
 //! 参考 lazync：`shared/src/nc_path_rules.pas`（继承其规则集与边界处理）。
 //!
-//! TODO(M0)：golden vectors（属 Task 5/7 范围）。
+//! 覆盖现状：13 条内联单元测试 + `fuzz/` 里的 `path_rules` target。
+//! **没有 golden 文件**（`tests/golden/` 下的六份都是序列化格式的，
+//! 而路径规则是函数不是格式）——归一化结果一旦被无意改动，能挡住它的
+//! 只有那 13 条内联测试。跨实现的一致性契约要不要固化成 golden，
+//! 等真有第二个实现时再定。
 
 use arca_chunk::hash::ContentHash;
 

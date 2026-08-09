@@ -6,8 +6,6 @@
 //!   绝不把未挂载的卷当空库）。
 //!
 //! vault 侧 `.arca/` 与 hub 侧 `.arca/` 结构不同，须可区分（§4.3，防误绑）。
-//!
-//! TODO(M0)：`format.json` 结构、布局常量、两种 `.arca/` 的判别函数。
 
 use crate::error::FormatError;
 use crate::model::ItemId;

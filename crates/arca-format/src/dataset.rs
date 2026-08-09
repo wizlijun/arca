@@ -4,8 +4,6 @@
 //! `public_base_url` / `url_style`（发布配置，§4.9）。
 //!
 //! 数据集随 `.arca/` 整体搬迁：身份、清单、目录卡、hub 归属全都跟着走。
-//!
-//! TODO(M0)：数据结构定义、TOML 解析/序列化。
 
 use crate::error::FormatError;
 use serde::{Deserialize, Serialize};

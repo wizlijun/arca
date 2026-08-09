@@ -1,6 +1,4 @@
 //! zstd 压缩（RFC 8878）——chunks 落盘形态。
-//!
-//! TODO(M0)：压缩级别选型（弱 NAS 友好，§1.1 目标 9）、流式接口。
 
 use std::io::Read;
 

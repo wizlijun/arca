@@ -8,7 +8,6 @@
 //!
 //! 参考 lazync：`shared/src/nc_version.pas` 的版本模型，此处升级为身份/版本/内容三层。
 //!
-//! TODO(M0)：`ItemId`/`Version` 的 serde 支持、golden vectors（属 Task 5/6/7 范围）。
 
 use crate::error::FormatError;
 use arca_chunk::hash::ContentHash;
