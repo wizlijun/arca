@@ -122,9 +122,18 @@ enum Command {
         dataset: String,
         /// 数据集内的文件路径——恢复目标；与 --list 二选一
         file: Option<String>,
-        /// 只列出保留期内可恢复的条目，不实际恢复
+        /// 只列出回收站里的条目，不实际恢复（列出的是全部条目，最后一列
+        /// within_retention 表示它是否仍在默认保留期内）
         #[arg(long)]
         list: bool,
+        /// 从**本设备**工作区侧的本地回收站（<dataset>/.arca/client/trash/，
+        /// server 角色下远端删除过闸门后本地副本的落点）找回，而不是默认的
+        /// hub 侧回收站（<存储根>/.arca/trash/）。默认那条是"把这个文件在
+        /// 整个数据集范围内找回来"（写回 hub，所有设备都会看到）；--local
+        /// 是"把这台机器上被删掉的那份副本捞回来"（纯本地，不碰 hub，
+        /// hub 离线也能跑）
+        #[arg(long)]
+        local: bool,
         /// 覆盖从 .gitarca 解析出的存储根路径
         #[arg(long)]
         root: Option<std::path::PathBuf>,
@@ -251,20 +260,22 @@ fn main() -> std::process::ExitCode {
             dataset,
             file,
             list,
+            local,
             root,
-        } => {
-            if list {
-                commands::porcelain::restore_list_cmd(&dataset, root.as_deref())
-            } else {
-                match file {
-                    Some(f) => commands::porcelain::restore_cmd(&dataset, &f, root.as_deref()),
-                    None => {
-                        eprintln!("`arca restore` 需要指定要找回的文件路径，或改用 --list");
-                        std::process::ExitCode::from(1)
-                    }
+        } => match (list, local) {
+            (true, false) => commands::porcelain::restore_list_cmd(&dataset, root.as_deref()),
+            (true, true) => commands::porcelain::restore_local_list_cmd(&dataset, root.as_deref()),
+            (false, _) => match file {
+                Some(f) if local => {
+                    commands::porcelain::restore_local_cmd(&dataset, &f, root.as_deref())
                 }
-            }
-        }
+                Some(f) => commands::porcelain::restore_cmd(&dataset, &f, root.as_deref()),
+                None => {
+                    eprintln!("`arca restore` 需要指定要找回的文件路径，或改用 --list");
+                    std::process::ExitCode::from(1)
+                }
+            },
+        },
         Command::Ls {
             path,
             root,

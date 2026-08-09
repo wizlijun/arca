@@ -29,6 +29,7 @@ use arca_cli::clock;
 use arca_cli::dataset::{self, HubTarget};
 use arca_cli::doctor;
 use arca_cli::init::{self, HookOutcome};
+use arca_cli::local_trash;
 use arca_cli::register::{self, RegisterOptions};
 use arca_cli::role;
 use arca_cli::status as status_lib;
@@ -848,6 +849,8 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
                 manifest_issue,
                 trash_issues,
                 possible_lost_server_role,
+                local_trash_usage,
+                local_trash_issues,
             } => {
                 if !local_only.is_empty() {
                     eprintln!();
@@ -893,6 +896,36 @@ pub fn doctor_cmd(root: Option<&Path>) -> ExitCode {
                          设备本该继续承诺永久保留一份完整副本，请重新运行\
                          `arca role {path} --set server`"
                     );
+                }
+                // M2e Task 1：本地回收站里损坏的记录——与 hub 侧同一严重性，
+                // 一条读不懂的 `.meta` 会让 `arca restore --local`/
+                // `arca gc --local` 对整个数据集失效。
+                for issue in local_trash_issues {
+                    eprintln!(
+                        "数据集 {path} 的 .arca/client/trash/ 记录损坏：{issue}\
+                         （`arca restore {path} --local --list` 会因此整体报错）"
+                    );
+                }
+                // M2e Task 1：让本地回收站可见。这是一条**信息**，不是问题
+                // ——`server` 角色下这里有东西完全正常，所以只在非空时打印、
+                // 且不影响退出码（见 `doctor::DatasetHealth::Checked::
+                // local_trash_usage` 文档）。Rule of Silence 因此不被破坏：
+                // 一个从未触发过 server 角色删除的数据集这里恒为空。
+                if let Some(u) = local_trash_usage {
+                    if u.entries > 0 {
+                        eprintln!(
+                            "数据集 {path} 的本地回收站（.arca/client/trash/）：{} 条记录、\
+                             占用 {} 字节、最老一条删除于 {}；其中 {} 条已过默认保留期\
+                             （{} 天）。这些内容**不会**被自动清理（I3），要销毁请显式运行\
+                             `arca gc {path} --local`（默认只出清单）；要找回请运行\
+                             `arca restore {path} <文件> --local`。",
+                            u.entries,
+                            u.bytes,
+                            u.oldest_deleted_at.as_deref().unwrap_or("(未知)"),
+                            u.expired,
+                            arca_cli::trash::DEFAULT_RETENTION_DAYS,
+                        );
+                    }
                 }
             }
             doctor::DatasetHealth::Offline { path, reason } => {
@@ -1029,6 +1062,98 @@ pub fn restore_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
 
     let now = clock::now_rfc3339();
     match trash::list(&store_root) {
+        Ok(entries) => {
+            for entry in &entries {
+                let retained =
+                    trash::within_retention(&entry.meta, &now, trash::DEFAULT_RETENTION_DAYS);
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    entry.meta.path,
+                    entry.meta.item_id.to_hex(),
+                    entry.meta.deleted_at,
+                    entry.trash_id,
+                    retained
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `arca restore … --local`（M2e Task 1，FORMAT.md §9.5）
+// ---------------------------------------------------------------------------
+
+/// `arca restore <dataset> <file> --local`：从**本设备工作区侧**的本地回收站
+/// （`<dataset>/.arca/client/trash/`）找回内容。
+///
+/// # 与不带 `--local` 的 `arca restore` 是两个不同的回收站
+///
+/// | | 不带 `--local`（默认） | `--local` |
+/// | --- | --- | --- |
+/// | 读哪里 | **hub 侧** `<存储根>/.arca/trash/`（FORMAT.md §7.3） | **本设备** `<dataset>/.arca/client/trash/`（§9.5） |
+/// | 内容怎么进去的 | 任一设备删除 → hub 记 tombstone 时移进来 | 本设备是 `server` 角色、远端 tombstone 过了四道闸门时移进来 |
+/// | 恢复的效果 | 写回 hub 的 `files/` + 追加版本链/index/journal（一次**权威**提交，所有设备都会看到） | 只把字节写回本设备工作区，**不碰 hub 任何状态** |
+/// | 需要什么 | 存储根在线且身份相符（I11） | 什么都不需要——纯本地操作，hub 离线也能跑 |
+///
+/// 换句话说：**默认那条是"把这个文件在整个数据集范围内找回来"，`--local`
+/// 是"把这台机器上被删掉的那份副本捞回来"**。两者不互斥——同一次删除通常
+/// 在两边各留了一份记录，从哪边找回取决于你想要什么效果。
+///
+/// 纯本地操作因此不打开存储根、不做 I11 身份校验：没有任何字节会被写到 hub。
+pub fn restore_local_cmd(dataset_path: &str, file: &str, root: Option<&Path>) -> ExitCode {
+    let resolved = match dataset::resolve(&cwd(), dataset_path, root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match local_trash::restore(&resolved.dataset_dir, file, &clock::now_rfc3339()) {
+        Ok(restored) => {
+            // I5：被顶替下去的内容去了哪里必须说清楚，不能只报"恢复成功"。
+            if let Some(protected) = restored.protected {
+                eprintln!(
+                    "{} 此前在工作区里已有一份**不同**的内容——它已被移入本地回收站\
+                     （trash_id={protected}），没有被这次恢复销毁；要把它换回来运行\
+                     `arca restore {dataset_path} {} --local`（会再次触发同样的保护）。",
+                    restored.path, restored.path,
+                );
+            }
+            println!("restore-local\t{}\t{}", restored.path, restored.trash_id);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `arca restore <dataset> --list --local`：列出本地回收站里的全部条目。
+///
+/// 输出与 hub 侧 `restore --list` **逐列相同**（`path`/`item_id`/`deleted_at`/
+/// `trash_id`/`within_retention`）——两个回收站的列表是同一种数据，脚本不该
+/// 因为多了个 `--local` 就要换一套解析规则。同样列出的是**全部**条目而不是
+/// "只有保留期内的"：没跑过 `arca gc` 就一条都不会消失（I3），
+/// `within_retention` 那一列回答的是"未来 `arca gc` 会不会把它列进候选"，
+/// 不是"现在还能不能恢复"。
+pub fn restore_local_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
+    let resolved = match dataset::resolve(&cwd(), dataset_path, root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let now = clock::now_rfc3339();
+    match local_trash::list(&resolved.dataset_dir) {
         Ok(entries) => {
             for entry in &entries {
                 let retained =

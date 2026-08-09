@@ -158,6 +158,22 @@ pub enum DatasetHealth {
         /// 仍持有内容，见 `crate::trash`），但如果不提醒，设备下次收到删除
         /// 事件会真的按 `client` 角色移除本地副本。
         possible_lost_server_role: bool,
+        /// M2e Task 1：`<dataset>/.arca/client/trash/` 的占用概况——
+        /// **让它可见**。这个目录此前是纯只写的：`server` 角色每收到一次
+        /// 远端删除就往里塞一份完整副本，没有任何诊断命令看得见它，用户
+        /// 只会在某天发现磁盘满了才去翻。`None` 表示统计没能跑出来（记录
+        /// 损坏，具体是哪一条见 `local_trash_issues`）——绝不用一个"看起来
+        /// 很健康的 0"掩盖读不出来这件事（I5）。
+        ///
+        /// **非空不代表有问题**：它不参与 [`DoctorReport::is_clean`]，
+        /// `server` 角色下回收站里有东西是完全正常的状态，命令壳只把它当
+        /// 一条信息打出来，不影响退出码。
+        local_trash_usage: Option<crate::local_trash::Usage>,
+        /// 本地回收站里逐条巡检出的损坏记录（`local_trash::scan_issues`）
+        /// ——与上面的 hub 侧 `trash_issues` 同一分工与同一严重性：一条读不
+        /// 懂的 `.meta` 会让 `arca restore --local`/`arca gc --local` 对整个
+        /// 数据集失效，必须点名具体文件。这一项**参与** `is_clean`。
+        local_trash_issues: Vec<trash::TrashIssue>,
     },
     /// 存储根打不开（I11：未挂载或卷身份不符）——数据集离线。**绝不能因此
     /// 假装"本地没有未同步文件"**：那本该是 `local_only` 检查要回答的问题，
@@ -201,12 +217,17 @@ impl DoctorReport {
                     manifest_issue,
                     trash_issues,
                     possible_lost_server_role,
+                    local_trash_issues,
+                    // `local_trash_usage` 刻意不参与：`server` 角色的本地
+                    // 回收站非空是完全正常的状态，见该字段文档。
+                    local_trash_usage: _,
                     ..
                 } => {
                     local_only.is_empty()
                         && ignore_issues.is_empty()
                         && manifest_issue.is_none()
                         && trash_issues.is_empty()
+                        && local_trash_issues.is_empty()
                         && !possible_lost_server_role
                 }
                 DatasetHealth::Offline { .. }
@@ -276,6 +297,8 @@ pub fn doctor(repo: &Repo, registry: &Registry, root_override: Option<&Path>) ->
                         manifest_issue: details.manifest_issue,
                         trash_issues: details.trash_issues,
                         possible_lost_server_role: details.possible_lost_server_role,
+                        local_trash_usage: details.local_trash_usage,
+                        local_trash_issues: details.local_trash_issues,
                     },
                     Err(reason) => DatasetHealth::CheckFailed {
                         path: resolved.normalized_path,
@@ -304,6 +327,8 @@ struct CheckedDetails {
     manifest_issue: Option<ManifestIssue>,
     trash_issues: Vec<trash::TrashIssue>,
     possible_lost_server_role: bool,
+    local_trash_usage: Option<crate::local_trash::Usage>,
+    local_trash_issues: Vec<trash::TrashIssue>,
 }
 
 /// 扫描本地 + 读远端 +（评审新增）实测 `.gitignore` 反选块 + 比对清单与
@@ -329,6 +354,7 @@ fn check_dataset(
     let manifest_issue = check_manifest(dataset_dir)?;
     let trash_issues = trash::scan_issues(store_root).map_err(|e| e.to_string())?;
     let possible_lost_server_role = check_lost_server_role(dataset_dir);
+    let (local_trash_usage, local_trash_issues) = check_local_trash(dataset_dir)?;
 
     Ok(CheckedDetails {
         local_only,
@@ -336,7 +362,38 @@ fn check_dataset(
         manifest_issue,
         trash_issues,
         possible_lost_server_role,
+        local_trash_usage,
+        local_trash_issues,
     })
+}
+
+/// M2e Task 1：巡检工作区侧本地回收站——占用概况 + 逐条损坏记录。
+///
+/// 两步的分工与 hub 侧 `trash::scan_issues`/`trash::list` 完全一致：先逐条
+/// 巡检（不因一条坏记录整体放弃、点名具体文件），只有在**一条都不坏**时
+/// 才去算占用（`local_trash::usage` 内部走 `list`，遇损坏记录会整体报错）。
+/// 有损坏记录时 usage 给 `None`——绝不用一个"看起来很健康的 0"掩盖"这个
+/// 目录此刻读不出来"（I5）。
+///
+/// 保留期判断用的是**当前墙上时钟**（`clock::now_rfc3339`）。这是 doctor
+/// 里唯一一处读系统时钟的地方，刻意没有把 `now` 提升成 `doctor()` 的参数：
+/// 它只影响 `Usage::expired` 这一个纯提示性的计数（"未来 `arca gc` 会把
+/// 几条列进候选"），不参与 `is_clean`、不影响退出码、不驱动任何销毁——
+/// 没有一条决策依赖它的确定性。
+fn check_local_trash(
+    dataset_dir: &Path,
+) -> Result<(Option<crate::local_trash::Usage>, Vec<trash::TrashIssue>), String> {
+    let issues = crate::local_trash::scan_issues(dataset_dir).map_err(|e| e.to_string())?;
+    if !issues.is_empty() {
+        return Ok((None, issues));
+    }
+    let usage = crate::local_trash::usage(
+        dataset_dir,
+        &crate::clock::now_rfc3339(),
+        trash::DEFAULT_RETENTION_DAYS,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok((Some(usage), issues))
 }
 
 /// 评审 Minor #1：`<dataset>/.arca/client/trash/` 非空、但
@@ -944,5 +1001,129 @@ mod tests {
             other => panic!("应为 Checked，实得 {other:?}"),
         }
         assert!(report.is_clean(), "{report:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // M2e Task 1：本地回收站的可见性
+    // -----------------------------------------------------------------
+
+    /// 「让它可见」：本地回收站非空时，doctor 必须报出条目数、实际占用与
+    /// 最老一条——这个目录此前是纯只写的，没有任何诊断命令看得见它。
+    /// 同时断言它**不影响** `is_clean()`：`server` 角色下这里有东西是完全
+    /// 正常的状态，不是一个"问题"。
+    #[test]
+    fn doctor报告本地回收站的占用与最老条目且不因此判定为不干净() {
+        let (vault_dir, _store_dir) = 建已登记的数据集(&[("a.txt", b"hello")]);
+        let dataset_dir = vault_dir.path().join("assets");
+
+        // 用真实的 `local_trash::move_to_trash` 造两条记录（不手工拼字节，
+        // 这样格式与生产路径一定一致）。
+        for (rel, content, at) in [
+            ("old.bin", &b"1234"[..], "2026-01-02T00:00:00Z"),
+            ("new.bin", &b"56"[..], "2026-08-08T00:00:00Z"),
+        ] {
+            let src = dataset_dir.join(rel);
+            fs::write(&src, content).unwrap();
+            crate::local_trash::move_to_trash(
+                &dataset_dir,
+                &src,
+                rel,
+                arca_format::model::ItemId::from_bytes([0x5a; 16]),
+                at,
+            )
+            .unwrap()
+            .unwrap();
+        }
+
+        // 同步 a.txt，让这个数据集在其它维度上是干净的——这样
+        // `is_clean()` 的断言只可能被本地回收站这一项破坏。
+        let vault = crate::vault::open(vault_dir.path()).unwrap();
+        let entry = &vault.registry.datasets()[0];
+        let hub = vault.registry.hub(&entry.hub).unwrap();
+        let root_path = crate::vault::resolve_hub_root(hub, None).unwrap();
+        let cfg_text =
+            fs::read_to_string(vault_dir.path().join("assets/.arca/dataset.toml")).unwrap();
+        let cfg = arca_format::dataset::DatasetConfig::parse(&cfg_text).unwrap();
+        let store_root = arca_store::root::StorageRoot::create(
+            &root_path,
+            &cfg.dataset_id,
+            "2026-08-09T09:00:00Z",
+        )
+        .unwrap();
+        let mut sink = NullSink;
+        sync::sync(&dataset_dir, &store_root, &actor(), &mut sink).unwrap();
+        // 角色声明也写上，否则会触发 `possible_lost_server_role`（回收站
+        // 非空 + role.toml 缺失）那条独立的告警，干扰 is_clean 断言。
+        crate::role::write(&dataset_dir, crate::role::Role::Server).unwrap();
+
+        let report = doctor(&vault.repo, &vault.registry, None);
+        match &report.datasets[0] {
+            DatasetHealth::Checked {
+                local_trash_usage,
+                local_trash_issues,
+                ..
+            } => {
+                let usage = local_trash_usage
+                    .as_ref()
+                    .expect("记录健康时占用统计必须能算出来");
+                assert_eq!(usage.entries, 2);
+                assert_eq!(usage.bytes, 6, "应是两份 .data 的实际字节数之和");
+                assert_eq!(
+                    usage.oldest_deleted_at.as_deref(),
+                    Some("2026-01-02T00:00:00Z")
+                );
+                assert!(local_trash_issues.is_empty());
+            }
+            other => panic!("应为 Checked，实得 {other:?}"),
+        }
+        assert!(
+            report.is_clean(),
+            "本地回收站非空是 server 角色的正常状态，绝不能因此判定为不干净：{report:?}"
+        );
+    }
+
+    /// 损坏的本地回收站 `.meta` 必须被**点名**（哪个文件），且占用统计给
+    /// `None` 而不是一个"看起来很健康的 0"——后者会让用户以为回收站是空的。
+    #[test]
+    fn 本地回收站里损坏的meta被doctor点名且占用统计不伪造成零() {
+        let (vault_dir, _store_dir) = 建已登记的数据集(&[("a.txt", b"hello")]);
+        引导存储根(vault_dir.path());
+
+        let local_trash_dir = vault_dir.path().join("assets/.arca/client/trash");
+        fs::create_dir_all(&local_trash_dir).unwrap();
+        let phantom = crate::trash::TrashId::parse(&"b".repeat(32)).unwrap();
+        fs::write(
+            local_trash_dir.join(format!("{phantom}.meta")),
+            "不是合法json",
+        )
+        .unwrap();
+
+        let vault = crate::vault::open(vault_dir.path()).unwrap();
+        let report = doctor(&vault.repo, &vault.registry, None);
+        match &report.datasets[0] {
+            DatasetHealth::Checked {
+                local_trash_usage,
+                local_trash_issues,
+                ..
+            } => {
+                assert_eq!(local_trash_issues.len(), 1, "{local_trash_issues:?}");
+                assert!(
+                    local_trash_issues[0]
+                        .file_name
+                        .contains(&phantom.to_string()),
+                    "应点名具体的 trash_id：{:?}",
+                    local_trash_issues[0]
+                );
+                assert!(
+                    local_trash_usage.is_none(),
+                    "记录读不出来时绝不能伪造一个 0 占用"
+                );
+            }
+            other => panic!("应为 Checked，实得 {other:?}"),
+        }
+        assert!(
+            !report.is_clean(),
+            "损坏的本地回收站记录必须让 doctor 判定为不干净"
+        );
     }
 }

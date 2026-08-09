@@ -393,8 +393,8 @@ role = "server"
 `<dataset>/.arca/client/trash/<trash_id>.meta`——与 hub 侧 §7.3 的 `trash/` **同一套
 字段格式与写入顺序纪律**（`.data` 先于 `.meta`、`rename` 不 copy+unlink、`.meta` 记录
 `hash`/`size` 作为独立校验证据），只是落在工作区侧而不是存储根侧，供
-`arca restore`（未来切片，本切片不实现自动恢复命令，找回可先靠直接读取
-`.data`/`.meta` 两个文件）使用。`trash_id` 编码与分配纪律同 §7.3。
+`arca restore <dataset> <file> --local`（M2e Task 1）使用。`trash_id` 编码与
+分配纪律同 §7.3。
 
 `.meta` 记录：
 
@@ -402,8 +402,17 @@ role = "server"
 {"v":1,"path":"京都/鸭川.png","item_id":"3f2a000000000000000000000000beef","deleted_at":"2026-08-04T11:00:00Z","hash":"blake3:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a1","size":12345}
 ```
 
-字段含义与 §7.3 逐字相同。物理销毁不在本节范围内——`server` 角色的存在
-理由就是"永不主动释放空间"，本切片（M2d）不引入任何清理/GC 路径。
+字段含义与 §7.3 逐字相同——**字节格式自 M2d 定稿以来一字未改**（M2e 只补上
+了读侧的列表/恢复通路与清理通路，不动记录本身）。
+
+**保留期与物理销毁**（M2e Task 1/2，spec §7）：本地回收站与 hub 侧 §7.3 的
+`trash/` 共用同一条保留期规则——`deleted_at + 保留期（默认 180 天）> 现在`
+即"仍在保留期内"。到期**不会**自动触发任何清理：本地回收站里的条目只会被
+显式的 `arca gc <dataset> --local --yes` 销毁（I3：绝不自动触发，没有定时器、
+没有"顺手清理"）。恢复（`arca restore … --local`）与销毁（`arca gc`）读到
+`.data` 时都必须重新打开文件、现场重算 BLAKE3 并与 `.meta.hash` 比对——与
+§7.3 对 hub 侧回收站的要求逐字相同，理由也相同：`.meta`/`.data` 两个文件都
+"存在"不代表 `.data` 里此刻的字节还是当初那份。
 
 ### 9.6 范围之外
 
