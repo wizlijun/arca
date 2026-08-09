@@ -592,6 +592,7 @@ pub fn restore(
         mtime: at.to_string(),
         actor: actor.clone(),
         committed_at: at.to_string(),
+        chunks: None,
     };
 
     // 写入顺序：files/ → items/ → index/ → journal（内容先于指针发布，
@@ -1056,6 +1057,7 @@ mod tests {
             mtime: "2026-08-08T09:00:00Z".to_string(),
             actor: actor(),
             committed_at: "2026-08-08T09:00:05Z".to_string(),
+            chunks: None,
         };
         let item_rel = layout::item_path(&item_id);
         fs::create_dir_all(root.path().join(&item_rel).parent().unwrap()).unwrap();
@@ -1218,6 +1220,7 @@ mod tests {
             mtime: "t".to_string(),
             actor: actor(),
             committed_at: "t".to_string(),
+            chunks: None,
         };
         let item_rel = layout::item_path(&item_old);
         fs::create_dir_all(root.path().join(&item_rel).parent().unwrap()).unwrap();
@@ -1242,6 +1245,7 @@ mod tests {
             mtime: "t".to_string(),
             actor: actor(),
             committed_at: "t".to_string(),
+            chunks: None,
         };
         let item_rel = layout::item_path(&item_new);
         fs::create_dir_all(root.path().join(&item_rel).parent().unwrap()).unwrap();

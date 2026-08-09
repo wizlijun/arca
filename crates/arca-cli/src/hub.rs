@@ -499,6 +499,7 @@ mod tests {
                 session: "s1".into(),
             },
             committed_at: "2026-08-05T09:00:05Z".to_string(),
+            chunks: None,
         };
 
         let item_rel = layout::item_path(&item_id);

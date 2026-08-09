@@ -128,6 +128,7 @@ impl<'a> LocalTransport<'a> {
             mtime,
             actor,
             committed_at: crate::clock::now_rfc3339(),
+            chunks: None,
         };
         append_item_version(self.root, &version)?;
         write_index_record(self.root, path, item_id)?;
@@ -381,6 +382,7 @@ impl Transport for LocalTransport<'_> {
             mtime: req.mtime.clone(),
             actor: req.actor.clone(),
             committed_at: crate::clock::now_rfc3339(),
+            chunks: None,
         };
 
         // 写入顺序：files/ → items/ → index/（内容先于指针发布——
@@ -537,6 +539,7 @@ impl Transport for LocalTransport<'_> {
                 mtime: req.mtime.clone(),
                 actor: req.actor.clone(),
                 committed_at: crate::clock::now_rfc3339(),
+                chunks: None,
             };
             append_item_version(self.root, &version)?;
             write_index_record(self.root, &req.path, req.item_id)?;

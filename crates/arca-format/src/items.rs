@@ -21,6 +21,11 @@ struct Wire {
     mtime: String,
     actor: Actor,
     committed_at: String,
+    /// FORMAT.md §7.1：可选追加字段。`skip_serializing_if` 保证**没有块清单
+    /// 时这个键根本不出现**——而不是写成 `null` 或 `[]`。老读者看不见未知键，
+    /// 新读者能把「缺省」与「空数组」区分开（见 `Version::chunks` 的文档）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunks: Option<Vec<String>>,
 }
 
 /// 序列化一条版本记录为单行 JSON。
@@ -42,6 +47,10 @@ pub fn to_line(version: &Version) -> Result<String, FormatError> {
         mtime: version.mtime.clone(),
         actor: version.actor.clone(),
         committed_at: version.committed_at.clone(),
+        chunks: version
+            .chunks
+            .as_ref()
+            .map(|cs| cs.iter().map(|c| c.to_hex()).collect()),
     };
     serde_json::to_string(&wire).map_err(|e| FormatError::Malformed {
         line: 0,
@@ -80,6 +89,20 @@ pub fn parse_line(line: &str, line_no: usize) -> Result<Version, FormatError> {
         mtime: wire.mtime,
         actor: wire.actor,
         committed_at: wire.committed_at,
+        chunks: match wire.chunks {
+            None => None,
+            Some(list) => Some(
+                list.iter()
+                    .map(|h| {
+                        // 块名是**不带 `blake3:` 前缀**的裸十六进制
+                        // （FORMAT.md §8 的文件名形态），这里补上前缀再解析，
+                        // 保证与 `ContentHash::parse` 的唯一入口一致。
+                        ContentHash::parse(&format!("blake3:{h}"))
+                            .map_err(|e| bad(format!("chunks 里的 {h:?} 不合规：{e}")))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+        },
     })
 }
 
@@ -144,7 +167,62 @@ mod tests {
                 session: "s1".into(),
             },
             committed_at: "2026-08-04T10:23:05Z".into(),
+            chunks: None,
         }
+    }
+
+    /// **本文件里最重要的一条。** `chunks` 缺省与空数组意义不同，
+    /// 且**都要能在往返之后保持原样**。
+    ///
+    /// 把两者合并（比如用 `Vec` 而不是 `Option<Vec>`）会让本字段落地之前
+    /// 写下的**老记录被读成「零字节」**——而 `arca checkout` 会拿着那个
+    /// 结论去用一个空文件覆盖用户的历史版本。
+    #[test]
+    fn chunks缺省与空数组不可混淆() {
+        // 缺省：键根本不出现在 JSON 里。
+        let 无 = 样例版本(None);
+        let line = super::to_line(&无).unwrap();
+        assert!(
+            !line.contains("chunks"),
+            "没有块清单时 chunks 键不该出现（而不是写成 null 或 []）：{line}"
+        );
+        assert_eq!(super::parse_line(&line, 1).unwrap().chunks, None);
+
+        // 空数组：留存过，内容是零字节——一个合法的空文件。
+        let mut 空 = 样例版本(None);
+        空.chunks = Some(vec![]);
+        let line = super::to_line(&空).unwrap();
+        assert!(line.contains("\"chunks\":[]"), "{line}");
+        assert_eq!(super::parse_line(&line, 1).unwrap().chunks, Some(vec![]));
+
+        // 有块：裸十六进制，**不带 `blake3:` 前缀**（FORMAT.md §8 的文件名形态）。
+        let mut 有 = 样例版本(None);
+        let h = ContentHash::from_bytes(b"chunk-one");
+        有.chunks = Some(vec![h]);
+        let line = super::to_line(&有).unwrap();
+        assert!(line.contains(&h.to_hex()), "{line}");
+        assert!(
+            !line.contains(&format!("blake3:{}", h.to_hex())),
+            "块名是裸十六进制，不带前缀：{line}"
+        );
+        assert_eq!(super::parse_line(&line, 1).unwrap().chunks, Some(vec![h]));
+    }
+
+    /// 老记录（没有 `chunks` 键）必须能被新读者读出来，且读成 `None`——
+    /// I10「只向前迁移」。
+    #[test]
+    fn 没有chunks键的老记录仍可解析且读成缺省() {
+        let 老 = r#"{"v":1,"version_id":"20260804T102302Z-00000000000000000000000000000000","item_id":"3f2a000000000000000000000000beef","parent":null,"hash":"blake3:ed7002b439e9ac845f22357d822bac1444730fbdb6016d3ec9432297b9ec9f73","size":7,"mtime":"2026-08-04T10:22:31Z","actor":{"account":"bruce","device":"mac","session":"s1"},"committed_at":"2026-08-04T10:23:05Z"}"#;
+        let v = super::parse_line(老, 1).expect("老记录必须仍可解析");
+        assert_eq!(v.chunks, None, "缺省必须读成 None，绝不是 Some(vec![])");
+    }
+
+    /// `chunks` 里出现不合规的哈希 → **拒绝整行**，不是跳过那一个
+    /// （I5：一条自称有块清单却给不出合法块名的记录是歧义状态）。
+    #[test]
+    fn chunks里的畸形哈希导致整行被拒() {
+        let 坏 = r#"{"v":1,"version_id":"20260804T102302Z-00000000000000000000000000000000","item_id":"3f2a000000000000000000000000beef","parent":null,"hash":"blake3:ed7002b439e9ac845f22357d822bac1444730fbdb6016d3ec9432297b9ec9f73","size":7,"mtime":"m","actor":{"account":"a","device":"d","session":"s"},"committed_at":"c","chunks":["不是十六进制"]}"#;
+        assert!(super::parse_line(坏, 1).is_err());
     }
 
     #[test]

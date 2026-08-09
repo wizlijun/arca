@@ -133,6 +133,18 @@ pub struct Version {
     pub mtime: String,
     pub actor: Actor,
     pub committed_at: String,
+    /// 这一版内容被切成的块（FORMAT.md §7.1 的 `chunks` 字段）。
+    ///
+    /// `None` 与 `Some(vec![])` **意义不同，不可互换**：
+    ///
+    /// - `None`（字段缺省）= **这一版的内容没有被留存**。要么它就是当前版本
+    ///   （字节还在 `files/` 里），要么它是本字段落地之前写下的老记录。
+    /// - `Some(vec![])` = 留存过，而内容是**零字节**——一个合法的空文件。
+    ///
+    /// 把两者合并成 `Vec` 会让老记录被读成「零字节」，那意味着
+    /// `arca checkout` 会拿一个空文件去覆盖用户的历史版本。用 `Option`
+    /// 把这条区分钉在类型上，而不是靠每个调用方记得。
+    pub chunks: Option<Vec<ContentHash>>,
 }
 
 #[cfg(test)]

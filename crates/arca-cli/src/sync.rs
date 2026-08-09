@@ -2193,6 +2193,7 @@ mod tests {
             mtime: "2026-08-08T09:00:00Z".to_string(),
             actor: actor(),
             committed_at: "2026-08-08T09:00:05Z".to_string(),
+            chunks: None,
         };
         let item_rel = layout::item_path(&item_id);
         let item_full = store.path().join(&item_rel);
