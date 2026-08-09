@@ -96,6 +96,18 @@ enum Command {
         #[arg(long)]
         root: Option<std::path::PathBuf>,
     },
+    /// 查看或设置一个数据集在本机的存储角色：server（永久保留）/ client
+    /// （可再生缓存，默认，M2d Task 1，spec §4.7）
+    Role {
+        /// 数据集路径，相对 vault 根
+        path: String,
+        /// 设为 server 或 client；不带此参数则只查看当前角色
+        #[arg(long)]
+        set: Option<String>,
+        /// 覆盖从 .gitarca 解析出的存储根路径
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
     /// 一致性巡检：.gitarca 一致性 + 本地存在但 hub 尚无副本的文件告警
     Doctor {
         /// 覆盖从 .gitarca 解析出的存储根路径（对本次巡检的全部数据集生效）
@@ -225,6 +237,9 @@ fn main() -> std::process::ExitCode {
         Command::Sync { path, root } => commands::porcelain::sync_cmd(&path, root.as_deref()),
         Command::Status { path, root } => commands::porcelain::status_cmd(&path, root.as_deref()),
         Command::Verify { path, root } => commands::porcelain::verify_cmd(&path, root.as_deref()),
+        Command::Role { path, set, root } => {
+            commands::porcelain::role_cmd(&path, set.as_deref(), root.as_deref())
+        }
         Command::Doctor { root } => commands::porcelain::doctor_cmd(root.as_deref()),
         Command::Restore {
             dataset,

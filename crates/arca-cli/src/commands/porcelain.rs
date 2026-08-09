@@ -30,6 +30,7 @@ use arca_cli::dataset::{self, HubTarget};
 use arca_cli::doctor;
 use arca_cli::init::{self, HookOutcome};
 use arca_cli::register::{self, RegisterOptions};
+use arca_cli::role;
 use arca_cli::status as status_lib;
 use arca_cli::sync::{self as sync_lib, SyncActor, SyncError};
 use arca_cli::trace_sink;
@@ -133,6 +134,66 @@ pub fn register_cmd(
         Err(e) => {
             eprintln!("{e}");
             ExitCode::from(1)
+        }
+    }
+}
+
+/// `arca role <path> [--set server|client] [--root <path>]`（M2d Task 1，
+/// FORMAT.md §9.5）：查看或设置一个数据集在**本机**的存储角色。只读写
+/// `<dataset>/.arca/client/role.toml`——不打开存储根、不联网，纯本地决策
+/// （spec §4.7）；`--root` 参数只是为了与其它命令的调用形状保持一致，
+/// `dataset::resolve` 解析出的 `dataset_dir` 才是本命令唯一关心的东西。
+///
+/// 不带 `--set`：把当前角色打印到 stdout（数据，可脚本消费）——文件缺失时
+/// 打印的是默认角色 `client`，不是空输出（`role::read` 的语义，见其文档）。
+/// 带 `--set`：写入新角色；设为 `server` 时额外在 stderr 提示这意味着什么
+/// （M2d Task 1 brief 明确要求：这是一个"永不主动释放空间"的承诺，用户
+/// 应该在设置的那一刻就被提醒，而不是要等到第一次删除传播时才发现）。
+pub fn role_cmd(path: &str, set: Option<&str>, root: Option<&Path>) -> ExitCode {
+    let resolved = match dataset::resolve(&cwd(), path, root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match set {
+        None => match role::read(&resolved.dataset_dir) {
+            Ok(current) => {
+                println!("{}", current.as_str());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(1)
+            }
+        },
+        Some(value) => {
+            let new_role = match role::Role::parse(value) {
+                Some(r) => r,
+                None => {
+                    eprintln!("--set 只接受 server 或 client，实得 {value:?}");
+                    return ExitCode::from(1);
+                }
+            };
+            match role::write(&resolved.dataset_dir, new_role) {
+                Ok(()) => {
+                    if matches!(new_role, role::Role::Server) {
+                        eprintln!(
+                            "{path} 已设为 server 角色：本设备承诺为这个数据集永久保留一份完整\
+                             副本——远端删除到达、过闸门之后，本地副本只会移入本地回收站\
+                             （.arca/client/trash/），不释放空间，物理销毁只经未来的显式清理\
+                             命令（本版本尚未提供）。"
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::from(1)
+                }
+            }
         }
     }
 }

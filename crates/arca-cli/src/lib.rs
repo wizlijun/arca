@@ -29,6 +29,7 @@ pub mod ids;
 pub mod init;
 pub mod journal;
 pub mod register;
+pub mod role;
 pub mod scan;
 pub mod status;
 pub mod sync;
