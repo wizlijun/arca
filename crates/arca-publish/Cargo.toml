@@ -9,3 +9,4 @@ homepage.workspace = true
 
 [dependencies]
 arca-format = { path = "../arca-format" }
+arca-chunk = { path = "../arca-chunk" }

@@ -168,6 +168,7 @@ dependencies = [
 name = "arca-publish"
 version = "0.0.1"
 dependencies = [
+ "arca-chunk",
  "arca-format",
 ]
 
