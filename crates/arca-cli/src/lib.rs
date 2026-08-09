@@ -20,6 +20,7 @@
 
 pub mod adopt;
 pub mod baseline;
+pub mod checkout;
 pub mod clock;
 pub mod dataset;
 pub mod doctor;

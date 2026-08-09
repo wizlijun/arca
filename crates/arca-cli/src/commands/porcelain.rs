@@ -755,6 +755,29 @@ fn status_one(path: &str, root: Option<&Path>) -> u8 {
     // 的离线由 `TransportError::Offline`（503）表达，翻译成同一个退出码 2、
     // 同一句措辞——拔盘演练脚本对三个命令做同一种断言，措辞分裂会让它要么
     // 漏判要么各写一套规则。
+    // 清单与基线是否一致（spec §6.3 第 10 条）。**最常见的成因是
+    // `git checkout` 到了另一个提交**：清单在 git 里、会跟着切换，而受管
+    // 二进制不在 git 里、不会跟着变。不报告的话，`status` 会在一个
+    // 「工作区与 git 说的对不上」的状态下报告「一切同步」——那正是
+    // I5 要挡住的那种静默。
+    let mut manifest_level = 0u8;
+    match doctor::check_manifest(&resolved.dataset_dir) {
+        Ok(None) => {}
+        Ok(Some(issue)) => {
+            manifest_level = 1;
+            eprintln!(
+                "数据集 {path}：{issue}\n\
+                 如果你刚 `git checkout` 到别的提交，这是预期的：清单跟着 git 走了，\
+                 而受管二进制不在 git 里、留在原地。用 `arca checkout {path}` 把它们\
+                 还原到清单说的那个版本。"
+            );
+        }
+        Err(e) => {
+            manifest_level = 1;
+            eprintln!("数据集 {path} 的清单检查失败：{e}");
+        }
+    }
+
     let mut sink = NullSink;
     let result = match &resolved.target {
         HubTarget::Local(root_path) => {
@@ -780,7 +803,10 @@ fn status_one(path: &str, root: Option<&Path>) -> u8 {
         }
     };
 
-    let mut level: u8 = 0;
+    // 清单漂移与调和结果取严重的那个：两者都是「有待办」（退出码 1），
+    // 但清单漂移**即使调和完全干净也要报**——那正是 `git checkout` 之后
+    // 的状态：远端与基线一致、工作区与清单不一致。
+    let mut level: u8 = manifest_level;
     match result {
         Ok(report) => {
             if report.is_silent() {
@@ -1565,6 +1591,116 @@ pub fn restore_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// `arca checkout`（spec §6.3 第 10 条）
+// ---------------------------------------------------------------------------
+
+/// `arca checkout <数据集> [--yes] [--force]`——把受管二进制还原到
+/// **清单说的那个版本**。
+///
+/// 典型场景：`git checkout` 到旧提交之后，清单变回了旧版本，而受管二进制
+/// 不在 git 里、还停在新版本。`arca status` 会报出这道缝，这条命令弥合它。
+pub fn checkout_cmd(path: &str, yes: bool, force: bool, root: Option<&Path>) -> ExitCode {
+    let resolved = match dataset::resolve(&cwd(), path, root) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let manifest_path = resolved.dataset_dir.join(".arca").join("manifest");
+    let text = match std::fs::read_to_string(&manifest_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "{} 不存在——这个数据集还没有清单（从未同步过），没有可还原的目标版本。",
+                manifest_path.display()
+            );
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!("读取 {} 失败：{e}", manifest_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let manifest = match arca_format::manifest::Manifest::parse(&text) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{} 解析失败：{e}", manifest_path.display());
+            return ExitCode::from(1);
+        }
+    };
+
+    let report = match &resolved.target {
+        HubTarget::Local(p) => {
+            let store = match arca_store::root::StorageRoot::open(p, Some(&resolved.cfg.dataset_id))
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
+                    return ExitCode::from(2);
+                }
+            };
+            let t = arca_cli::transport::local::LocalTransport::new(&store);
+            arca_cli::checkout::checkout(&resolved.dataset_dir, &manifest, &t, yes, force)
+        }
+        HubTarget::Http { base_url, tls_pin } => {
+            let t = match http_transport(
+                base_url,
+                &resolved.cfg.dataset_id,
+                tls_pin.as_deref(),
+                None,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(1);
+                }
+            };
+            arca_cli::checkout::checkout(&resolved.dataset_dir, &manifest, &t, yes, force)
+        }
+    };
+
+    for (p, outcome) in &report.files {
+        match outcome {
+            arca_cli::checkout::Outcome::AlreadyMatches => {}
+            arca_cli::checkout::Outcome::Ready { size, .. } => {
+                println!("checkout-ready\t{p}\t{size}")
+            }
+            arca_cli::checkout::Outcome::Restored { size, .. } => {
+                println!("checkout-restored\t{p}\t{size}")
+            }
+            arca_cli::checkout::Outcome::Skipped(reason) => {
+                println!("checkout-skipped\t{p}");
+                eprintln!("{p}：{reason}");
+            }
+        }
+    }
+
+    if report.ready() == 0 && report.restored() == 0 && report.skipped() == 0 {
+        // Rule of Silence：本地已经就是清单说的样子。
+        return ExitCode::SUCCESS;
+    }
+    if yes {
+        eprintln!(
+            "已还原 {} 个文件到清单说的版本，{} 个被跳过。",
+            report.restored(),
+            report.skipped()
+        );
+    } else {
+        eprintln!(
+            "以上是 **dry-run** 清单：{} 个可还原、{} 个被跳过，本次**没有改动任何文件**。\
+             确认无误后加 `--yes` 重跑。",
+            report.ready(),
+            report.skipped()
+        );
+    }
+    if report.skipped() > 0 {
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
 }
 
 // ---------------------------------------------------------------------------

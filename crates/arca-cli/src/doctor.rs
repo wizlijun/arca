@@ -574,7 +574,13 @@ fn check_ignore_block(repo: &Repo, normalized_path: &str) -> Result<Vec<IgnoreIs
 /// 基线是本地投影（I9：可抛弃），清单是从它渲染出的、进 git 的行式镜像——
 /// 两者理应逐路径一致；`sync` 现在每次收尾都会重新生成清单，这里独立巡检
 /// 一遍以覆盖"用旧版本二进制同步过""清单被人手工改过"这两类既有漂移。
-fn check_manifest(dataset_dir: &Path) -> Result<Option<ManifestIssue>, String> {
+/// 清单（git 里那份）与基线（本机投影）是否一致。
+///
+/// 公开出来给 `arca status` 用：**`git checkout` 到旧提交之后，清单会跟着
+/// 变回旧版本，而工作区的二进制不会**（它们不在 git 里）。此时不报告，
+/// `status` 就会在一个「工作区与 git 说的对不上」的状态下报告「一切同步」
+/// ——spec §6.3 第 10 条要挡的正是这个。
+pub fn check_manifest(dataset_dir: &Path) -> Result<Option<ManifestIssue>, String> {
     let loaded = baseline::load(dataset_dir).map_err(|e| e.to_string())?;
     let mut expected: BTreeMap<String, (String, u64)> = BTreeMap::new();
     for (path, state) in loaded.iter() {

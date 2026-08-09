@@ -187,6 +187,23 @@ enum Command {
     /// 路径与 arca 自己的诊断结论，绝不读取任何受管文件的内容**；输出直接
     /// 打到 stdout，不落盘、不上传——你在按回车之前就能把收了什么看个遍
     Bugreport,
+    /// 把受管二进制还原到**清单说的那个版本**（spec §6.3 第 10 条）。
+    /// 典型场景：`git checkout` 到旧提交之后，清单跟着 git 变回了旧版本，
+    /// 而受管二进制不在 git 里、还停在新版本。**默认只出清单**
+    Checkout {
+        /// 数据集路径，相对 vault 根
+        dataset: String,
+        /// 真的改写文件。不给这个开关时只出清单
+        #[arg(long)]
+        yes: bool,
+        /// 连**本地有未保存改动**的文件也一起覆盖。默认拒绝它们——
+        /// 那些改动还没有被任何地方保存，覆盖等于销毁未同步的工作
+        #[arg(long)]
+        force: bool,
+        /// 覆盖从 .gitarca 解析出的存储根路径
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
     /// 从既有仓库迁入（spec §8）
     Import {
         #[command(subcommand)]
@@ -411,6 +428,12 @@ fn main() -> std::process::ExitCode {
                 root.as_deref(),
             )
         }
+        Command::Checkout {
+            dataset,
+            yes,
+            force,
+            root,
+        } => commands::porcelain::checkout_cmd(&dataset, yes, force, root.as_deref()),
         Command::Import { action } => match action {
             ImportCommand::Lfs { path, yes } => {
                 commands::porcelain::import_lfs_cmd(path.as_deref(), yes)
