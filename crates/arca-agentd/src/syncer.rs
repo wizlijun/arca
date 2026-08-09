@@ -28,7 +28,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use arca_cli::sync::{SyncActor, SyncReport};
-use arca_cli::transport::Transport;
+use arca_cli::transport::{ChangesOutcome, Transport};
+use arca_format::journal::Cursor;
 use tokio::sync::watch;
 
 /// 相邻两轮对账之间的基础间隔。
@@ -203,6 +204,62 @@ fn sync_error_class(e: &arca_cli::sync::SyncError) -> ErrorClass {
     match e {
         arca_cli::sync::SyncError::Transport(t) => t.class(),
         _ => ErrorClass::NeedsHuman,
+    }
+}
+
+/// 一次「等着有事发生」的结果（M3a Task 3）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum Wakeup {
+    /// 有新事件（或者等待超时到点了）——去跑一轮调和。
+    Reconcile,
+    /// 服务端说这个游标没法续接：丢掉它，做一次全量对账。
+    ResetAndReconcile,
+    /// 该停了。
+    Stop,
+}
+
+/// 用 `Transport::changes` 的 longpoll 当唤醒器。
+///
+/// # 为什么 `changes` 只用来**唤醒**，不用来驱动调和
+///
+/// 拿到事件之后「按事件增量地改本地」是很诱人的写法，但那等于在 agentd 里
+/// 重新实现一遍调和——而调和的正确性全部由 `arca-core` 的 18 格决策表与
+/// `arca_cli::sync` 的四道闸门保证。事件流告诉我们的只是**「那边有动静」**；
+/// 「该怎么办」仍然要交给同一段代码去算。
+///
+/// 代价是每次唤醒都做一次全量对账（扫本地 + 读远端 state）。收益是
+/// **agentd 与手动命令永远不会给出不同的结果**——这正是 M2d 评审在
+/// `Transport` 上抓过的那类分叉，本切片从一开始就不留口子。
+///
+/// 真正的增量优化（只对变动路径做调和）要等到调和本身支持「只看这几条路径」，
+/// 那是 `arca-core` 的接口问题，不是 agentd 该私自解决的问题。
+pub async fn wait_for_change<F>(
+    since: Option<Cursor>,
+    wait: Duration,
+    probe: F,
+    shutdown: &mut watch::Receiver<bool>,
+) -> (Wakeup, Option<Cursor>)
+where
+    F: FnOnce(Option<Cursor>, Duration) -> Result<ChangesOutcome, String> + Send + 'static,
+{
+    if *shutdown.borrow() {
+        return (Wakeup::Stop, since);
+    }
+    let probe_task = tokio::task::spawn_blocking(move || probe(since.clone(), wait));
+    tokio::select! {
+        joined = probe_task => match joined {
+            // 有事件、以及 longpoll 空转超时，处置**相同**：都跑一轮调和。
+            // 空转也跑不是浪费——周期性全量对账是 spec §5.2 三重保险的最后
+            // 一层，事件流漏了也要收敛。这一层的存在，正是上面「changes 只
+            // 用来唤醒」那个取舍能够成立的原因。
+            Ok(Ok(ChangesOutcome::Events { cursor, .. })) => (Wakeup::Reconcile, cursor),
+            Ok(Ok(ChangesOutcome::ResetRequired { cursor })) => (Wakeup::ResetAndReconcile, cursor),
+            // 探测失败（网络抖动、hub 掉线）不是致命的：照常跑一轮调和，
+            // 让 `sync_transport` 去给出准确的错误与分类。在这里自己判断
+            // 「这算不算能重试」会与 `sync_error_class` 形成第二套判据。
+            Ok(Err(_)) | Err(_) => (Wakeup::Reconcile, None),
+        },
+        _ = shutdown.changed() => (Wakeup::Stop, None),
     }
 }
 

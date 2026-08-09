@@ -90,10 +90,12 @@ pub mod local;
 
 use arca_chunk::hash::ContentHash;
 use arca_core::state::RemoteState;
+use arca_format::journal::{Cursor, JournalEvent};
 use arca_format::model::{Actor, ItemId, VersionId};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
+use std::time::Duration;
 
 /// 提交一个新版本所需的全部信息。
 ///
@@ -427,4 +429,48 @@ pub trait Transport {
         item_id: ItemId,
         expected_hash: ContentHash,
     ) -> Result<Option<Recoverable>, TransportError>;
+
+    /// 拉取 `since` 之后的 journal 事件（M3a Task 3，PROTOCOL.md §3、spec §5.2）。
+    ///
+    /// 这是 agentd 增量回路的输入：M2c 建好了服务端 `GET /changes` 与 longpoll，
+    /// 但**客户端一直没有消费者**——本方法就是那个消费者的传输面。
+    ///
+    /// - `since = None` 等价于「从头开始」。
+    /// - `wait` 是 longpoll 的挂起上限。`http(s)://` 会真的挂起；
+    ///   `file://` **没有可挂起的对象**，它立刻返回（见
+    ///   [`local::LocalTransport::changes`] 的说明）——调用方据此自己决定
+    ///   下一轮什么时候来，绝不能假设「返回了就说明有新事件」。
+    /// - `limit` 是单次最多返回的事件数，服务端会把它钳到自己的上限。
+    ///
+    /// 游标早于保留区间（或超前于服务端所知）时返回
+    /// [`ChangesOutcome::ResetRequired`] 而**不是**错误，也**不是**静默地
+    /// 「从头开始」：调用方必须据此做一次全量对账，再从响应给出的游标继续。
+    /// I5 在这里的含义很具体——把 `reset_required` 当成「从头开始」会静默
+    /// 重下全库，把一个可诊断的状态变成一次无声的巨量传输。
+    fn changes(
+        &self,
+        since: Option<&Cursor>,
+        wait: Duration,
+        limit: usize,
+    ) -> Result<ChangesOutcome, TransportError>;
+}
+
+/// [`Transport::changes`] 的结果。
+///
+/// 两个变体都是**成功**——`ResetRequired` 不是错误，它是服务端在诚实地说
+/// 「你那个游标我没法从它继续，请先全量对账」。做成 `Ok` 的变体而不是
+/// `Err`，是为了让「必须处理它」这件事落在类型上：`Err` 很容易被一个
+/// 泛泛的重试逻辑吞掉，而漏掉全量对账的后果是客户端永远缺一段历史。
+/// 这与 `CommitOutcome::Conflict` 是 `Ok` 变体同一条纪律（M2b）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangesOutcome {
+    Events {
+        events: Vec<JournalEvent>,
+        /// 下一次 `since` 该用的游标。数据集从未有过任何事件时为 `None`。
+        cursor: Option<Cursor>,
+    },
+    ResetRequired {
+        /// 服务端此刻的有效游标——全量对账之后从这里继续增量。
+        cursor: Option<Cursor>,
+    },
 }

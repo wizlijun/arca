@@ -12,8 +12,8 @@
 //! `DELETE` 就应该在服务端真正校验 If-Match。
 
 use super::{
-    BatchOutcome, CommitOutcome, CommitRequest, Recoverable, RenameRequest, TombstoneRequest,
-    Transport, TransportError,
+    BatchOutcome, ChangesOutcome, CommitOutcome, CommitRequest, Recoverable, RenameRequest,
+    TombstoneRequest, Transport, TransportError,
 };
 use crate::{hub, journal, trash};
 use arca_chunk::hash::ContentHash;
@@ -21,7 +21,7 @@ use arca_core::state::RemoteState;
 use arca_format::hub_layout::layout;
 use arca_format::index::IndexRecord;
 use arca_format::items;
-use arca_format::journal::{JournalEvent, Op};
+use arca_format::journal::{Cursor, JournalEvent, Op};
 use arca_format::model::{Actor, ItemId, Version, VersionId};
 use arca_format::path_rules;
 use arca_store::atomic;
@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::time::Duration;
 
 /// `file://` 传输：包一个已打开、身份已确认的存储根。
 ///
@@ -755,6 +756,60 @@ impl Transport for LocalTransport<'_> {
         }
         Ok(None)
     }
+
+    /// `file://` 的变更流：直接读 journal，按游标裁剪。
+    ///
+    /// # `wait` 被**忽略**，这是有意的
+    ///
+    /// longpoll 的本质是「服务端替客户端等」，而 `file://` 没有服务端——
+    /// 没有任何进程能在别人写入 journal 时叫醒我们。可选的替代是在这里
+    /// 自己轮询文件 mtime 直到超时，但那只是把轮询藏进传输层：调用方
+    /// 以为自己拿到了推送语义，实际拿到的是一个看不见的忙等。
+    ///
+    /// 所以这里**立刻返回**，并由 `Transport::changes` 的文档明说
+    /// 「`file://` 不挂起，调用方自己决定下一轮什么时候来」。诚实的
+    /// 「我做不到」好过一个形似推送的轮询——后者会让 agentd 的回路
+    /// 时序变得无法解释。
+    fn changes(
+        &self,
+        since: Option<&Cursor>,
+        _wait: Duration,
+        limit: usize,
+    ) -> Result<ChangesOutcome, TransportError> {
+        let (cursor_now, all) = journal::read_all(self.root).map_err(|e| TransportError::Io {
+            path: self.root.path().display().to_string(),
+            reason: e.to_string(),
+        })?;
+
+        let Some(since) = since else {
+            // 从头开始：全部事件（受 `limit` 约束）。
+            return Ok(truncate_changes(all, cursor_now, limit));
+        };
+
+        // epoch 不符 → `reset_required`。与 arcad 同一判据（PROTOCOL.md §3）：
+        // 本阶段没有 journal 压缩，epoch 一旦存在就不会变，所以任何不匹配
+        // 都意味着这个游标没法从它继续。
+        match &cursor_now {
+            None => {
+                // 数据集这一侧一条事件都没有，而客户端却拿着一个游标——
+                // 它声称见过我们没有的东西，同样没法诚实地续上。
+                return Ok(ChangesOutcome::ResetRequired { cursor: None });
+            }
+            Some(now) if now.epoch != since.epoch => {
+                return Ok(ChangesOutcome::ResetRequired { cursor: cursor_now });
+            }
+            Some(now) if since.seq > now.seq => {
+                // 游标超前于我们所知的末尾——与 epoch 不符同一处置
+                // （M2c 评审 Minor：修复前这种情形会返回一个"倒退"的游标，
+                // 与「游标只应单调前进」的调用约定矛盾）。
+                return Ok(ChangesOutcome::ResetRequired { cursor: cursor_now });
+            }
+            Some(_) => {}
+        }
+
+        let rest: Vec<JournalEvent> = all.into_iter().filter(|e| e.seq > since.seq).collect();
+        Ok(truncate_changes(rest, cursor_now, limit))
+    }
 }
 
 /// 追加一条版本记录到 `items/<xx>/<item_id>.jsonl`——与
@@ -842,6 +897,35 @@ fn remove_index_record(root: &StorageRoot, path: &str) -> Result<(), TransportEr
             reason: e.to_string(),
         }),
     }
+}
+
+/// 把事件列表按 `limit` 截断，并把游标相应地**只推进到这一批的最后一条**
+/// ——不是数据集当前最新游标。
+///
+/// 这一条是协议里最容易写错的地方（PROTOCOL.md §3 专门写明）：如果截断了
+/// 却给出最新游标，客户端下一次从那里继续，中间被截掉的事件就**永久丢失**
+/// 了，而且没有任何征兆——它会表现为"某个文件的某次改动从未发生过"。
+fn truncate_changes(
+    mut events: Vec<JournalEvent>,
+    cursor_now: Option<Cursor>,
+    limit: usize,
+) -> ChangesOutcome {
+    if limit == 0 || events.len() <= limit {
+        return ChangesOutcome::Events {
+            events,
+            cursor: cursor_now,
+        };
+    }
+    events.truncate(limit);
+    let last_seq = events.last().map(|e| e.seq);
+    let cursor = match (cursor_now, last_seq) {
+        (Some(c), Some(seq)) => Some(Cursor {
+            epoch: c.epoch,
+            seq,
+        }),
+        (c, _) => c,
+    };
+    ChangesOutcome::Events { events, cursor }
 }
 
 #[cfg(test)]

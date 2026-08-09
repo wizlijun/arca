@@ -36,11 +36,12 @@
 //! 搬运，不整份读进 `Vec<u8>` 再写出去。
 
 use super::{
-    BatchOutcome, CommitOutcome, CommitRequest, Recoverable, RenameRequest, TombstoneRequest,
-    Transport, TransportError,
+    BatchOutcome, ChangesOutcome, CommitOutcome, CommitRequest, Recoverable, RenameRequest,
+    TombstoneRequest, Transport, TransportError,
 };
 use arca_chunk::hash::ContentHash;
 use arca_core::state::RemoteState;
+use arca_format::journal::{Cursor, JournalEvent};
 use arca_format::model::{ItemId, VersionId};
 use arca_format::trace::Sid;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
@@ -776,6 +777,92 @@ impl Transport for HttpTransport {
             other => Err(TransportError::Protocol {
                 message: format!("GET .../trash/{} 返回意外状态码 {other}", item_id.to_hex()),
             }),
+        }
+    }
+
+    /// `GET /v1/datasets/{id}/changes`——M2c 建好的变更流，**这里是它的第一个
+    /// 客户端消费者**（M3a Task 3，PROTOCOL.md §3）。
+    fn changes(
+        &self,
+        since: Option<&Cursor>,
+        wait: Duration,
+        limit: usize,
+    ) -> Result<ChangesOutcome, TransportError> {
+        let mut req = self
+            .with_session(self.agent.get(self.dataset_url("/changes")))
+            .query("wait", wait.as_secs().to_string())
+            .query("limit", limit.to_string());
+        if let Some(c) = since {
+            req = req.query("since", c.to_string());
+        }
+        // longpoll 会挂起最多 `wait` 秒，读超时必须比它宽裕——否则客户端会在
+        // 服务端正常挂起期间自己先超时，把一次**成功的等待**误报成网络故障，
+        // 并触发退避。多给 30 秒余量覆盖服务端把 wait 钳到 90 之后的情形。
+        let mut resp = req
+            .config()
+            .timeout_recv_response(Some(wait + Duration::from_secs(30)))
+            .build()
+            .call()
+            .map_err(Self::map_send_error)?;
+
+        let status = resp.status();
+        if let Some(e) = Self::check_offline(status, resp.body_mut()) {
+            return Err(e);
+        }
+        match status {
+            StatusCode::OK => {
+                let body = read_json_body(&mut resp)?;
+                let cursor = parse_cursor_field(&body)?;
+                let raw = body
+                    .get("events")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| TransportError::Protocol {
+                        message: format!("GET .../changes 响应体缺少 events 数组：{body}"),
+                    })?;
+                let mut events = Vec::with_capacity(raw.len());
+                for v in raw {
+                    let line = serde_json::to_string(v).map_err(|e| TransportError::Protocol {
+                        message: format!("GET .../changes 事件无法重新序列化：{e}"),
+                    })?;
+                    events.push(JournalEvent::parse_line(&line, 0).map_err(|e| {
+                        TransportError::Protocol {
+                            message: format!("GET .../changes 事件解析失败：{e}（原文 {line}）"),
+                        }
+                    })?);
+                }
+                Ok(ChangesOutcome::Events { events, cursor })
+            }
+            // `410 journal.reset_required`——**不是错误**，是服务端在诚实地说
+            // 「你那个游标我没法从它继续」。返回 `Ok` 的变体强制调用方处理它：
+            // 当成错误会被泛泛的重试逻辑吞掉，当成「从头开始」会静默重下全库。
+            StatusCode::GONE => {
+                let body = read_json_body(&mut resp)?;
+                Ok(ChangesOutcome::ResetRequired {
+                    cursor: parse_cursor_field(&body)?,
+                })
+            }
+            other => Err(TransportError::Protocol {
+                message: format!("GET .../changes 返回意外状态码 {other}"),
+            }),
+        }
+    }
+}
+
+/// 从响应体里取 `cursor` 字段。**`null` 与缺失都是合法的**（数据集从未有过
+/// 任何事件），但一个存在却解析不出来的游标是协议错误——绝不当作 `None`
+/// 悄悄降级成「从头开始」（I5）。
+fn parse_cursor_field(body: &serde_json::Value) -> Result<Option<Cursor>, TransportError> {
+    match body.get("cursor") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => {
+            let text = v.as_str().ok_or_else(|| TransportError::Protocol {
+                message: format!("GET .../changes 的 cursor 字段不是字符串：{v}"),
+            })?;
+            Cursor::parse(text)
+                .map(Some)
+                .map_err(|e| TransportError::Protocol {
+                    message: format!("GET .../changes 的 cursor {text:?} 解析失败：{e}"),
+                })
         }
     }
 }

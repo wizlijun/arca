@@ -20,6 +20,7 @@
 //! `--once` 跑一轮就退出——给演练脚本与 CI 用，让「自动同步确实在工作」
 //! 可以被断言，而不必去 sleep 一个不确定的时长再猜。
 
+mod cursor;
 mod hydration;
 mod ipc;
 mod lock;
@@ -206,6 +207,17 @@ async fn run_loop(
     once: bool,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
+    // 增量游标：只对 http(s):// 有意义（`file://` 没有可挂起的对象，
+    // 见 `LocalTransport::changes` 的说明）。
+    let longpoll = matches!(resolved.target, HubTarget::Http { .. });
+    let loaded = cursor::load(&resolved.dataset_dir);
+    if !matches!(loaded, cursor::Loaded::Cursor(_)) && longpoll {
+        // 读不懂的游标要留一句诊断——「第一次跑」和「上次写坏了」对排障
+        // 的人是两件事（FORMAT.md §9.6）。
+        eprintln!("{}：{loaded}", lp.label);
+    }
+    let mut since = loaded.as_cursor().cloned();
+
     let mut healthy;
     loop {
         let outcome = reconcile_once(&resolved, actor.clone()).await;
@@ -249,21 +261,127 @@ async fn run_loop(
         lp.record(&outcome);
 
         if once {
+            // `--once` 也要把游标推进并落盘——否则每次脚本化调用（演练、CI、
+            // cron）都从头做一次全量对账，而**游标持久化这条路径也就永远
+            // 不会被这些流程走到**：一个只在长驻模式下才生效的持久化，
+            // 等于一个没被日常验证覆盖的持久化。
+            if longpoll && healthy {
+                if let Some(c) = probe_changes(&resolved, since.clone(), Duration::ZERO).await {
+                    persist(&resolved, &lp, c.as_ref());
+                }
+            }
             return healthy;
         }
-        // 失败时用退避，成功时用配置的间隔。
+
         let delay = if lp.consecutive_failures() == 0 {
             interval
         } else {
             lp.next_delay()
         };
-        if !syncer::wait_next(delay, shutdown).await {
-            return healthy;
+
+        // 失败之后走退避睡眠，不进 longpoll——一个连不上的 hub 上挂 60 秒
+        // 的 longpoll，等于把退避策略架空了。
+        if !longpoll || lp.consecutive_failures() > 0 {
+            if !syncer::wait_next(delay, shutdown).await {
+                return healthy;
+            }
+            continue;
+        }
+
+        // 这一轮调和成功了。**先把游标快进过我们自己刚写进 journal 的那些
+        // 事件**（`wait=0`，立刻返回），否则下一次 longpoll 会被自己的写入
+        // 立刻唤醒，白跑一轮空调和。
+        if let Some(c) = probe_changes(&resolved, since.clone(), Duration::ZERO).await {
+            since = c;
+            persist(&resolved, &lp, since.as_ref());
+        }
+
+        // 挂起等待对面的动静。
+        let probe = make_probe(&resolved);
+        let (wakeup, next) = syncer::wait_for_change(since.clone(), delay, probe, shutdown).await;
+        match wakeup {
+            syncer::Wakeup::Stop => return healthy,
+            syncer::Wakeup::ResetAndReconcile => {
+                // 服务端说这个游标没法续接。丢掉它做一次全量对账——**绝不
+                // 当作「从头开始」静默重下全库**，那正是 I5 要挡住的东西。
+                eprintln!(
+                    "{}（hub={}）：hub 报告增量游标已失效，本轮改做一次全量对账。",
+                    lp.label, lp.hub_name
+                );
+                if let Err(e) = cursor::clear(&resolved.dataset_dir) {
+                    eprintln!("{}：清除失效游标失败：{e}", lp.label);
+                }
+                since = next;
+                persist(&resolved, &lp, since.as_ref());
+            }
+            syncer::Wakeup::Reconcile => {
+                if let Some(c) = next {
+                    since = Some(c);
+                    persist(&resolved, &lp, since.as_ref());
+                }
+            }
         }
     }
 }
 
-/// 按 hub 类型造传输并跑一轮。两种传输走**同一个** `run_once`——差别只在
+/// 把游标落盘。失败**不中断回路**——丢了它的后果只是下次多做一次全量对账
+/// （FORMAT.md §9.6），为它停掉自动同步不划算。
+fn persist(
+    resolved: &arca_cli::dataset::ResolvedDataset,
+    lp: &Loop,
+    cursor: Option<&arca_format::journal::Cursor>,
+) {
+    let Some(c) = cursor else { return };
+    if let Err(e) = cursor::save(&resolved.dataset_dir, c) {
+        eprintln!(
+            "{}：增量游标写入失败（不影响本轮同步，下次会多做一次全量对账）：{e}",
+            lp.label
+        );
+    }
+}
+
+/// 造一个「探测变更流」的闭包，形状与 `reconcile_once` 里造传输的那一套一致。
+fn make_probe(
+    resolved: &arca_cli::dataset::ResolvedDataset,
+) -> impl FnOnce(
+    Option<arca_format::journal::Cursor>,
+    Duration,
+) -> Result<arca_cli::transport::ChangesOutcome, String>
+       + Send
+       + 'static {
+    let target = resolved.target.clone();
+    let dataset_id = resolved.cfg.dataset_id.clone();
+    move |since, wait| {
+        let HubTarget::Http { base_url, tls_pin } = &target else {
+            // `file://` 不走这条路（`longpoll` 为假），到这里说明调用点写错了。
+            return Err("file:// hub 不支持 longpoll 唤醒".to_string());
+        };
+        let transport =
+            build_http(base_url, &dataset_id, tls_pin.as_deref()).map_err(|f| f.message)?;
+        use arca_cli::transport::Transport;
+        transport
+            .changes(since.as_ref(), wait, 1000)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// 一次不挂起的探测，只为把游标快进到当前位置。返回 `None` 表示这次探测
+/// 没能给出可用的游标（网络抖动等）——保持原值，下一轮再说。
+async fn probe_changes(
+    resolved: &arca_cli::dataset::ResolvedDataset,
+    since: Option<arca_format::journal::Cursor>,
+    wait: Duration,
+) -> Option<Option<arca_format::journal::Cursor>> {
+    let probe = make_probe(resolved);
+    match tokio::task::spawn_blocking(move || probe(since, wait)).await {
+        Ok(Ok(arca_cli::transport::ChangesOutcome::Events { cursor, .. })) => Some(cursor),
+        // `ResetRequired` 交给下面真正的 longpoll 那一轮去处理——在这里
+        // 顺手清游标会让「为什么重下全库」少一条日志。
+        _ => None,
+    }
+}
+
+/// 按 hub 类型造传输并跑一轮。/// 按 hub 类型造传输并跑一轮。两种传输走**同一个** `run_once`——差别只在
 /// 怎么造传输，不在怎么调和。
 async fn reconcile_once(
     resolved: &arca_cli::dataset::ResolvedDataset,
