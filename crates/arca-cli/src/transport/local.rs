@@ -433,6 +433,20 @@ impl Transport for LocalTransport<'_> {
         // 条目真实会造成的状态，不是过时的批前快照。
         let mut working_remote: BTreeMap<String, RemoteState> = remote.clone();
         let mut working_last_version: BTreeMap<ItemId, Option<VersionId>> = BTreeMap::new();
+        // `item_id → 占用它的路径` 的倒排索引。
+        //
+        // 身份校验（「这个 item_id 是不是已经占用在别的路径上」，M2b 评审 C1）
+        // 原先是对 `working_remote` 做一次全扫，**每个请求扫一遍**——
+        // 于是一批 n 条就是 O(n²)。一万文件的 `adopt` 因此耗时 245 秒
+        // （预算 120 秒），而且这个平方项在批量化之前藏在
+        // `LocalTransport::commit` 的 `read_remote()` 里，批量化只是把它
+        // 搬了个家、换了个更便宜的常数。
+        //
+        // 建一次索引、随 `working_remote` 增量维护，校验就变成一次查表。
+        let mut owner_of: BTreeMap<ItemId, String> = working_remote
+            .iter()
+            .filter_map(|(p, s)| owner_item_id(s).map(|id| (id, p.clone())))
+            .collect();
 
         let mut prepared: Vec<(&CommitRequest, Option<VersionId>)> = Vec::with_capacity(reqs.len());
         for (index, req) in reqs.iter().enumerate() {
@@ -468,9 +482,11 @@ impl Transport for LocalTransport<'_> {
                     });
                 }
             }
-            if let Some(other_path) = working_remote.iter().find_map(|(p, s)| {
-                (p != &req.path && owner_item_id(s) == Some(req.item_id)).then(|| p.clone())
-            }) {
+            if let Some(other_path) = owner_of
+                .get(&req.item_id)
+                .filter(|p| *p != &req.path)
+                .cloned()
+            {
                 return Ok(BatchOutcome::Rejected {
                     index,
                     outcome: CommitOutcome::IdentityMismatch {
@@ -509,6 +525,7 @@ impl Transport for LocalTransport<'_> {
                 },
             );
             working_last_version.insert(req.item_id, Some(req.version_id.clone()));
+            owner_of.insert(req.item_id, req.path.clone());
             prepared.push((req, item_last_version));
         }
 

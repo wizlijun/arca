@@ -82,7 +82,9 @@
 // 留给一次专门的清理，见 `crates/arca-conformance/tests/nightmare/README.md`。
 #![allow(dead_code)]
 
-use crate::transport::{CommitOutcome, CommitRequest, RenameRequest, TombstoneRequest, Transport};
+use crate::transport::{
+    BatchOutcome, CommitOutcome, CommitRequest, RenameRequest, TombstoneRequest, Transport,
+};
 use crate::{baseline, clock, gates, hub, ids, local_trash, role, scan, trash, vault};
 use arca_chunk::hash::ContentHash;
 use arca_core::reconcile::{decide_traced, Action};
@@ -820,6 +822,8 @@ pub fn sync_transport<T: Transport>(
     paths.extend(remote.keys().cloned());
     paths.retain(|p| !handled.contains(p));
 
+    let mut pending_uploads: Vec<PendingUpload> = Vec::new();
+
     for (idx, path) in paths.iter().enumerate() {
         let base = baseline.get(path);
         let local = scan_result
@@ -834,6 +838,14 @@ pub fn sync_transport<T: Transport>(
         match decision.action {
             Action::Noop => {}
 
+            // **收集而不是立刻提交。** 每次 `Transport::commit` 内部都要
+            // 读一遍**全部**远端状态做身份校验（`LocalTransport::commit`
+            // 开头的 `read_remote()`），一万文件就是一万次 × 读一万条 ——
+            // O(n²)，实测一万文件基准 238s（预算 120s）。
+            //
+            // `commit_batch` 正是为此存在：读一次远端，批次内用
+            // `working_remote` 增量维护，同一把跨进程锁摊到整批。
+            // 见循环之后的 `flush_uploads`。
             Action::Upload { parent } => {
                 let local_path = dataset_root.join(to_native(path));
                 let bytes = fs::read(&local_path).map_err(|e| io_err(&local_path, e))?;
@@ -845,58 +857,23 @@ pub fn sync_transport<T: Transport>(
                         "Upload{parent:Some(_)} 意味着 base 或 remote 至少一方已知这个 item",
                     ),
                 };
-                let version_id = ids::new_version_id();
                 let mtime = fs::metadata(&local_path)
                     .and_then(|m| m.modified())
                     .map(rfc3339_from_systemtime)
                     .unwrap_or_else(|_| clock::now_rfc3339());
-                let outcome = transport
-                    .commit(&CommitRequest {
+                pending_uploads.push(PendingUpload {
+                    hash,
+                    size,
+                    req: CommitRequest {
                         path: path.clone(),
                         item_id,
-                        version_id: version_id.clone(),
+                        version_id: ids::new_version_id(),
                         parent,
                         bytes,
                         mtime,
                         actor: actor.clone(),
-                    })
-                    .map_err(SyncError::Transport)?;
-                match outcome {
-                    CommitOutcome::Committed {
-                        item_id,
-                        version_id,
-                    } => {
-                        baseline.set(
-                            path.clone(),
-                            BaseState::Present {
-                                item_id,
-                                version_id,
-                                hash,
-                                size,
-                            },
-                        );
-                        report.uploaded.push(path.clone());
-                    }
-                    // 提交时刻才发现的 CAS 冲突——`decide()` 用的是循环开始
-                    // 时读到的那份 `remote` 快照，两机并发写同一路径时，
-                    // 对方可能恰好在这中间提交成功。**不更新基线**：下一轮
-                    // `decide()` 会用（仍然是旧的）基线 + 本地内容 + 这一次
-                    // 已经变化的远端内容重新判断，落进
-                    // `both_new_divergent`/`three_way_divergent` 的常规
-                    // Conflict 分支——双方各自的内容都原封不动（远端已提交
-                    // 的版本没被覆盖，本地文件也没被覆盖），这正是「双版本
-                    // 并存、绝不静默覆盖」（spec §5.3）在 CAS 冲突这条路径
-                    // 上的落地，不需要额外发明"冲突副本"机制。
-                    CommitOutcome::Conflict { .. } => {
-                        report.conflicts.push(path.clone());
-                    }
-                    // 身份校验没过（item_id 已被别的路径占用，或已被
-                    // tombstone 终结）——状态模糊，按 I5 停下等人，不猜测
-                    // 该怎么处理。
-                    CommitOutcome::IdentityMismatch { .. } => {
-                        report.needs_human.push(path.clone());
-                    }
-                }
+                    },
+                });
             }
 
             Action::Download { version_id } => {
@@ -1015,10 +992,119 @@ pub fn sync_transport<T: Transport>(
         }
     }
 
+    flush_uploads(transport, pending_uploads, &mut baseline, &mut report)?;
+
     baseline.save(dataset_root).map_err(SyncError::Baseline)?;
     write_manifest(dataset_root, &baseline)?;
 
     Ok(report)
+}
+
+/// 一条攒着待提交的上传——见 `Action::Upload` 分支处的说明。
+struct PendingUpload {
+    hash: ContentHash,
+    size: u64,
+    req: CommitRequest,
+}
+
+/// 把攒下来的上传一次性提交。
+///
+/// # 为什么批量：`commit` 是 O(n²) 的
+///
+/// `LocalTransport::commit` 每次都要读一遍**全部**远端状态来做身份校验
+/// （`item_id` 是不是已经占用在别的路径上，M2b 评审 C1），并各自取一次
+/// 跨进程锁。一万文件 = 一万次 × 读一万条。实测一万文件基准 **238s**
+/// （预算 120s），而每文件成本随规模上升（200 文件 39.8ms/个、
+/// 800 文件 56.5ms/个）——正是 O(n²) 的形状。
+///
+/// `commit_batch` 读一次远端、批次内用 `working_remote` 增量维护、
+/// 整批共用一把锁。这也顺带关掉了 M2c 评审记的
+/// 「`commit_batch` 生产路径零调用者」。
+///
+/// # 批次被拒时逐条回退——语义必须与逐条提交完全一致
+///
+/// `commit_batch` 是全有全无的：任何一条校验没过，**整批都不写**。
+/// 而逐条提交时，一个冲突只影响那一条、其余照常上传。如果直接把整批的
+/// 失败报成「全部冲突」，一万文件里的一次并发冲突会让另外 9999 个都传不上去
+/// ——那是把一个局部问题放大成全局停摆。
+///
+/// 所以被拒时**退回逐条提交**：慢，但只在真的出现冲突时才发生，
+/// 而且行为与批量化之前**逐字节一致**。
+fn flush_uploads<T: Transport>(
+    transport: &T,
+    pending: Vec<PendingUpload>,
+    baseline: &mut baseline::Baseline,
+    report: &mut SyncReport,
+) -> Result<(), SyncError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let reqs: Vec<CommitRequest> = pending.iter().map(|u| u.req.clone()).collect();
+    match transport
+        .commit_batch(&reqs)
+        .map_err(SyncError::Transport)?
+    {
+        BatchOutcome::Committed(results) => {
+            debug_assert_eq!(results.len(), pending.len());
+            for (u, (item_id, version_id)) in pending.iter().zip(results) {
+                baseline.set(
+                    u.req.path.clone(),
+                    BaseState::Present {
+                        item_id,
+                        version_id,
+                        hash: u.hash,
+                        size: u.size,
+                    },
+                );
+                report.uploaded.push(u.req.path.clone());
+            }
+            Ok(())
+        }
+        // 整批未写入任何内容——退回逐条，让没问题的那些照常上传。
+        BatchOutcome::Rejected { .. } => {
+            for u in &pending {
+                commit_one(transport, u, baseline, report)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 逐条提交一次上传。这是批量被拒之后的回退路径，行为与批量化之前完全一致。
+fn commit_one<T: Transport>(
+    transport: &T,
+    u: &PendingUpload,
+    baseline: &mut baseline::Baseline,
+    report: &mut SyncReport,
+) -> Result<(), SyncError> {
+    let path = &u.req.path;
+    match transport.commit(&u.req).map_err(SyncError::Transport)? {
+        CommitOutcome::Committed {
+            item_id,
+            version_id,
+        } => {
+            baseline.set(
+                path.clone(),
+                BaseState::Present {
+                    item_id,
+                    version_id,
+                    hash: u.hash,
+                    size: u.size,
+                },
+            );
+            report.uploaded.push(path.clone());
+        }
+        // 提交时刻才发现的 CAS 冲突——`decide()` 用的是循环开始时读到的
+        // 那份 `remote` 快照，两机并发写同一路径时对方可能恰好在这中间提交
+        // 成功。**不更新基线**：下一轮会用旧基线 + 本地内容 + 已变化的远端
+        // 重新判断，落进常规 Conflict 分支——双方内容都原封不动，这正是
+        // 「双版本并存、绝不静默覆盖」（spec §5.3）在 CAS 冲突上的落地。
+        CommitOutcome::Conflict { .. } => report.conflicts.push(path.clone()),
+        // 身份校验没过（item_id 已被别的路径占用，或已被 tombstone 终结）
+        // ——状态模糊，按 I5 停下等人。
+        CommitOutcome::IdentityMismatch { .. } => report.needs_human.push(path.clone()),
+    }
+    Ok(())
 }
 
 /// 改名检测：内容哈希匹配的"消失路径 ↔ 新增路径"配对，**唯一匹配才算数**
