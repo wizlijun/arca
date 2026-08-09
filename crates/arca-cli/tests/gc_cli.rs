@@ -283,3 +283,56 @@ fn hub侧gc在存储根离线时报离线而不是当空库() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("离线"), "{stderr:?}");
 }
+
+/// 「有 `.meta` 但磁盘上没有 `.data`」的条目被销毁时，报告必须**单独点名**，
+/// 而不是混进普通销毁里让「回收 0 字节」当唯一线索。
+///
+/// 这个状态是歧义的：可能是上一次 gc 销毁到一半被打断留下的残留（先 `.data`
+/// 后 `.meta`，补删是自愈），也可能是那份内容以别的方式丢了——而这条 `.meta`
+/// 的原路径就是「丢的是哪个文件」的最后一条线索。gc 选自愈是对的（把它当
+/// blocker 会让任何一次 gc 崩溃永久堵死后续所有 gc），**但选了之后要说出来**。
+///
+/// 实机跑 gc 时发现的：一条正常条目 + 一条无内容条目一起销毁，输出里除了
+/// 清单那行的 `0`，没有任何地方提示第二条根本没回收到空间。
+#[test]
+fn 销毁无内容的条目时报告单独点名而不是混进普通销毁() {
+    let (vault, store) = 造一个有回收站条目的vault();
+    let root = store.path().join("root");
+
+    // 制造中间态：把回收站里那条记录的 `.data` 拿掉，`.meta` 留着。
+    let data = std::fs::read_dir(root.join(".arca/trash"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "data"))
+        .expect("测试前置条件：回收站里应当有一份 .data");
+    std::fs::remove_file(&data).unwrap();
+
+    let out = arca(
+        vault.path(),
+        &["gc", "assets", "--retention-days", "0", "--yes"],
+    );
+    assert!(out.status.success(), "自愈路径不该失败：{out:?}");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("已经没有内容"),
+        "必须单独点名这类条目，否则用户唯一的线索只有清单里那个 0：{stderr}"
+    );
+    assert!(
+        stderr.contains("以别的方式丢了"),
+        "必须说出第二种成因，让人有机会认出「这不是我中断的 gc」：{stderr}"
+    );
+
+    // 反面：全都是正常条目时，不该冒出这句话（否则它就成了噪音）。
+    let (vault2, _store2) = 造一个有回收站条目的vault();
+    let out2 = arca(
+        vault2.path(),
+        &["gc", "assets", "--retention-days", "0", "--yes"],
+    );
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    assert!(
+        !stderr2.contains("已经没有内容"),
+        "正常销毁不该出现这句提示：{stderr2}"
+    );
+}
