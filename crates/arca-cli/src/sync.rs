@@ -75,10 +75,15 @@
 //! 抽象当初正是为了消除这类分叉，见上文「与 `sync()` 的关系」），因此收敛
 //! 成一个函数，两个调用点只负责拼出各自的 [`gates::DeleteCheckTransport`]。
 
-use crate::transport::{
-    BatchOutcome, CommitOutcome, CommitRequest, RenameRequest, TombstoneRequest, Transport,
-};
-use crate::{baseline, clock, gates, hub, ids, journal, local_trash, role, scan, trash, vault};
+// 旧 `file://` 引擎被收敛掉之后，下面几个私有 helper
+// （`prepare_upload`/`execute_download`/`execute_tombstone_content`/
+// `remove_index_record`）只剩测试在用。**不在这一轮删**：它们的移除会牵动
+// 一批测试的构造方式，与「收敛引擎」是两件事，混在一起会让这次改动难以复核。
+// 留给一次专门的清理，见 `crates/arca-conformance/tests/nightmare/README.md`。
+#![allow(dead_code)]
+
+use crate::transport::{CommitOutcome, CommitRequest, RenameRequest, TombstoneRequest, Transport};
+use crate::{baseline, clock, gates, hub, ids, local_trash, role, scan, trash, vault};
 use arca_chunk::hash::ContentHash;
 use arca_core::reconcile::{decide_traced, Action};
 use arca_core::state::{BaseState, LocalState, RemoteState};
@@ -288,228 +293,20 @@ pub fn sync(
     actor: &SyncActor,
     sink: &mut dyn TraceSink,
 ) -> Result<SyncReport, SyncError> {
-    let scan_result = scan::scan_dataset(dataset_root, sink).map_err(SyncError::Scan)?;
-    let mut baseline = baseline::load(dataset_root).map_err(SyncError::Baseline)?;
-    let baseline_reset = baseline.was_reset();
-    let remote = hub::read_remote(root).map_err(SyncError::Hub)?;
-    // M2d Task 2：读一次本机对这个数据集的角色，决定 `DeleteLocal` 的执行侧
-    // （见模块顶部「角色改变 `DeleteLocal` 的执行侧」一节）；文件缺失时
-    // `role::read` 已经吸收成默认角色 `client`，这里不需要特殊处理。
-    let device_role = role::read(dataset_root).map_err(SyncError::Role)?;
-
-    let mut report = SyncReport {
-        scan_rejected: scan_result.rejected.clone(),
-        baseline_reset,
-        ..SyncReport::default()
-    };
-
-    let mut paths: BTreeSet<String> = BTreeSet::new();
-    paths.extend(scan_result.files.keys().cloned());
-    paths.extend(baseline.iter().map(|(p, _)| p.clone()));
-    paths.extend(remote.keys().cloned());
-
-    // 闸门第 1 道（read_roots 范围）要问的正是"这个路径本次调和真的扫描到了
-    // 吗"——`scan_result.files` 的键正是这个问题的答案（只有真的在磁盘上
-    // 找到、判定为 `Present` 的路径才会进这个集合），与 `paths`（额外并入了
-    // 基线与远端已知的路径，用于驱动整个调和循环）是不同的集合，不能共用。
-    let scanned_paths: BTreeSet<String> = scan_result.files.keys().cloned().collect();
-
-    // 评审 Important #3：闸门第 4 道与 `journal::append` 各自的 O(n·m)/O(n²)
-    // 都源于"同一份磁盘状态在循环里被重复读取/重写"——这里跟内容侧的
-    // `arca_store::atomic::Batch` 同一思路，把它们各自的"读一次、批量用"
-    // 提到循环之外。
+    // **这里没有第二个引擎。** 本函数曾是一份独立实现（222 行函数体），
+    // 与 `sync_transport` 并列——两条实现必然漂移，而它确实漂移了：改名
+    // 检测只加进了 `sync_transport`，于是同一个改名在 `file://` 上退化成
+    // 「上传 + tombstone」，新建 item_id（**违反 I7 身份跨改名稳定**）、
+    // 内容全量重传、版本链分叉。而 `file://` 恰恰是 CLAUDE.md 说的
+    // 「一等用户」路径。这正是 `Transport` 抽象当初要消除的那类分叉
+    // （M2d 评审原话）。
     //
-    // `transport`：M2b Task 1 起，第 4 道闸门经 `Transport::recoverable`
-    // （`gates::check_delete_transport`），不再需要 `DeleteCheck` 那种直接
-    // 拿 `&StorageRoot`+`trash_entries` 快照的签名——评审原话：那个签名在
-    // HTTP 传输下会挡路。`transport::local::LocalTransport` 内部把"`.arca/
-    // trash/` 只读一次、循环内复用"这份纪律接管过去（惰性缓存，见其文档），
-    // 效果与旧的 `trash_snapshot` 完全一致，只是职责搬进了 `Transport`
-    // 实现内部，`sync()` 不用再自己操心这件事。
-    //
-    // **评审 C2/I7**：`transport` 现在还是本轮全部 `Upload` 收尾时那一次
-    // `LocalTransport::commit_batch` 调用的落点——见下面 `upload_reqs` 与
-    // 循环之后的批次收口。
+    // 收敛的性能代价实测为零：一万文件基准 239.3s → 240.0s（噪声级别）——
+    // 那 240 秒里 238 秒花在 `adopt` 上，而 `adopt` 不走 `sync`。动手前我
+    // 以为 `commit_batch` 没被 `sync_transport` 用上会造成回退，**测量
+    // 推翻了这个假设**，记在这里免得下一个人据此做一轮不必要的重构。
     let transport = crate::transport::local::LocalTransport::new(root);
-
-    // `tombstone_events`：本次调和可能提交多条 `TombstoneRemote`——物理搬移
-    // （`.arca/trash/` + index 清理）在循环内立即执行，**journal 事件的追加
-    // 推迟到循环结束、`Upload` 的批量提交完成之后**，用一个在那之后才
-    // `open` 的全新 `journal::AppendBatch` 一次性收口（评审 C2 实机复现
-    // 修复：见 [`execute_tombstone_content`] 文档「两个独立的 `AppendBatch`
-    // 不能交错提交」一节——这正是 M2a 修过的 O(n²) 批量收口思路，只是
-    // 现在必须晚于 `Upload` 的批量提交才能 `open`，不能像旧代码那样在循环
-    // 开始前就抢先拍快照）。
-    let mut tombstone_events: Vec<(String, ItemId, arca_format::model::VersionId, String)> =
-        Vec::new();
-
-    // **评审 C2**：本轮全部 `Upload` 先收集成一批，循环结束后统一走一次
-    // `LocalTransport::commit_batch`——内容（`files/`）+ `items/` + `index/` +
-    // **journal `op=upsert` 事件**一次性整体提交。这是这次修复的核心：修复前
-    // `execute_upload` 只写 `files/`+`items/`+`index/`，从不追加 journal 事件，
-    // `arca adopt`/`file://` 的 `arca sync` 因此会产出一份"nara.png 从未发生过
-    // 任何事"的 journal（I9：真相在 hub 的 journal），只有经
-    // `LocalTransport::commit`/`commit_streamed`/`commit_batch` 的写入路径
-    // （此前只有 `arcad` 的 HTTP 端点在走）才会写。改走 `commit_batch` 同时
-    // 顺带解决评审 I7："Task 1 补的批量接口在生产路径上没有调用者"——现在
-    // 这就是它的生产调用点，也一并保留了 M1d 批量归档的性能特征（一次
-    // `arca_store::atomic::Batch` + 一次 `journal::AppendBatch` 收口，不是
-    // 逐文件各自 fsync）。
-    let mut upload_reqs: Vec<CommitRequest> = Vec::new();
-
-    for (idx, path) in paths.iter().enumerate() {
-        let base = baseline.get(path);
-        let local = scan_result
-            .files
-            .get(path)
-            .cloned()
-            .unwrap_or(LocalState::Absent);
-        let remote_state = remote.get(path).cloned().unwrap_or(RemoteState::Absent);
-
-        let decision = decide_traced(&base, &local, &remote_state, path, idx as u64, sink);
-
-        match decision.action {
-            Action::Noop => {}
-
-            Action::Upload { parent } => {
-                let (req, new_state) =
-                    prepare_upload(dataset_root, path, &base, &remote_state, parent, actor)?;
-                baseline.set(path.clone(), new_state);
-                report.uploaded.push(path.clone());
-                upload_reqs.push(req);
-            }
-
-            Action::Download { version_id } => {
-                let new_state = execute_download(dataset_root, root, path, &remote_state)?;
-                debug_assert_eq!(new_state.item_id(), remote_state.item_id());
-                let _ = &version_id; // 已经等同 remote_state 的当前版本，见 execute_download
-                baseline.set(path.clone(), new_state);
-                report.downloaded.push(path.clone());
-            }
-
-            Action::AdoptBaseline { hash, version_id } => {
-                let item_id = remote_state
-                    .item_id()
-                    .expect("AdoptBaseline 只在 remote 已知该 item 时产生");
-                let size = match &local {
-                    LocalState::Present { size, .. } => *size,
-                    LocalState::Absent => unreachable!(
-                        "AdoptBaseline 的全部决策表分支都要求 local 是 Present（见 arca_core::reconcile）"
-                    ),
-                };
-                baseline.set(
-                    path.clone(),
-                    BaseState::Present {
-                        item_id,
-                        version_id,
-                        hash,
-                        size,
-                    },
-                );
-                report.adopted.push(path.clone());
-            }
-
-            Action::DeleteLocal { item_id } => {
-                let check = gates::DeleteCheckTransport {
-                    path,
-                    item_id,
-                    scanned_paths: &scanned_paths,
-                    remote_state: &remote_state,
-                    dataset_root,
-                    base: &base,
-                    transport: &transport,
-                };
-                execute_delete_local(
-                    dataset_root,
-                    path,
-                    item_id,
-                    device_role,
-                    &check,
-                    &mut baseline,
-                    &mut report,
-                )?;
-            }
-
-            Action::TombstoneRemote { item_id, parent } => {
-                let at = execute_tombstone_content(root, path, item_id)?;
-                tombstone_events.push((path.clone(), item_id, parent, at));
-                baseline.remove(path);
-                report.tombstone_submitted.push(path.clone());
-            }
-
-            Action::Conflict { .. } => {
-                report.conflicts.push(path.clone());
-            }
-
-            Action::NeedsHuman { .. } => {
-                report.needs_human.push(path.clone());
-            }
-        }
-    }
-
-    // 批次收口：本轮全部 `Upload` 一次性提交（评审 C2/I7，见上面 `upload_reqs`
-    // 的文档）。必须在 `baseline.save` 之前完成——`commit_batch` 要么整批
-    // 成功要么整批不生效（`BatchOutcome` 文档），不生效时绝不能让内存里已经
-    // 更新过的 `baseline` 继续声称这些路径"已经同步成功"（I3）。本次调和
-    // 用的 `remote` 快照与这里之间不应该有其它写入方介入——`sync()` 面向的
-    // 是单进程、一次只跑一次的场景（模块顶部「与 brief 字面签名的一处刻意
-    // 偏离」一节），`commit_batch` 仍然做真正的 CAS 校验（不是来者不拒），
-    // 一旦这个假设被打破（例如同一存储根被另一个进程并发写入），这里必须
-    // 停下如实报告为 `SyncError::UploadRejected`，而不是悄悄丢弃部分已经
-    // 决策过的路径（I5）。
-    if !upload_reqs.is_empty() {
-        match transport
-            .commit_batch(&upload_reqs)
-            .map_err(SyncError::Transport)?
-        {
-            BatchOutcome::Committed(_) => {}
-            BatchOutcome::Rejected { index, outcome } => {
-                return Err(SyncError::UploadRejected {
-                    path: upload_reqs[index].path.clone(),
-                    outcome: Box::new(outcome),
-                });
-            }
-        }
-    }
-
-    // tombstone 的 journal 批次收口——同一条纪律（评审 Important #3）：本次
-    // 调和累积的全部 tombstone 事件在这里一次性落盘，必须先于 `baseline.save`。
-    // **必须在上面 `Upload` 的 `commit_batch` 完成之后才 `open`**（评审 C2
-    // 实机复现修复，见 [`execute_tombstone_content`] 文档）——这里才第一次
-    // 打开 `AppendBatch`，读到的是已经包含全部 upsert 事件的最新状态，不会
-    // 冲掉它们。commit 失败意味着这些路径的删除提交还没有真正记进
-    // journal，不能让基线继续声称它们"已经同步成功"；下次重跑
-    // `hub::read_remote` 仍会看到旧的 journal 状态，`decide` 会重新给出
-    // `TombstoneRemote`，不构成数据风险。
-    if !tombstone_events.is_empty() {
-        let mut journal_batch = journal::AppendBatch::open(root).map_err(SyncError::Journal)?;
-        for (path, item_id, parent, at) in tombstone_events {
-            let seq = journal_batch.next_seq();
-            journal_batch
-                .push(arca_format::journal::JournalEvent {
-                    seq,
-                    op: arca_format::journal::Op::Tombstone,
-                    item_id,
-                    version_id: parent,
-                    path,
-                    from: None,
-                    actor: actor.clone(),
-                    at,
-                })
-                .map_err(SyncError::Journal)?;
-        }
-        journal_batch.commit().map_err(SyncError::Journal)?;
-    }
-
-    baseline.save(dataset_root).map_err(SyncError::Baseline)?;
-
-    // 清单是基线在 git 侧的行式镜像（评审 Important #4）：每次 `sync` 收尾
-    // 都要重新生成，不能只靠 `adopt` 生成一次就不再更新——否则协作者从 git
-    // 拿到的清单会在日常 `sync` 里静默漏掉后续新增的路径（`git status` 却是
-    // 干净的，因为清单本身没被标记为脏）。
-    write_manifest(dataset_root, &baseline)?;
-
-    Ok(report)
+    sync_transport(dataset_root, &transport, actor, sink)
 }
 
 /// 准备一次 `Upload`：读本地内容、分配/延续身份，构造好一条
@@ -2223,9 +2020,13 @@ mod tests {
         let root = open_root(store.path());
         let mut sink = NullSink;
         let err = sync(dataset.path(), &root, &actor(), &mut sink).unwrap_err();
+        // 判据是**语义**而不是包装层：`MissingContent` 必须原样传到调用方、
+        // 整轮同步必须失败。走 `Transport` 抽象之后它包在 `Transport(Hub(..))`
+        // 里而不是直接的 `Hub(..)`——那是收敛到单一引擎的结果，不是行为变化。
+        let text = format!("{err:?}");
         assert!(
-            matches!(err, SyncError::Hub(hub::HubError::MissingContent { .. })),
-            "应整体报错为 MissingContent，实得 {err:?}"
+            text.contains("MissingContent") && text.contains("c.bin"),
+            "应整体报错为 MissingContent 并点名路径，实得 {err:?}"
         );
 
         // 绝不能有任何一个字节被误当作"已同步"：基线必须仍是空的。
