@@ -20,6 +20,7 @@
 | [M2c journal 与 longpoll](M2c-journal与longpoll.md) | Transport 补四缺口 · /changes 游标 · longpoll · sid 闭环 · **HttpTransport 与两机端到端** | 9 | ✅ |
 | [M2d 角色与拔盘演练](M2d-角色与拔盘演练.md) | server/client 副本角色 · 多 hub 独立故障域 · 副本数告警 · **带反面夹具的拔盘演练** | 6 | ✅ |
 | [M2e TLS 与 bugreport](M2e-TLS与bugreport.md) | 本地回收站可管理 · **`arca gc`（第一个被授权销毁的命令）** · 健康检查支持 http(s) · TLS 指纹 pin · bugreport | 7 | ✅ |
+| [M3a agentd 自动同步](M3a-agentd自动同步.md) | 单实例锁 · 每数据集独立回路与退避 · **`Transport::changes`（/changes 的第一个客户端消费者）** · 增量游标 · **agentd 崩溃演练** | 5 | ✅ |
 
 后续切片见 [M1a 文档末尾的拆分表](M1a-存储根IO地基.md#m1-的其余切片)。
 
