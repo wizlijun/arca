@@ -210,6 +210,20 @@ async fn run_loop(
     // 增量游标：只对 http(s):// 有意义（`file://` 没有可挂起的对象，
     // 见 `LocalTransport::changes` 的说明）。
     let longpoll = matches!(resolved.target, HubTarget::Http { .. });
+
+    // 本地 watcher（M3b）。**失败必须降级而不是中止**：某些平台/文件系统
+    // 不支持事件监听，那时退回纯周期模式照常工作——watcher 是周期对账的
+    // 增强，不是它的替代（spec §3.1 的分层降级关系）。
+    let mut local_wakes = match watcher::spawn_forwarder(&resolved.dataset_dir) {
+        Ok(rx) => Some(rx),
+        Err(e) => {
+            eprintln!(
+                "{}：本地文件监听不可用（{e}），本数据集退回纯周期模式——                 本地改动仍会被发现，只是最多晚一个间隔。",
+                lp.label
+            );
+            None
+        }
+    };
     let loaded = cursor::load(&resolved.dataset_dir);
     if !matches!(loaded, cursor::Loaded::Cursor(_)) && longpoll {
         // 读不懂的游标要留一句诊断——「第一次跑」和「上次写坏了」对排障
@@ -279,13 +293,21 @@ async fn run_loop(
             lp.next_delay()
         };
 
-        // 失败之后走退避睡眠，不进 longpoll——一个连不上的 hub 上挂 60 秒
-        // 的 longpoll，等于把退避策略架空了。
-        if !longpoll || lp.consecutive_failures() > 0 {
+        // 失败之后走退避睡眠，**既不进 longpoll 也不接受 watcher 唤醒**——
+        // 一个连不上的 hub，本地每存一次盘就重试一次，等于把退避架空了。
+        if lp.consecutive_failures() > 0 {
             if !syncer::wait_next(delay, shutdown).await {
                 return healthy;
             }
             continue;
+        }
+
+        // `file://`：没有 longpoll 可等，等本地 watcher 或者等到点。
+        if !longpoll {
+            match wait_local_or_tick(local_wakes.as_mut(), delay, shutdown, &lp).await {
+                syncer::Wakeup::Stop => return healthy,
+                _ => continue,
+            }
         }
 
         // 这一轮调和成功了。**先把游标快进过我们自己刚写进 journal 的那些
@@ -296,9 +318,26 @@ async fn run_loop(
             persist(&resolved, &lp, since.as_ref());
         }
 
-        // 挂起等待对面的动静。
+        // 挂起等待对面的动静——同时盯着本地 watcher。
         let probe = make_probe(&resolved);
-        let (wakeup, next) = syncer::wait_for_change(since.clone(), delay, probe, shutdown).await;
+        let (wakeup, next) = {
+            let remote = syncer::wait_for_change(since.clone(), delay, probe, shutdown);
+            match local_wakes.as_mut() {
+                None => remote.await,
+                Some(rx) => {
+                    tokio::select! {
+                        r = remote => r,
+                        w = rx.recv() => {
+                            报告本地唤醒(&lp, w.as_ref());
+                            // 本地有动静：立刻去调和。游标保持原值——本地改动
+                            // 不会推进远端 journal 的游标，硬要在这里动它就是
+                            // 在编造一个服务端没说过的位置。
+                            (syncer::Wakeup::Reconcile, since.clone())
+                        }
+                    }
+                }
+            }
+        };
         match wakeup {
             syncer::Wakeup::Stop => return healthy,
             syncer::Wakeup::ResetAndReconcile => {
@@ -321,6 +360,45 @@ async fn run_loop(
                 }
             }
         }
+    }
+}
+
+/// `file://` 的等待：本地 watcher 唤醒、等到点、或者停止信号。
+async fn wait_local_or_tick(
+    local: Option<&mut tokio::sync::mpsc::Receiver<watcher::Wake>>,
+    delay: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+    lp: &Loop,
+) -> syncer::Wakeup {
+    let Some(rx) = local else {
+        return if syncer::wait_next(delay, shutdown).await {
+            syncer::Wakeup::Reconcile
+        } else {
+            syncer::Wakeup::Stop
+        };
+    };
+    tokio::select! {
+        w = rx.recv() => {
+            报告本地唤醒(lp, w.as_ref());
+            syncer::Wakeup::Reconcile
+        }
+        // 周期地基仍在：即使 watcher 一声不吭，也要按时全量对账一次
+        // （spec §5.2 三重保险的第三层）。
+        go_on = syncer::wait_next(delay, shutdown) => {
+            if go_on { syncer::Wakeup::Reconcile } else { syncer::Wakeup::Stop }
+        }
+    }
+}
+
+/// 本地唤醒的日志。**溢出要说出来**——它意味着有事件被内核丢掉了，
+/// 而这正是三重保险第二层「溢出即全扫」在起作用的时刻，值得留痕。
+fn 报告本地唤醒(lp: &Loop, wake: Option<&watcher::Wake>) {
+    if let Some(watcher::Wake::Overflow) = wake {
+        eprintln!(
+            "{}：文件系统事件队列溢出（有事件被丢弃）——按三重保险第二层的\
+             约定立刻做一次全量对账。",
+            lp.label
+        );
     }
 }
 
