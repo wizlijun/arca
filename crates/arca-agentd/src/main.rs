@@ -25,6 +25,7 @@ mod hydration;
 mod ipc;
 mod lock;
 mod projection;
+mod provider;
 mod syncer;
 mod watcher;
 
