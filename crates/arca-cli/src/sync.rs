@@ -13,7 +13,7 @@
 //! | `Upload{parent}` | 写 `files/` + 追加 `items/` + 更新 `index/` |
 //! | `Download{version_id}` | 从存储根读出内容写到本地 |
 //! | `AdoptBaseline{hash, version_id}` | 零传输，只更新基线 |
-//! | `DeleteLocal{item_id}` | **过四道闸门（`gates::check_delete`，M2a Task 4）后**才移除本地副本；任一闸门不过则不删，计入 `delete_blocked` |
+//! | `DeleteLocal{item_id}` | **过四道闸门（`gates::check_delete`，M2a Task 4）后**——`client` 角色移除本地副本，`server` 角色移进工作区侧本地回收站（M2d Task 2，见 [`execute_delete_local`]）；任一闸门不过则不删，计入 `delete_blocked` |
 //! | `TombstoneRemote{item_id, parent}` | 提交 tombstone：`files/` → `.arca/trash/` + 清理 index 记录 + 追加 journal `op=tombstone` 事件（M2a Task 4 收尾，复用 Task 3 交付的 `trash`/`journal` 原语；清理 index 记录见评审 Important #2） |
 //! | `Conflict{..}` | 不动数据，计入报告 |
 //! | `NeedsHuman{..}` | 停下，计入报告 |
@@ -50,11 +50,35 @@
 //! 情形（当前决策表到达 `TombstoneRemote` 时 `remote_state` 必然是
 //! `RemoteState::Present`，`trash::move_to_trash` 因此总能找到源文件，这个
 //! 桶目前恒空，但类型上保留，供未来加发起侧闸门时使用）。
+//!
+//! # 角色改变 `DeleteLocal` 的执行侧，绝不改变决策本身（M2d Task 2）
+//!
+//! `arca-core` 的决策表**不认识角色**——`present|unchanged|tombstoned ->
+//! DeleteLocal` 这一格的产出与角色无关，四道闸门（`gates::check_delete*`）
+//! 同样不认识角色。角色只在闸门**之后**的执行侧分流（spec §4.7）：
+//!
+//! - `client` 角色（默认，见 `crate::role`）：与 M2a 起的既有行为一致，
+//!   `fs::remove_file`——本地视为可再生缓存，数据的唯一副本转移到 hub。
+//! - `server` 角色：**不 `unlink`**，把本地副本移进工作区侧的本地回收站
+//!   （`crate::local_trash`，FORMAT.md §9.5）——这台设备承诺"本地永远有
+//!   完整数据，任何云侧语义都不会缩减它"，物理销毁只经未来显式的清理命令
+//!   （本切片不新增任何销毁路径，I3）。
+//!
+//! 这个分工必须留在这里、留在执行侧——**不要把角色塞进 `arca_core` 的决策
+//! 表**：决策表回答的是"这个格子该不该产生 `DeleteLocal`"，与哪台设备用
+//! 什么策略执行它是两个正交的问题；一旦决策表也认识角色，两端（client/hub）
+//! 共用的 sans-io 状态机就会长出一份只有客户端才有意义的字段，破坏
+//! `arca-core` "无 IO、两端共用、纯状态机"的设计（CLAUDE.md「架构约束」）。
+//! `sync()`/`sync_transport()` 共用同一份执行函数（[`execute_delete_local`]）
+//! ——此前两个函数各自内联了一份几乎相同的 `DeleteLocal` 处理逻辑，如果
+//! 角色分流在两处各写一遍，就会有演化出两套不同角色语义的风险（`Transport`
+//! 抽象当初正是为了消除这类分叉，见上文「与 `sync()` 的关系」），因此收敛
+//! 成一个函数，两个调用点只负责拼出各自的 [`gates::DeleteCheckTransport`]。
 
 use crate::transport::{
     BatchOutcome, CommitOutcome, CommitRequest, RenameRequest, TombstoneRequest, Transport,
 };
-use crate::{baseline, clock, gates, hub, ids, journal, scan, trash, vault};
+use crate::{baseline, clock, gates, hub, ids, journal, local_trash, role, scan, trash, vault};
 use arca_chunk::hash::ContentHash;
 use arca_core::reconcile::{decide_traced, Action};
 use arca_core::state::{BaseState, LocalState, RemoteState};
@@ -78,7 +102,20 @@ pub struct SyncReport {
     pub uploaded: Vec<String>,
     pub downloaded: Vec<String>,
     pub adopted: Vec<String>,
+    /// `DeleteLocal` 过闸门后，**`client` 角色**移除了本地副本（`fs::remove_file`）
+    /// ——数据仍然安全，唯一副本转移到 hub。`server` 角色过闸门后走的是
+    /// [`deleted_to_local_trash`]（`Self::deleted_to_local_trash`），不落在
+    /// 这里——两个桶分开是故意的：调用方（`arca sync` 的命令壳）据此给出
+    /// 不同的措辞（"已移除本地副本" vs "已移入本地回收站"，见 M2d Task 2
+    /// brief），不能靠单一文案覆盖两种截然不同的本地终态。
     pub deleted_local: Vec<String>,
+    /// `DeleteLocal` 过闸门后，**`server` 角色**把本地副本移进了工作区侧
+    /// 本地回收站（`crate::local_trash`，FORMAT.md §9.5）——原文件不再在
+    /// 原路径，但内容仍在 `<dataset>/.arca/client/trash/` 下可以找回，见
+    /// [`execute_delete_local`] 与模块顶部「角色改变 `DeleteLocal` 的执行侧」
+    /// 一节。与 `deleted_local` 同一性质（正常完成的动作），不计入
+    /// `is_clean()` 的"有问题"判断。
+    pub deleted_to_local_trash: Vec<String>,
     /// `DeleteLocal` 被四道闸门（`gates::check_delete`）里的至少一道拦下——
     /// **不删**（I3、I5：状态模糊或不安全就停下，绝不"尽力删"）。逐条保留
     /// 具体是哪个 [`gates::GateFailure`]，供 `arca sync` 的诊断输出与
@@ -126,6 +163,7 @@ impl SyncReport {
             || !self.downloaded.is_empty()
             || !self.adopted.is_empty()
             || !self.deleted_local.is_empty()
+            || !self.deleted_to_local_trash.is_empty()
             || !self.tombstone_submitted.is_empty()
             || !self.renamed.is_empty()
     }
@@ -144,6 +182,14 @@ pub enum SyncError {
     Trash(crate::trash::TrashError),
     /// 提交 tombstone 时 journal 追加失败。
     Journal(crate::journal::JournalError),
+    /// 读 `<dataset_root>/.arca/client/role.toml` 失败——文件缺失不会走到
+    /// 这里（`role::read` 把缺失吸收成默认角色），只有内容非法/真正的 IO
+    /// 故障才会（M2d Task 2，见 `role` 模块文档「与 baseline 刻意不同的
+    /// 错误处理策略」）。
+    Role(crate::role::RoleError),
+    /// `server` 角色执行 `DeleteLocal` 时，移入工作区侧本地回收站失败
+    /// （M2d Task 2，见 [`execute_delete_local`]）。
+    LocalTrash(crate::local_trash::LocalTrashError),
     Io {
         path: String,
         reason: String,
@@ -184,6 +230,8 @@ impl fmt::Display for SyncError {
             SyncError::Format(e) => write!(f, "{e}"),
             SyncError::Trash(e) => write!(f, "{e}"),
             SyncError::Journal(e) => write!(f, "{e}"),
+            SyncError::Role(e) => write!(f, "{e}"),
+            SyncError::LocalTrash(e) => write!(f, "{e}"),
             SyncError::Io { path, reason } => write!(f, "{path}：{reason}"),
             SyncError::Transport(e) => write!(f, "{e}"),
             SyncError::UploadRejected { path, outcome } => write!(
@@ -244,6 +292,10 @@ pub fn sync(
     let mut baseline = baseline::load(dataset_root).map_err(SyncError::Baseline)?;
     let baseline_reset = baseline.was_reset();
     let remote = hub::read_remote(root).map_err(SyncError::Hub)?;
+    // M2d Task 2：读一次本机对这个数据集的角色，决定 `DeleteLocal` 的执行侧
+    // （见模块顶部「角色改变 `DeleteLocal` 的执行侧」一节）；文件缺失时
+    // `role::read` 已经吸收成默认角色 `client`，这里不需要特殊处理。
+    let device_role = role::read(dataset_root).map_err(SyncError::Role)?;
 
     let mut report = SyncReport {
         scan_rejected: scan_result.rejected.clone(),
@@ -367,24 +419,15 @@ pub fn sync(
                     base: &base,
                     transport: &transport,
                 };
-                match gates::check_delete_transport(&check) {
-                    Ok(()) => {
-                        let local_path = dataset_root.join(to_native(path));
-                        match fs::remove_file(&local_path) {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                            Err(e) => return Err(io_err(&local_path, e)),
-                        }
-                        baseline.remove(path);
-                        report.deleted_local.push(path.clone());
-                    }
-                    Err(failure) => {
-                        // 闸门拒绝：不删、不改基线，如实计入报告（I5）——下次
-                        // 重跑会重新走一遍这四道检查，一旦竞态窗口关闭（例如
-                        // 用户的修改已经通过正常上传流程同步），自然会通过。
-                        report.delete_blocked.push((path.clone(), failure));
-                    }
-                }
+                execute_delete_local(
+                    dataset_root,
+                    path,
+                    item_id,
+                    device_role,
+                    &check,
+                    &mut baseline,
+                    &mut report,
+                )?;
             }
 
             Action::TombstoneRemote { item_id, parent } => {
@@ -576,6 +619,55 @@ fn execute_download(
         hash,
         size,
     })
+}
+
+/// 执行一次 `Action::DeleteLocal`：先跑四道闸门（与角色无关），过闸门后
+/// **按角色分流执行侧**——`client` 移除本地副本，`server` 移进工作区侧本地
+/// 回收站，二者都不影响 hub 侧任何状态（决策与提交早在 `decide`/上游产出
+/// `DeleteLocal` 时就已经完成，本函数只处理本地文件系统这一侧）。完整分工
+/// 论证见模块顶部「角色改变 `DeleteLocal` 的执行侧，绝不改变决策本身」一节
+/// ——**不要在这里之外的任何地方（尤其是 `arca_core`）重新判断一次角色**，
+/// `sync()`/`sync_transport()` 都只应该调这一个函数。
+fn execute_delete_local(
+    dataset_root: &Path,
+    path: &str,
+    item_id: ItemId,
+    device_role: role::Role,
+    check: &gates::DeleteCheckTransport,
+    baseline: &mut baseline::Baseline,
+    report: &mut SyncReport,
+) -> Result<(), SyncError> {
+    match gates::check_delete_transport(check) {
+        Ok(()) => {
+            let local_path = dataset_root.join(to_native(path));
+            match device_role {
+                role::Role::Client => {
+                    // 与既有行为逐字一致（M2a 起）：本地已经不存在也是
+                    // 正常的幂等终态，不是错误。
+                    match fs::remove_file(&local_path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(io_err(&local_path, e)),
+                    }
+                    report.deleted_local.push(path.to_string());
+                }
+                role::Role::Server => {
+                    // 不 unlink：移进本地回收站，物理销毁只经未来显式的
+                    // 清理命令（I3，本切片不实现、不新增任何销毁路径）。
+                    let at = clock::now_rfc3339();
+                    local_trash::move_to_trash(dataset_root, &local_path, path, item_id, &at)
+                        .map_err(SyncError::LocalTrash)?;
+                    report.deleted_to_local_trash.push(path.to_string());
+                }
+            }
+            baseline.remove(path);
+        }
+        Err(failure) => {
+            // 闸门拒绝：不删、不改基线、不碰角色分流——如实计入报告（I5）。
+            report.delete_blocked.push((path.to_string(), failure));
+        }
+    }
+    Ok(())
 }
 
 /// 执行一次 `TombstoneRemote`：向 hub 提交本地删除意图——把 `files/<path>`
@@ -771,6 +863,8 @@ pub fn sync_transport<T: Transport>(
     let mut baseline = baseline::load(dataset_root).map_err(SyncError::Baseline)?;
     let baseline_reset = baseline.was_reset();
     let remote = transport.read_remote().map_err(SyncError::Transport)?;
+    // M2d Task 2：与 `sync()` 同一条纪律，见其同名注释。
+    let device_role = role::read(dataset_root).map_err(SyncError::Role)?;
 
     let mut report = SyncReport {
         scan_rejected: scan_result.rejected.clone(),
@@ -1065,21 +1159,15 @@ pub fn sync_transport<T: Transport>(
                     base: &base,
                     transport,
                 };
-                match gates::check_delete_transport(&check) {
-                    Ok(()) => {
-                        let local_path = dataset_root.join(to_native(path));
-                        match fs::remove_file(&local_path) {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                            Err(e) => return Err(io_err(&local_path, e)),
-                        }
-                        baseline.remove(path);
-                        report.deleted_local.push(path.clone());
-                    }
-                    Err(failure) => {
-                        report.delete_blocked.push((path.clone(), failure));
-                    }
-                }
+                execute_delete_local(
+                    dataset_root,
+                    path,
+                    item_id,
+                    device_role,
+                    &check,
+                    &mut baseline,
+                    &mut report,
+                )?;
             }
 
             Action::TombstoneRemote { item_id, parent } => {
@@ -1610,6 +1698,120 @@ mod tests {
             .unwrap()
             .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".data"));
         assert!(trash_has_data, "hub 的权威副本必须仍在 .arca/trash/ 里");
+    }
+
+    /// M2d Task 2 核心验收：**同一个远端 tombstone**，两台设备的本地终态因
+    /// 角色不同而不同——`client` 角色移除本地副本（既有行为不变），
+    /// `server` 角色不 unlink，把内容挪进工作区侧本地回收站、原文件仍可
+    /// 找回；无论哪种角色，hub 侧的状态都完全一样（角色只影响执行侧，
+    /// 不影响提交给 hub 的任何东西，见 `execute_delete_local` 文档）。
+    #[test]
+    fn 同一远端tombstone下client移除本地副本_server移入本地回收站可找回() {
+        fn 造一次tombstone传播场景(
+            given_role: role::Role,
+        ) -> (tempfile::TempDir, tempfile::TempDir) {
+            let dataset = tempfile::tempdir().unwrap();
+            let store = tempfile::tempdir().unwrap();
+            造存储根(store.path());
+            fs::create_dir_all(store.path().join(".arca/trash")).unwrap();
+            fs::create_dir_all(store.path().join(".arca/journal")).unwrap();
+            fs::write(dataset.path().join("j.txt"), b"content").unwrap();
+
+            if matches!(given_role, role::Role::Server) {
+                role::write(dataset.path(), given_role).unwrap();
+            }
+
+            let root = open_root(store.path());
+            let mut sink = NullSink;
+            sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+
+            let remote_before = hub::read_remote(&root).unwrap();
+            let (item_id, version_id) = match remote_before.get("j.txt").unwrap() {
+                RemoteState::Present {
+                    item_id,
+                    version_id,
+                    ..
+                } => (*item_id, version_id.clone()),
+                other => panic!("应为 Present，实得 {other:?}"),
+            };
+            crate::trash::move_to_trash(&root, "j.txt", item_id, "2026-08-08T09:20:00Z").unwrap();
+            let next_seq = crate::journal::next_seq(&root).unwrap();
+            crate::journal::append(
+                &root,
+                &arca_format::journal::JournalEvent {
+                    seq: next_seq,
+                    op: arca_format::journal::Op::Tombstone,
+                    item_id,
+                    version_id,
+                    path: "j.txt".to_string(),
+                    from: None,
+                    actor: actor(),
+                    at: "2026-08-08T09:20:00Z".to_string(),
+                },
+            )
+            .unwrap();
+
+            let report = sync(dataset.path(), &root, &actor(), &mut sink).unwrap();
+            assert!(
+                report.is_clean(),
+                "{given_role:?} 角色下 DeleteLocal 应是正常终态：{report:?}"
+            );
+
+            match given_role {
+                role::Role::Client => {
+                    assert_eq!(report.deleted_local, vec!["j.txt".to_string()]);
+                    assert!(report.deleted_to_local_trash.is_empty());
+                }
+                role::Role::Server => {
+                    assert_eq!(report.deleted_to_local_trash, vec!["j.txt".to_string()]);
+                    assert!(report.deleted_local.is_empty());
+                }
+            }
+
+            (dataset, store)
+        }
+
+        // --- client 角色：本地副本被移除，工作区侧不留任何回收站条目 ---
+        let (client_dataset, client_store) = 造一次tombstone传播场景(role::Role::Client);
+        assert!(
+            !client_dataset.path().join("j.txt").exists(),
+            "client 角色：本地副本应已被移除"
+        );
+        assert!(
+            !client_dataset.path().join(".arca/client/trash").exists()
+                || fs::read_dir(client_dataset.path().join(".arca/client/trash"))
+                    .map(|mut it| it.next().is_none())
+                    .unwrap_or(true),
+            "client 角色不应在本地回收站留下任何条目"
+        );
+
+        // --- server 角色：原路径消失，但内容仍可从本地回收站找回 ---
+        let (server_dataset, server_store) = 造一次tombstone传播场景(role::Role::Server);
+        assert!(
+            !server_dataset.path().join("j.txt").exists(),
+            "server 角色：原路径不应再持有内容（已挪进本地回收站）"
+        );
+        let local_trash_dir = server_dataset.path().join(".arca/client/trash");
+        let data_entry = fs::read_dir(&local_trash_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().ends_with(".data"))
+            .expect("server 角色：本地回收站必须留有一条 .data 记录");
+        assert_eq!(
+            fs::read(data_entry.path()).unwrap(),
+            b"content",
+            "server 角色：本地回收站里的内容必须与被删除前完全一致——原文件仍可找回"
+        );
+
+        // --- 两种角色下 hub 侧的状态完全一样：都只是把权威副本移进
+        //     `.arca/trash/`，角色只影响客户端执行侧，不影响提交给 hub 的
+        //     任何东西 ---
+        for store in [&client_store, &server_store] {
+            let trash_has_data = fs::read_dir(store.path().join(".arca/trash"))
+                .unwrap()
+                .any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".data"));
+            assert!(trash_has_data, "hub 的权威副本必须仍在 .arca/trash/ 里");
+        }
     }
 
     /// 端到端闭环（M2a tombstone 计划收尾）：两台设备**只通过 `sync()` 调用**

@@ -68,6 +68,16 @@ impl TrashId {
         }
         Ok(TrashId(bytes))
     }
+
+    /// 分配一个全新、随机的 `trash_id`——创建时分配、永不复用（FORMAT.md
+    /// §7.3）。原本只在本模块内部用 `TrashId(crate::ids::random_bytes16())`
+    /// 构造（元组字段私有，模块外无法直接构造）；M2d Task 2 起工作区侧的
+    /// `crate::local_trash`（FORMAT.md §9.5）需要同一套编码与分配纪律，
+    /// 因此把这个构造步骤提炼成公开方法而不是让它另起一套——两处"trash_id
+    /// 怎么分配"必须是同一个答案。
+    pub fn new_random() -> TrashId {
+        TrashId(crate::ids::random_bytes16())
+    }
 }
 
 impl fmt::Display for TrashId {
@@ -143,7 +153,10 @@ struct MetaWire {
 }
 
 impl TrashMeta {
-    fn to_json(&self) -> Result<String, FormatError> {
+    /// 序列化成 `.meta` 单行 JSON。公开——`crate::local_trash`（M2d Task 2，
+    /// FORMAT.md §9.5）复用同一套字段与编码，工作区侧的本地回收站不该有
+    /// 第二份序列化逻辑。
+    pub fn to_json(&self) -> Result<String, FormatError> {
         let wire = MetaWire {
             v: RECORD_VERSION,
             path: self.path.clone(),
@@ -213,7 +226,7 @@ pub fn move_to_trash(
     item_id: ItemId,
     deleted_at: &str,
 ) -> Result<TrashId, TrashError> {
-    let trash_id = TrashId(crate::ids::random_bytes16());
+    let trash_id = TrashId::new_random();
 
     let source = format!("{}/{}", layout::FILES_DIR, path);
     atomic::rename(root, &source, &data_path(trash_id)).map_err(TrashError::Atomic)?;

@@ -28,6 +28,7 @@ pub mod hub;
 pub mod ids;
 pub mod init;
 pub mod journal;
+pub mod local_trash;
 pub mod register;
 pub mod role;
 pub mod scan;

@@ -322,6 +322,23 @@ fn print_sync_report(report: &sync_lib::SyncReport) -> bool {
     for p in &report.deleted_local {
         println!("delete-local\t{p}");
     }
+    // M2d Task 2：`server` 角色下 `DeleteLocal` 不移除本地副本，而是移进
+    // 工作区侧本地回收站——机器可读的 tag 与 `delete-local` 刻意不同
+    // （`delete-local-trash`），供脚本区分；额外补一条人类可读的 stderr
+    // 说明（brief 原话要求区分文案：client「已移除本地副本」/ server
+    // 「已移入本地回收站（server 角色永不释放空间）」），只在这个桶非空时
+    // 打一次，不逐路径重复。
+    for p in &report.deleted_to_local_trash {
+        println!("delete-local-trash\t{p}");
+    }
+    if !report.deleted_to_local_trash.is_empty() {
+        eprintln!(
+            "以上 {} 个路径已移入本地回收站（.arca/client/trash/），不是移除——\
+             本设备对这个数据集是 server 角色，永不主动释放空间；找回可直接读取\
+             该目录下对应的 .data/.meta 文件（`arca role` 查看/切换角色）",
+            report.deleted_to_local_trash.len()
+        );
+    }
     for p in &report.tombstone_submitted {
         println!("tombstone\t{p}");
     }
