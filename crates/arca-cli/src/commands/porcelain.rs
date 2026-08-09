@@ -568,9 +568,22 @@ fn sync_one(path: &str, root: Option<&Path>) -> u8 {
                     return 2;
                 }
             };
-            sync_lib::sync(
+            // **两种 hub 走同一个引擎。** 从前 `file://` 走 `sync_lib::sync`、
+            // `http://` 走 `sync_lib::sync_transport`，两条实现分叉——
+            // §6.3 第 5 条的验收演练首跑就抓到了后果：改名检测只存在于
+            // `sync_transport` 里，于是同一个改名在 `file://` 上退化成
+            // 「上传 + tombstone」，新建 item_id（违反 I7 身份跨改名稳定）、
+            // 内容全量重传、版本链分叉。而 `file://` 恰恰是 CLAUDE.md 说的
+            // 「一等用户」路径（Linux/CI 只用手动模式）。
+            //
+            // 这正是 `Transport` 抽象当初要消除的那类分叉（M2d 评审原话）。
+            // 收敛的代价只可能是性能（`LocalTransport` 的 `commit_batch`
+            // 暂时没被 `sync_transport` 用上），而正确性天然成立——
+            // 同一个 trait 的两个方法都实现了。
+            let transport = arca_cli::transport::local::LocalTransport::new(&storage_root);
+            sync_lib::sync_transport(
                 &resolved.dataset_dir,
-                &storage_root,
+                &transport,
                 &default_actor(),
                 &mut sink,
             )

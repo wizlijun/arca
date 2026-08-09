@@ -12,18 +12,18 @@
 | 2 | 离线修改 + 重连 | ✅ | `journey.sh` |
 | 3 | hydration 中文件被编辑/被释放 | ⬜ 未覆盖 | 需占位符层 |
 | 4 | 占位层与真相层不一致（投影重建） | ⬜ 未覆盖 | 需占位符层 |
-| 5 | A 改名、B 编辑，在 hub 汇合 | ⚠️ **部分** | `journey.sh`——数据安全通过，**改名识别失败**，见下 |
+| 5 | A 改名、B 编辑，在 hub 汇合 | ✅ | `journey.sh`（引擎收敛后通过，见下） |
 | 6 | Linux 客户端以 server 角色运行 | ⬜ 未覆盖 | 角色本身有测试（M2d），整条路径没端到端跑过 |
 | 7 | ★ 全库索引不触发水化 | ✅ | `arca-agentd` 的 `hydration`/`provider` 单元测试（M3c，策略层） |
 | 8 | ★ 笔记打开风暴 | ⬜ 未覆盖 | 队列限流有单测，端到端需占位符层 |
 | 9 | ★ `.gitignore` 反选写法 | ✅ | `arca-git/tests/nightmare.rs`（M1c） |
 | 10 | ★ 清单与实体一致性 | ❌ **不成立** | `arca checkout` 已实现，但**历史版本字节从未留存**，见下 |
 | 11 | ★ 多 hub 故障隔离 | ✅ | `arca-cli/tests/multi_hub.rs`、`arca-agentd/tests/multi_hub_isolation.rs`（M2d） |
-| 12 | 数据集搬迁零重传 | ✅ | `journey.sh` |
+| 12 | 数据集搬迁零重传 | ❌ **失败** | `journey.sh`——`register` 报 `hub_instance_id` 不符，见下 |
 
 ## 两个已确认的阻断项
 
-### 第 5 条：`arca sync` 有两个引擎，改名检测只在其中一个里
+### 第 5 条：`arca sync` 曾有两个引擎，改名检测只在其中一个里 —— **已修**
 
 - `file://` → `sync_lib::sync`（`sync.rs:285`）——**没有改名检测**
 - `http://` → `sync_lib::sync_transport`（`sync.rs:869`）——**有** `detect_renames`
@@ -36,10 +36,33 @@ hub 上新建 item_id（**违反 I7 身份跨改名稳定**）、内容被全量
 这正是 M2d 评审命名过的那类问题：「同一个抽象下两条实现分叉，正是 `Transport`
 当初要消除的」。
 
-**修法有取舍**：直接把 `file://` 换成 `sync_transport + LocalTransport` 是最干净的
-收敛，但 `sync()` 有批量提交（`Batch`/`AppendBatch`）而 `sync_transport` 没有
-（M2c 归档记过：「`sync_transport` 的批量化未完成」），换过去会让一万文件基准回退。
-正解是**收敛 + 给 `sync_transport` 补 `commit_batch`**，两件事一起做。
+**修法**：CLI 的 `file://` 分支改走 `sync_transport + LocalTransport`，两种 hub
+同一个引擎。演练重跑通过。
+
+修之前我担心性能：`sync()` 有批量提交（`Batch`/`AppendBatch`）而 `sync_transport`
+没有（M2c 归档记过「`sync_transport` 的批量化未完成」），换过去会让一万文件基准回退。
+**测量推翻了这个假设**——基线 239.3s、改后 240.0s，差 0.7s（噪声级别）。原因很简单：
+240 秒里 238 秒花在 `adopt`（归档）上，而 `adopt` 压根不走 `sync`。
+
+顺带发现：**一万文件基准早就在失败**（239s vs 120s 预算），与本次改动无关。
+它是 `#[ignore]` 的、不进 CI，所以一直没人看见。瓶颈在 `adopt`，不在同步。
+
+### 第 12 条：数据集搬迁在 `register` 一步就失败
+
+```
+photo 已有 dataset.toml，其 hub_instance_id "fd15…" 与本次解析出的 "c864…" 不符
+```
+
+搬迁场景是：把 `photo/`（含 `.arca/`）整体移到另一个 git 仓库，然后在新 vault 里
+`register` 同一个 hub。`dataset.toml` 里记着原 hub 的 `instance_id`，而新 vault 的
+`.gitarca` 解析出的是另一个——两者对不上就拒绝（I5：绝不猜测）。
+
+**拒绝本身是对的**，但它让 spec §6.3 第 12 条承诺的「搬迁后身份/清单/hub 归属
+全部复位、零重传」走不通：目前没有任何一条命令能表达「这就是同一个数据集，
+只是换了个仓库」。缺的是搬迁通路本身，不是那道校验。
+
+> **订正**：本账本此前把第 12 条标为 ✅ 是错的——前两次演练都在第 5 条就停了，
+> 第 12 条**从未真正跑到过**。标记依据必须是「跑过并通过」，不是「写了断言」。
 
 ### 第 10 条：历史版本的字节从未被保留过
 
@@ -52,5 +75,5 @@ hub 存储根里只有 `files/`（当前版本）、`index/`、`items/`、`journ
 
 ## 为什么这个演练还没进 CI
 
-因为它现在是**红的**——第 5 条（续）会失败。这是有意的：它把一个真实缺陷变成了
-可执行断言。等两个阻断项修完再接进 CI；在那之前，**不要为了让它变绿而放松断言**。
+因为它现在是**红的**——第 12 条会失败。这是有意的：它把一个真实缺陷变成了
+可执行断言。等阻断项修完再接进 CI；在那之前，**不要为了让它变绿而放松断言**。
