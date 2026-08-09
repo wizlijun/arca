@@ -118,6 +118,33 @@ jobs:
             exit 1
           fi
 
+  agentd-crash-drill:
+    name: agentd 崩溃演练（分层降级，M3a）
+    runs-on: ubuntu-latest
+    # CLAUDE.md「agentd 崩了，手动命令必须照常工作」与 I11 同级别：它是
+    # spec §3.1 分层降级关系的全部内容。同样每次 push/PR 都跑。
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 编译 arca / arca-agentd 二进制
+        run: cargo build -p arca-cli -p arca-agentd --bins
+      - name: chmod
+        run: chmod +x crates/arca-conformance/tests/drills/*.sh
+      - name: 正面：kill -9 agentd 之后手动命令照常工作
+        run: crates/arca-conformance/tests/drills/agentd-crash.sh "$RUNNER_TEMP/agentd-crash"
+      - name: 反面：手动命令一旦依赖 agentd，演练必须变红
+        # 用一个「没有 agentd 在跑时 sync/status/verify 直接失败」的包装重跑
+        # 一遍——那正是本演练要抓的回归。注意**不能**复用
+        # fake-always-success-wrapper.sh：那个夹具强制成功，而本演练的正例
+        # 本来就期望成功、判据是字节是否落地，用它等于什么都没验。
+        run: |
+          if REAL_ARCA_BIN="$(pwd)/target/debug/arca" \
+             ARCA_BIN="$(pwd)/crates/arca-conformance/tests/drills/fake-requires-agentd-wrapper.sh" \
+             crates/arca-conformance/tests/drills/agentd-crash.sh "$RUNNER_TEMP/agentd-crash-fake"; then
+            echo "「手动命令依赖 agentd」的包装脚本没有被 agentd-crash.sh 抓出来——演练本身的断言逻辑失效" >&2
+            exit 1
+          fi
+
   fuzz:
     name: fuzz 回归（含 ASAN，每晚）／${{ matrix.target }}
     runs-on: ubuntu-latest

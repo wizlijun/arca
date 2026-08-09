@@ -11,4 +11,14 @@ homepage.workspace = true
 arca-core = { path = "../arca-core" }
 arca-format = { path = "../arca-format" }
 arca-chunk = { path = "../arca-chunk" }
-# 计划依赖（实现时启用）：tokio, rusqlite（投影）, notify（watcher）
+arca-store = { path = "../arca-store" }
+# agentd 是 arca-cli 的**消费者**，不是它的平行实现：调和的决策来自
+# arca-core、执行来自 arca_cli::sync，本 crate 只负责「什么时候调它」与
+# 「失败了怎么退避」。两者同为 MIT，依赖方向合法。见 main.rs 模块文档。
+arca-cli = { path = "../arca-cli" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+fs4 = "1.1.0"
+# 计划依赖（实现时启用）：rusqlite（投影，M3c）, notify（watcher，M3b）
+
+[dev-dependencies]
+tempfile = "3.27.0"

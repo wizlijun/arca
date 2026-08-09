@@ -66,8 +66,13 @@ name = "arca-agentd"
 version = "0.0.1"
 dependencies = [
  "arca-chunk",
+ "arca-cli",
  "arca-core",
  "arca-format",
+ "arca-store",
+ "fs4",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
