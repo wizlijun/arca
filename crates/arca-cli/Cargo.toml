@@ -38,7 +38,5 @@ toml = "1.1.4"
 
 [dev-dependencies]
 tempfile = "3.27.0"
-# 只用于 TLS 测试里现造一张自签名证书（M2e Task 4）——不进生产依赖树。
-rcgen = "0.14"
 rustls-pki-types = "1"
 # 计划依赖（实现时启用）：serde_json（--json 输出，M1）

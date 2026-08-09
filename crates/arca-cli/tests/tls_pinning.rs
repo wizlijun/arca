@@ -42,9 +42,11 @@ fn git(dir: &Path, args: &[&str]) {
 /// pin 并不豁免它）。
 fn serve_tls(response: &'static str) -> (u16, Vec<u8>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let cert_der = issued.cert.der().to_vec();
-    let key_der = issued.signing_key.serialize_der();
+    // 证书是**提交进仓库的夹具**，不是运行时现造的——见本文件末尾
+    // `mod 夹具说明`。所有指纹都由 `fingerprint(der)` 在运行时算，
+    // 所以固定一张证书不削弱任何一条断言。
+    let cert_der = include_bytes!("fixtures/localhost-selfsigned.cert.der").to_vec();
+    let key_der = include_bytes!("fixtures/localhost-selfsigned.pkcs8.der").to_vec();
 
     // 绑到 `localhost:0` 而不是 `127.0.0.1:0`：客户端连的是 `localhost`
     // （证书 SAN 也是它），本机装了 IPv6 时 `localhost` 会解析出 `::1` 与
@@ -320,3 +322,33 @@ fn 明文http_hub上配pin被拒绝而不是静默忽略() {
         "必须明说这个配置是无效的：{stderr}"
     );
 }
+
+/// # 夹具说明：证书为什么是提交进仓库的，而不是运行时现造的
+///
+/// 本文件原先用 `rcgen::generate_simple_self_signed` 每次现造一张证书。
+/// 那样很方便，但它把 `time` 拖进了**构建图**——而 `time >= 0.3.47`
+/// （`ureq` 的 `cookie_store` 要求的下界）全都要 rustc **1.88**，
+/// 于是 `cargo +1.85 check --workspace --locked --all-targets` 这道门禁
+/// 当场断掉。它在 M2e Task 4 落地时就断了，直到 Task 5 收尾跑门禁才被发现。
+///
+/// **MSRV 是对用户的承诺，不该被一个只在测试里用一次的依赖拉低。**
+/// 发布出去的二进制本身在 1.85 上编得好好的；被卡住的只有测试。
+/// 所以这里换成夹具：`openssl` 生成的自签名 P-256 证书，SAN 为 `localhost`，
+/// 有效期到 **2126 年**（不会在某个早上突然让 CI 变红）。
+///
+/// 私钥进仓库看着刺眼，但它是**一次性的测试用密钥**，不保护任何东西——
+/// rustls、hyper 等项目都这么做。要重新生成：
+///
+/// ```text
+/// openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+///   -keyout key.pem -out cert.pem -days 36500 -nodes \
+///   -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost"
+/// openssl x509  -in cert.pem -outform DER -out fixtures/localhost-selfsigned.cert.der
+/// openssl pkcs8 -topk8 -nocrypt -in key.pem -outform DER \
+///   -out fixtures/localhost-selfsigned.pkcs8.der
+/// ```
+///
+/// 换回运行时生成的条件很明确：`time` 的 MSRV 回落到 1.85 及以下，
+/// 或者本项目自己把 MSRV 提到 1.88。
+#[cfg(test)]
+mod 夹具说明 {}
