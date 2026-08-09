@@ -164,7 +164,13 @@ pub struct FlushOutcome {
     pub dropped: u64,
 }
 
-fn trace_dir(state_dir: &Path) -> PathBuf {
+/// 会话文件的实际落点：`<state>/trace/`。
+///
+/// 公开出来是因为 `arca bugreport` 要列出最近的落盘文件——它必须列
+/// **这个**目录而不是 `<state>` 本身。第一版就踩了这个坑：列 `<state>`
+/// 只会得到一行「`trace` 目录」，几十个真正的会话文件一个都看不见，
+/// 而 bugreport 里那一节的全部价值就在于让人知道**有哪些会话可以附上**。
+pub fn trace_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("trace")
 }
 

@@ -1475,6 +1475,292 @@ pub fn restore_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
+// `arca bugreport`（M2e Task 5，spec §3.3）
+// ---------------------------------------------------------------------------
+
+/// `arca bugreport`——**一条命令收齐诊断现场**（spec §3.3，借 git 的
+/// `git bugreport`）。目的是让用户/agent 报障时不必被追问二十个问题。
+///
+/// # 隐私边界：只收元数据与路径，绝不收内容
+///
+/// 收集的东西全部落在这三类里：
+///
+/// 1. **本机与版本**：arca 版本、操作系统/架构、git 版本；
+/// 2. **配置与状态的元数据**：数据集路径、hub 名与 URL、角色（`role.toml`）、
+///    `dataset_id`、`.gitignore` 反选块的**实测**结果、hub 可达性、
+///    本地回收站的条目数/占用/最老条目、trace 落盘文件的**文件名与大小**；
+/// 3. **诊断结论**：`arca doctor` 的报告。
+///
+/// **绝不读取任何受管文件的内容**——没有一处 `fs::read` 作用在
+/// `<dataset>/<受管路径>` 上；trace 文件同理只列**文件名与大小**，不读内容
+/// （trace 事件里会带路径，那是用户自己决定要不要附上的东西，本命令不替他
+/// 决定）。**路径本身会出现**（数据集路径、本地回收站里记录的原路径）——
+/// 这是任务简报画的线：「绝不收集文件内容或路径以外的用户数据」。如果连
+/// 路径都不能外泄，请手工编辑输出后再发出去。
+///
+/// 输出走 **stdout**，纯文本、逐行、可直接粘进 issue——用户在按回车之前
+/// 就能把收了什么看个遍（这正是"输出前要能让用户看到收了什么"的落地方式：
+/// 不落盘、不上传、不做任何后台动作，就是打到屏幕上）。
+pub fn bugreport_cmd() -> ExitCode {
+    println!("# arca bugreport");
+    println!();
+    println!("生成时间：{}", clock::now_rfc3339());
+    println!();
+    println!("## 隐私边界");
+    println!(
+        "本报告只含版本/平台/配置元数据、路径、以及 arca 自己的诊断结论。\
+         **不含任何受管文件的内容**；trace 文件只列文件名与大小，未读取其内容。\
+         数据集路径与回收站记录里的原路径**会**出现——如果这些路径本身敏感，\
+         请手工编辑后再发出去。"
+    );
+    println!();
+
+    println!("## 本机");
+    println!("arca 版本：{}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "平台：{} / {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let git_version = Command::new("git")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "(git 不可用)".to_string());
+    println!("git：{git_version}");
+    println!();
+
+    // --- trace 落盘（文件名 + 大小，不读内容） ---------------------------
+    println!("## 最近的 trace 落盘");
+    match trace_sink::state_dir() {
+        None => println!("(无法解析全机 trace 目录：home/profile 目录不可用)"),
+        Some(state) => {
+            // 会话文件落在 `<state>/trace/`，不是 `<state>` 本身——列错一层
+            // 只会得到一行「trace 目录」，几十个真正的会话文件一个都看不见。
+            let dir = trace_sink::trace_dir(&state);
+            println!("目录：{}", dir.display());
+            let mut files: Vec<(String, u64)> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                // 只要常规文件：目录项没有"这次会话留了多少字节"的含义。
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let size = e.metadata().ok()?.len();
+                    Some((name, size))
+                })
+                .collect();
+            files.sort();
+            if files.is_empty() {
+                println!("(没有任何 trace 落盘文件——trace 只在失败时落盘，见 FORMAT.md §10.6)");
+            } else {
+                // 只列最近的若干条，避免报告被几十个文件名淹没。
+                let shown = files.len().min(20);
+                for (name, size) in files.iter().rev().take(shown) {
+                    println!("{name}\t{size} 字节");
+                }
+                if files.len() > shown {
+                    println!("…（另有 {} 个更早的文件未列出）", files.len() - shown);
+                }
+            }
+        }
+    }
+    println!();
+
+    // --- vault 与各数据集 ------------------------------------------------
+    let vault = match vault::open(&cwd()) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("## vault");
+            println!("打开失败：{e}");
+            println!();
+            println!("（不在 vault 内时报告到此为止——上面的本机与 trace 信息仍然有用。）");
+            return ExitCode::SUCCESS;
+        }
+    };
+    println!("## vault");
+    println!("根：{}", vault.repo.root().display());
+    println!();
+
+    println!("## hub 端点");
+    for (name, hub) in vault.registry.hubs() {
+        println!(
+            "{name}\turl={}\tinstance_id={}\ttls_pin={}",
+            hub.url,
+            hub.instance_id,
+            hub.tls_pin.as_deref().unwrap_or("(无)")
+        );
+    }
+    println!();
+
+    println!("## 数据集");
+    for entry in vault.registry.datasets() {
+        println!("### {}", entry.path);
+        println!("hub：{}", entry.hub);
+        match dataset::resolve(&cwd(), &entry.path, None) {
+            Err(e) => println!("解析失败：{e}"),
+            Ok(resolved) => {
+                println!("dataset_id：{}", resolved.cfg.dataset_id);
+                // M2d 评审建议：**角色必须进 bugreport**——它正是那种"解释
+                // 为什么这台设备行为和那台不同"的设备本地状态，而在此之前
+                // 所有诊断命令都看不见它。
+                match role::read(&resolved.dataset_dir) {
+                    Ok(r) => println!("角色（role.toml）：{}", r.as_str()),
+                    Err(e) => println!("角色（role.toml）：读取失败：{e}"),
+                }
+                match &resolved.target {
+                    HubTarget::Local(p) => {
+                        println!("存储根：{}", p.display());
+                        // hub 可达性：对本地根就是"能不能按已知身份打开"（I11）。
+                        match StorageRoot::open(p, Some(&resolved.cfg.dataset_id)) {
+                            Ok(_) => println!("hub 可达性：在线（身份相符）"),
+                            Err(e) => println!("hub 可达性：离线——{e}"),
+                        }
+                    }
+                    HubTarget::Http { base_url, tls_pin } => {
+                        println!("hub 基址：{base_url}");
+                        // 可达性探测：只发一次 `GET .../state`，不写任何东西。
+                        match http_transport(
+                            base_url,
+                            &resolved.cfg.dataset_id,
+                            tls_pin.as_deref(),
+                            None,
+                        ) {
+                            Err(e) => println!("hub 可达性：连接前失败——{e}"),
+                            Ok(t) => {
+                                use arca_cli::transport::Transport;
+                                match t.read_remote() {
+                                    Ok(m) => {
+                                        println!("hub 可达性：在线（报告 {} 条路径）", m.len())
+                                    }
+                                    Err(e) => println!("hub 可达性：{e}"),
+                                }
+                            }
+                        }
+                    }
+                }
+                // 本地回收站占用——M2e Task 1 让它可见，这里一并带上。
+                match local_trash::usage(
+                    &resolved.dataset_dir,
+                    &clock::now_rfc3339(),
+                    trash::DEFAULT_RETENTION_DAYS,
+                ) {
+                    Ok(u) => println!(
+                        "本地回收站：{} 条、{} 字节、最老 {}、已过保留期 {} 条",
+                        u.entries,
+                        u.bytes,
+                        u.oldest_deleted_at.as_deref().unwrap_or("(无)"),
+                        u.expired
+                    ),
+                    Err(e) => println!("本地回收站：统计失败：{e}"),
+                }
+                // 本地回收站的**清单**（M2d 评审建议：应当进 bugreport）——
+                // 只列路径与时间，不读任何 `.data` 内容。
+                match local_trash::list(&resolved.dataset_dir) {
+                    Ok(entries) if !entries.is_empty() => {
+                        println!("本地回收站清单（原路径 / 删除时刻 / trash_id）：");
+                        for e in entries.iter().take(50) {
+                            println!("  {}\t{}\t{}", e.meta.path, e.meta.deleted_at, e.trash_id);
+                        }
+                        if entries.len() > 50 {
+                            println!("  …（另有 {} 条未列出）", entries.len() - 50);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => println!("本地回收站清单：读取失败：{e}"),
+                }
+                // `.gitignore` 反选块的**实测**结果（CLAUDE.md「已知的高危处」：
+                // 断言的必须是 `git check-ignore` 的实际结果，不是文本）。
+                let probe = format!("{}/__arca_bugreport_probe__", resolved.normalized_path);
+                match vault.repo.check_ignore_no_index(&probe) {
+                    Ok(true) => println!(".gitignore 反选块（实测）：受管路径已被忽略 ✓"),
+                    Ok(false) => println!(
+                        ".gitignore 反选块（实测）：**受管路径未被忽略** —— \
+                         下次 `git add -A` 会把整个数据集提交进 git"
+                    ),
+                    Err(e) => println!(".gitignore 反选块（实测）：检查失败：{e}"),
+                }
+                let meta_probe = format!("{}/.arca/manifest", resolved.normalized_path);
+                match vault.repo.check_ignore_no_index(&meta_probe) {
+                    Ok(false) => println!(".arca/manifest（实测）：未被忽略 ✓（协作者能拿到清单）"),
+                    Ok(true) => {
+                        println!(".arca/manifest（实测）：**被忽略** —— 协作者拿不到这份清单")
+                    }
+                    Err(e) => println!(".arca/manifest（实测）：检查失败：{e}"),
+                }
+            }
+        }
+        println!();
+    }
+
+    // --- doctor 的结论 ---------------------------------------------------
+    println!("## arca doctor");
+    let report = doctor::doctor(&vault.repo, &vault.registry, None);
+    for issue in &report.vault_issues {
+        println!("vault：{issue}");
+    }
+    for d in &report.datasets {
+        match d {
+            doctor::DatasetHealth::Checked {
+                path,
+                local_only,
+                ignore_issues,
+                manifest_issue,
+                trash_issues,
+                possible_lost_server_role,
+                local_trash_issues,
+                hub_trash_scan_skipped,
+                ..
+            } => {
+                println!(
+                    "{path}：local_only={} ignore_issues={} manifest_issue={} \
+                     trash_issues={} local_trash_issues={} possible_lost_server_role={} \
+                     hub_trash_scan_skipped={}",
+                    local_only.len(),
+                    ignore_issues.len(),
+                    manifest_issue.is_some(),
+                    trash_issues.len(),
+                    local_trash_issues.len(),
+                    possible_lost_server_role,
+                    hub_trash_scan_skipped
+                );
+                for p in local_only {
+                    println!("  本地存在但 hub 尚无副本：{path}/{p}");
+                }
+                for i in ignore_issues {
+                    println!("  {i}");
+                }
+                if let Some(i) = manifest_issue {
+                    println!("  {i}");
+                }
+                for i in trash_issues.iter().chain(local_trash_issues) {
+                    println!("  {i}");
+                }
+            }
+            doctor::DatasetHealth::Offline { path, reason } => {
+                println!("{path}：离线（I11）——{reason}")
+            }
+            doctor::DatasetHealth::CheckFailed { path, reason } => {
+                println!("{path}：巡检失败——{reason}")
+            }
+            doctor::DatasetHealth::ResolveFailed { path, reason } => {
+                println!("{path}：解析失败——{reason}")
+            }
+        }
+    }
+    println!();
+    println!("（报告结束。以上全部内容都在你的屏幕上，arca 没有把它写到任何地方、也没有上传。）");
+
+    // bugreport 是一次纯粹的信息收集，**它自己**成功了就退出 0——即便报告
+    // 里记录了一堆问题。退出码回答的是"这条命令跑成功了吗"，不是"你的库
+    // 健康吗"（后者是 `arca doctor` 的退出码要回答的）。
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
 // `arca gc`（M2e Task 2，spec §7、I3）
 // ---------------------------------------------------------------------------
 

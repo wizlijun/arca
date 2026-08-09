@@ -181,6 +181,12 @@ enum Command {
         #[arg(long)]
         root: Option<std::path::PathBuf>,
     },
+    /// 一条命令收齐诊断现场（spec §3.3，借 git 的 git bugreport）：版本、
+    /// 平台、各数据集的角色与健康度、最近的 trace 落盘文件列表、本地回收站
+    /// 占用与清单、.gitignore 反选块的实测结果、hub 可达性。**只收元数据、
+    /// 路径与 arca 自己的诊断结论，绝不读取任何受管文件的内容**；输出直接
+    /// 打到 stdout，不落盘、不上传——你在按回车之前就能把收了什么看个遍
+    Bugreport,
     /// hub 端点的本机操作（目前只有 TLS 证书 pin，spec §9）
     Hub {
         #[command(subcommand)]
@@ -371,6 +377,7 @@ fn main() -> std::process::ExitCode {
                 root.as_deref(),
             )
         }
+        Command::Bugreport => commands::porcelain::bugreport_cmd(),
         Command::Hub { action } => match action {
             HubCommand::Trust { name, fingerprint } => {
                 commands::porcelain::hub_trust_cmd(&name, fingerprint.as_deref())
