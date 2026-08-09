@@ -187,6 +187,15 @@ enum Command {
     /// 路径与 arca 自己的诊断结论，绝不读取任何受管文件的内容**；输出直接
     /// 打到 stdout，不落盘、不上传——你在按回车之前就能把收了什么看个遍
     Bugreport,
+    /// **克隆之后的第一条命令**（spec §1.1：克隆仓库 + arca setup 即完成
+    /// 新设备引导）：装 pre-push 钩子（`git clone` 不会带上 .git/hooks/——
+    /// 没有它，「二进制没上传完就 push」不会被拦住），然后把全部数据集的
+    /// 内容拉下来
+    Setup {
+        /// 覆盖从 .gitarca 解析出的存储根路径
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+    },
     /// 把受管二进制还原到**清单说的那个版本**（spec §6.3 第 10 条）。
     /// 典型场景：`git checkout` 到旧提交之后，清单跟着 git 变回了旧版本，
     /// 而受管二进制不在 git 里、还停在新版本。**默认只出清单**
@@ -428,6 +437,7 @@ fn main() -> std::process::ExitCode {
                 root.as_deref(),
             )
         }
+        Command::Setup { root } => commands::porcelain::setup_cmd(root.as_deref()),
         Command::Checkout {
             dataset,
             yes,

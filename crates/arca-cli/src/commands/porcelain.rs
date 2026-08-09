@@ -1594,6 +1594,91 @@ pub fn restore_list_cmd(dataset_path: &str, root: Option<&Path>) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
+// `arca setup`（spec §1.1：克隆仓库 + arca setup 即完成新设备引导）
+// ---------------------------------------------------------------------------
+
+/// `arca setup`——**克隆之后的第一条命令**。
+///
+/// spec §1.1 把新设备引导定义成两步：「克隆仓库 + `arca setup`」。这条命令
+/// 就是第二步，它做两件事：
+///
+/// 1. **装 pre-push 钩子。** `git clone` **不会**带上 `.git/hooks/`——
+///    这不是小事：没有钩子，用户可以推送一个「二进制还没上传完」的提交，
+///    协作者拉下来就是一堆悬空引用（§4.4.2 正是为此存在）。这是克隆路径上
+///    一个天然的、静默的安全缺口，只有 `setup` 能补。
+/// 2. **把全部数据集的内容拉下来。** 逐个跑一轮调和——`arca sync` 在
+///    刚克隆的仓库里本来就能工作（基线缺失会自动重建成一次全量对账），
+///    这里只是给它一个**用户找得到的名字**，并且一次覆盖所有数据集。
+///
+/// # 为什么不是 `arca init`
+///
+/// `init` 是**建立**一个 vault（写 `.gitarca`）；克隆出来的仓库那些东西
+/// 已经在 git 里了，再"建"一次只会制造「已存在则只校验」的分支。
+/// 两条路径的心智模型不同：`init` 面向「我要开始用 arca」，
+/// `setup` 面向「这台机器要接上一个已经在用 arca 的库」。
+pub fn setup_cmd(root: Option<&Path>) -> ExitCode {
+    let vault = match vault::open(&cwd()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "{e}\n（`arca setup` 要在一个**已经克隆下来的** arca vault 里跑。\
+                 如果你是要新建一个 vault，用 `arca init`。）"
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    // 1. 钩子。失败**不中止**——拿不到内容比没有钩子更让人无法开始工作，
+    //    而且钩子可以事后补。但必须说清楚。
+    match arca_git::hooks::install_pre_push(&vault.repo) {
+        Ok(arca_git::hooks::InstallOutcome::Installed) => {
+            eprintln!("已安装 pre-push 钩子（`git clone` 不会带上 .git/hooks/，所以每台新设备都要装一次）。");
+        }
+        Ok(arca_git::hooks::InstallOutcome::AlreadyInstalled) => {}
+        Ok(arca_git::hooks::InstallOutcome::Rewritten) => {
+            eprintln!("pre-push 钩子已更新到当前版本。");
+        }
+        Ok(other) => {
+            eprintln!(
+                "**没有安装 pre-push 钩子**（{other:?}）——这台机器上，\
+                 「二进制还没上传完就 git push」将不会被拦住（§4.4.2）。\
+                 处理掉已有的钩子之后重跑 `arca setup`。"
+            );
+        }
+        Err(e) => {
+            eprintln!("**没有安装 pre-push 钩子**：{e}——同上，推送保护在这台机器上不生效。");
+        }
+    }
+
+    // 2. 内容。
+    let paths: Vec<String> = vault
+        .registry
+        .datasets()
+        .iter()
+        .map(|e| e.path.clone())
+        .collect();
+    if paths.is_empty() {
+        eprintln!(
+            "这个 vault 里还没有登记任何数据集——没有内容要拉。\
+             （用 `arca register <目录> --hub <名> --hub-url <地址>` 登记一个。）"
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    let mut worst: u8 = 0;
+    for path in &paths {
+        if paths.len() > 1 {
+            eprintln!("== {path} ==");
+        }
+        worst = worst.max(sync_one(path, root));
+    }
+    if worst == 0 {
+        eprintln!("引导完成：{} 个数据集的内容都已就位。", paths.len());
+    }
+    ExitCode::from(worst)
+}
+
+// ---------------------------------------------------------------------------
 // `arca checkout`（spec §6.3 第 10 条）
 // ---------------------------------------------------------------------------
 
