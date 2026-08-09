@@ -743,8 +743,13 @@ pub fn verify_cmd(path: &str, root: Option<&Path>) -> ExitCode {
     // 存储根路径），但 `verify` 是针对一个具体已登记数据集的巡检，必须先
     // 做这道身份检查；否则挂错了别的空盘会被 `check_path` 老老实实巡检出
     // "零个问题"，把"身份不明"误判成"库是空的、一切正常"（I11）。
+    //
+    // M2d Task 5（拔盘演练）：诊断文案与 `status_one`/`sync_one` 统一用
+    // "数据集 {path}（hub=...）离线：{e}" 这个形状——拔盘演练脚本需要对
+    // 三个命令做同一种断言（都报"离线"、都点名哪个 hub），措辞分裂会让
+    // 演练脚本要么漏判、要么各写一套匹配规则。
     if let Err(e) = StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id)) {
-        eprintln!("{e}");
+        eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
         return ExitCode::from(2);
     }
 

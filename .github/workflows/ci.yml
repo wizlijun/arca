@@ -88,6 +88,36 @@ jobs:
             exit 1
           fi
 
+  unplug-drills:
+    name: 拔盘演练（I11，M2d）
+    runs-on: ubuntu-latest
+    # I11「挂载缺失即离线」与 I1 同级别的头号承诺，同样每次 push/PR 都跑，
+    # 不等每晚 cron——见 crates/arca-conformance/tests/drills/README.md。
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 编译 arca / arcad 二进制
+        run: cargo build -p arca-cli -p arcad --bins
+      - name: chmod
+        run: chmod +x crates/arca-conformance/tests/drills/*.sh
+      - name: 正面 + 反面：客户端侧（status/sync/verify）
+        run: crates/arca-conformance/tests/drills/unplug-cli.sh "$RUNNER_TEMP/unplug-cli"
+      - name: 正面 + 反面：arcad 侧（某数据集 503，其余照常 200）
+        run: crates/arca-conformance/tests/drills/unplug-arcad.sh "$RUNNER_TEMP/unplug-arcad"
+      - name: 断言「演练脚本自己也会被假绿骗过」这件事不成立
+        # 只跑正例的演练是假绿（M0 逃生舱脚本被评审抓到过三次"该失败时报
+        # 成功"）——用一个把 status/sync/verify 强制改成"无论真实结果如何
+        # 都报成功"的包装二进制重跑一遍 unplug-cli.sh，这次运行必须以非零
+        # 退出；如果反而报告"全部通过"，说明 unplug-cli.sh 自己的断言逻辑
+        # 失效了，不能再信任它能抓住真实回归。
+        run: |
+          if REAL_ARCA_BIN="$(pwd)/target/debug/arca" \
+             ARCA_BIN="$(pwd)/crates/arca-conformance/tests/drills/fake-always-success-wrapper.sh" \
+             crates/arca-conformance/tests/drills/unplug-cli.sh "$RUNNER_TEMP/unplug-cli-fake"; then
+            echo "假绿的 arca 包装脚本没有被 unplug-cli.sh 抓出来——演练脚本本身的断言逻辑失效" >&2
+            exit 1
+          fi
+
   fuzz:
     name: fuzz 回归（含 ASAN，每晚）／${{ matrix.target }}
     runs-on: ubuntu-latest
