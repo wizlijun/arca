@@ -1602,7 +1602,7 @@ pub fn publish_map_cmd(all: bool, out: Option<&Path>) -> ExitCode {
         None
     } else {
         let mut set = std::collections::BTreeSet::new();
-        if let Err(e) = 收集md引用(&vault_root, &vault_root, &mut set) {
+        if let Err(e) = 收集md引用(&vault_root, &mut set) {
             eprintln!("扫描 md 引用失败：{e}");
             return ExitCode::from(1);
         }
@@ -1677,11 +1677,7 @@ pub fn publish_map_cmd(all: bool, out: Option<&Path>) -> ExitCode {
 }
 
 /// 递归收集 vault 里所有 `.md` 的引用。**跳过 `.git/` 与 `.arca/`**。
-fn 收集md引用(
-    vault_root: &Path,
-    dir: &Path,
-    out: &mut std::collections::BTreeSet<String>,
-) -> Result<(), String> {
+fn 收集md引用(dir: &Path, out: &mut std::collections::BTreeSet<String>) -> Result<(), String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}：{e}", dir.display()))?;
     for e in entries.filter_map(|e| e.ok()) {
         let path = e.path();
@@ -1691,7 +1687,7 @@ fn 收集md引用(
         }
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
-            收集md引用(vault_root, &path, out)?;
+            收集md引用(&path, out)?;
         } else if path.extension().is_some_and(|x| x == "md") {
             // 只读 `.md`——**受管二进制一个字节都不读**（那正是本命令的卖点）。
             let text =
