@@ -106,19 +106,63 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
+    /// 明文 `http://`（或"信任配置由调用方另行决定"）的构造。`https://`
+    /// 请用 [`HttpTransport::with_trust`]——它才会把 pin 过的证书装进
+    /// TLS 配置。
     pub fn new(base_url: &str, dataset_id: &str, sid: Option<Sid>) -> Self {
+        Self::build(base_url, dataset_id, sid, None)
+    }
+
+    /// 带 TLS 信任配置的构造（M2e Task 4，spec §9）——`trust` 由
+    /// [`crate::tls::decide`] 产出：
+    ///
+    /// - [`crate::tls::Trust::PublicRoots`]：走 ureq 默认的公共根
+    ///   （WebPki）。公网签发的证书静默通过；自签名握手失败，由命令壳用
+    ///   [`crate::tls::explain_handshake_failure`] 补上"你需要 pin"的诊断。
+    /// - [`crate::tls::Trust::PinnedCert`]：**只信任这一张证书**。注意这
+    ///   仍然是完整的 rustls 校验（链、有效期、SAN/主机名全查），只是信任
+    ///   锚点换成了这一张——不是"关掉校验再自己比一次哈希"。
+    pub fn with_trust(
+        base_url: &str,
+        dataset_id: &str,
+        sid: Option<Sid>,
+        trust: &crate::tls::Trust,
+    ) -> Self {
+        let tls = match trust {
+            crate::tls::Trust::PublicRoots => None,
+            crate::tls::Trust::PinnedCert(der) => {
+                let cert = ureq::tls::Certificate::from_der(der).to_owned();
+                Some(
+                    ureq::tls::TlsConfig::builder()
+                        .root_certs(ureq::tls::RootCerts::new_with_certs(&[cert]))
+                        .build(),
+                )
+            }
+        };
+        Self::build(base_url, dataset_id, sid, tls)
+    }
+
+    fn build(
+        base_url: &str,
+        dataset_id: &str,
+        sid: Option<Sid>,
+        tls: Option<ureq::tls::TlsConfig>,
+    ) -> Self {
         // `http_status_as_error(false)`：4xx/5xx 也要拿到 `Ok(Response)`——
         // 本模块要读它们的结构化响应体（412 的 base/theirs/yours、409 的
         // claimed/actual_item_id、503 的 code/message），不能让 ureq 提前
         // 把它们折叠成一个不带响应体的 `Err`。真正的 `Err` 因此只代表"这次
         // 请求压根没有走完"（连不上/超时/协议解析失败等），与 [`TransportError::class`]
         // 的分类原则完全对齐。
-        let config = ureq::Agent::config_builder()
+        let builder = ureq::Agent::config_builder()
             .http_status_as_error(false)
-            .timeout_global(Some(DEFAULT_TIMEOUT))
-            .build();
+            .timeout_global(Some(DEFAULT_TIMEOUT));
+        let builder = match tls {
+            Some(t) => builder.tls_config(t),
+            None => builder,
+        };
         Self {
-            agent: ureq::Agent::new_with_config(config),
+            agent: ureq::Agent::new_with_config(builder.build()),
             base_url: base_url.trim_end_matches('/').to_string(),
             dataset_id: dataset_id.to_string(),
             sid,

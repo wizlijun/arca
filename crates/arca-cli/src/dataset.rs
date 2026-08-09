@@ -32,11 +32,26 @@ pub enum HubTarget {
     /// `file://`/裸路径解析出的本地存储根路径，尚未 `StorageRoot::open`
     /// （与 M1d 起的既有行为完全一致）。
     Local(PathBuf),
-    /// `http://` hub 的基址——`http://<host>[:port]`，不含末尾 `/`、不含
-    /// `/v1/datasets/...` 后缀（数据集坐标由 [`ResolvedDataset::cfg`] 的
-    /// `dataset_id` 另外提供，两者合起来才是完整端点，见
-    /// `transport::http::HttpTransport::new`）。
-    Http { base_url: String },
+    /// `http://` / `https://` hub 的基址——`<scheme>://<host>[:port]`，不含
+    /// 末尾 `/`、不含 `/v1/datasets/...` 后缀（数据集坐标由
+    /// [`ResolvedDataset::cfg`] 的 `dataset_id` 另外提供，两者合起来才是
+    /// 完整端点，见 `transport::http::HttpTransport::new`）。
+    Http {
+        base_url: String,
+        /// `.gitarca` 里为这个 hub 记录的 TLS 指纹 pin（M2e Task 4，
+        /// FORMAT.md §9.1）。只对 `https://` 有意义；`http://` 恒为 `None`
+        /// （明文连接没有证书可 pin——而且如果一个 `http://` hub 配了 pin，
+        /// 那是配置错误，[`resolve`] 会拒绝，见其实现）。
+        tls_pin: Option<String>,
+    },
+}
+
+impl HubTarget {
+    /// 这个目标是不是 `https://`——命令壳据此决定要不要走
+    /// [`crate::tls::decide`]（明文 `http://` 没有证书可验）。
+    pub fn is_tls(&self) -> bool {
+        matches!(self, HubTarget::Http { base_url, .. } if base_url.starts_with("https://"))
+    }
 }
 
 /// 一个已解析、但尚未打开存储根/建立连接的数据集。
@@ -69,7 +84,7 @@ impl ResolvedDataset {
     pub fn local_root(&self) -> Result<&Path, ResolveError> {
         match &self.target {
             HubTarget::Local(p) => Ok(p),
-            HubTarget::Http { base_url } => Err(ResolveError::LocalOnlyCommand {
+            HubTarget::Http { base_url, .. } => Err(ResolveError::LocalOnlyCommand {
                 hub_url: base_url.clone(),
             }),
         }
@@ -100,6 +115,17 @@ pub enum ResolveError {
     LocalOnlyCommand {
         hub_url: String,
     },
+    /// 明文 `http://` hub 上配了 `tls_pin`——配置错误，拒绝而不是忽略
+    /// （M2e Task 4，见 [`resolve`] 里的注释）。
+    PinOnPlaintextHub {
+        hub: String,
+        url: String,
+    },
+    /// `tls_pin` 的字节格式不合规（FORMAT.md §9.1）。
+    BadTlsPin {
+        hub: String,
+        reason: String,
+    },
     Io {
         path: String,
         reason: String,
@@ -126,6 +152,15 @@ impl fmt::Display for ResolveError {
                 "{hub_url} 是 http:// hub——这条命令目前只支持本地（file://）存储根，\
                  改用 `arca sync` 之类已接通 http:// 的命令"
             ),
+            ResolveError::PinOnPlaintextHub { hub, url } => write!(
+                f,
+                "hub {hub:?} 的 url 是明文 {url}，却配置了 tls_pin——这条连接根本不走 TLS，\
+                 pin 不会生效。已停止（绝不静默忽略一个会让你误以为受保护的配置，I5）：\
+                 要么把 url 改成 https://，要么删掉 tls_pin。"
+            ),
+            ResolveError::BadTlsPin { hub, reason } => {
+                write!(f, "hub {hub:?} 的 tls_pin 不合规：{reason}")
+            }
             ResolveError::Io { path, reason } => write!(f, "{path}：{reason}"),
         }
     }
@@ -182,13 +217,36 @@ pub fn resolve(
     // 报「该 transport 属 M2，本版本不支持」，行为不变。
     let target = if let Some(root) = root_override {
         HubTarget::Local(root.to_path_buf())
-    } else if let Some(rest) = hub.url.strip_prefix("http://") {
+    } else if let Some((scheme, rest)) = hub
+        .url
+        .strip_prefix("http://")
+        .map(|r| ("http", r))
+        .or_else(|| hub.url.strip_prefix("https://").map(|r| ("https", r)))
+    {
         let base = rest.trim_end_matches('/');
         if base.is_empty() {
             return Err(ResolveError::HubRoot(HubRootError::EmptyUrl));
         }
+        // M2e Task 4：pin 只对 `https://` 有意义。给一个明文 `http://` hub
+        // 配 `tls_pin` 是配置错误——**拒绝而不是忽略**（I5）：静默忽略会让
+        // 用户以为自己已经受 pin 保护，而实际上这条连接连 TLS 都没有。
+        if scheme == "http" && hub.tls_pin.is_some() {
+            return Err(ResolveError::PinOnPlaintextHub {
+                hub: entry.hub.clone(),
+                url: hub.url.clone(),
+            });
+        }
+        // pin 的字节格式在这里就校验（FORMAT.md §9.1）——一个写错的 pin
+        // 应该在解析配置时就报出来，不是等到握手那一刻才发现。
+        if let Some(pin) = &hub.tls_pin {
+            crate::tls::parse_pin(pin).map_err(|e| ResolveError::BadTlsPin {
+                hub: entry.hub.clone(),
+                reason: e.to_string(),
+            })?;
+        }
         HubTarget::Http {
-            base_url: format!("http://{base}"),
+            base_url: format!("{scheme}://{base}"),
+            tls_pin: hub.tls_pin.clone(),
         }
     } else {
         HubTarget::Local(vault::resolve_hub_root(hub, None).map_err(ResolveError::HubRoot)?)
@@ -321,7 +379,7 @@ mod tests {
 
         let resolved = resolve(vault_dir.path(), "assets", None).unwrap();
         match &resolved.target {
-            HubTarget::Http { base_url } => assert_eq!(base_url, "http://127.0.0.1:18420"),
+            HubTarget::Http { base_url, .. } => assert_eq!(base_url, "http://127.0.0.1:18420"),
             other => panic!("应为 HubTarget::Http，实得 {other:?}"),
         }
         assert!(matches!(

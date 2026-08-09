@@ -221,16 +221,17 @@ pub fn register(start: &Path, opts: RegisterOptions) -> Result<RegisterOutcome, 
     // `dataset::resolve`/`HubTarget::Http`，不是它的职责）——这里只做一次
     // 语法层面的"这是不是一个非空的 http:// 地址"检查，真正的连通性/
     // 数据集匹配留到 `arca sync` 实际发起请求时暴露。
-    if !hub_url.starts_with("http://") {
+    if !(hub_url.starts_with("http://") || hub_url.starts_with("https://")) {
         vault::resolve_hub_root(
             &HubEntry {
                 instance_id: hub_instance_id.clone(),
                 url: hub_url.clone(),
+                tls_pin: None,
             },
             None,
         )
         .map_err(RegisterError::UnsupportedHubUrl)?;
-    } else if hub_url == "http://" {
+    } else if hub_url == "http://" || hub_url == "https://" {
         return Err(RegisterError::UnsupportedHubUrl(HubRootError::EmptyUrl));
     }
 
@@ -265,11 +266,19 @@ pub fn register(start: &Path, opts: RegisterOptions) -> Result<RegisterOutcome, 
         .hubs()
         .map(|(k, v)| (k.to_string(), v.clone()))
         .collect();
+    // `tls_pin`：**保留既有值**，绝不因为一次 `arca register` 就把它抹掉
+    // ——`register` 对同名 hub 是"更新 url/instance_id"的语义，而 pin 是一次
+    // 人工确认过的安全决定，静默丢失它会让下一次连接悄悄退回"用系统根校验"
+    // （对自签名 hub 就是直接连不上，还算好；对被中间人替换成公网证书的
+    // 场景就是静默降级）。要改 pin 只能经 `arca hub trust`（那条路径要求
+    // 人工确认指纹）。
+    let existing_pin = registry.hub(opts.hub_name).and_then(|h| h.tls_pin.clone());
     hub_map.insert(
         opts.hub_name.to_string(),
         HubEntry {
             instance_id: hub_instance_id.clone(),
             url: hub_url,
+            tls_pin: existing_pin,
         },
     );
 
@@ -647,8 +656,34 @@ mod tests {
         ));
     }
 
+    /// M2e Task 4 起 `https://` 是受支持的 transport（spec §9 的 TLS 落地），
+    /// 不再被 `register` 拒绝——这条测试从"断言被拒绝"翻转成"断言被接受"，
+    /// 是行为的**有意变更**，不是回归。
     #[test]
-    fn https_url被拒绝() {
+    fn https_url被接受() {
+        let dir = tempfile::tempdir().unwrap();
+        初始化vault(dir.path());
+        fs::create_dir_all(dir.path().join("assets")).unwrap();
+
+        register(
+            dir.path(),
+            RegisterOptions {
+                path: "assets",
+                hub_name: "home",
+                hub_instance_id: None,
+                hub_url: Some("https://nas.example.com:8443"),
+                root_hint: None,
+                dataset_id: None,
+            },
+        )
+        .expect("https:// 自 M2e Task 4 起受支持");
+    }
+
+    /// 但**真正不认识的 transport 仍然被拒绝**（I5：不认识的东西要明确说
+    /// 出来，不是当成裸路径尝试）——这条守住的是"支持的集合是白名单"这个
+    /// 性质本身，不因为白名单里多了一项就消失。
+    #[test]
+    fn 未知transport仍被拒绝() {
         let dir = tempfile::tempdir().unwrap();
         初始化vault(dir.path());
         fs::create_dir_all(dir.path().join("assets")).unwrap();
@@ -659,13 +694,16 @@ mod tests {
                 path: "assets",
                 hub_name: "home",
                 hub_instance_id: None,
-                hub_url: Some("https://nas.example.com/assets"),
+                hub_url: Some("ftp://nas.example.com/assets"),
                 root_hint: None,
                 dataset_id: None,
             },
         )
         .unwrap_err();
-        assert!(matches!(err, RegisterError::UnsupportedHubUrl(_)));
+        assert!(
+            matches!(err, RegisterError::UnsupportedHubUrl(_)),
+            "实得 {err:?}"
+        );
     }
 
     #[test]

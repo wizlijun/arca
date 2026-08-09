@@ -35,6 +35,7 @@ pub mod role;
 pub mod scan;
 pub mod status;
 pub mod sync;
+pub mod tls;
 pub mod trace_sink;
 pub mod transport;
 pub mod trash;

@@ -121,6 +121,28 @@ pub fn write_registry(repo: &Repo, registry: &Registry) -> Result<(), VaultError
     })
 }
 
+/// 只改一个 hub 的 `tls_pin`，其余条目**逐字保持不变**（M2e Task 4）。
+///
+/// `Registry` 是不变数据（没有原地修改 API），所以这里的做法是完整读出全部
+/// hub/dataset 条目、只替换目标那一条的 `tls_pin`、再整体重建写回——与
+/// `register.rs` 增删条目时同一手法。「其余条目保持不变」不是客套话：
+/// `.gitarca` 里可能有别的 hub 的 pin，一次写回把它们弄丢等于静默解除那些
+/// hub 的证书保护。
+pub fn set_hub_tls_pin(vault: &Vault, hub_name: &str, pin: &str) -> Result<(), VaultError> {
+    let mut hubs: std::collections::BTreeMap<String, HubEntry> = vault
+        .registry
+        .hubs()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let entry = hubs.get_mut(hub_name).ok_or_else(|| VaultError::Io {
+        path: GITARCA_FILE.to_string(),
+        reason: format!("hub {hub_name:?} 未在注册表中"),
+    })?;
+    entry.tls_pin = Some(pin.to_string());
+    let registry = Registry::new(hubs, vault.registry.datasets().to_vec());
+    write_registry(&vault.repo, &registry)
+}
+
 /// hub URL 解析失败——彼此可区分（I5）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HubRootError {
@@ -295,6 +317,7 @@ mod tests {
         let hub = HubEntry {
             instance_id: "x".into(),
             url: "file:///Volumes/disk1/arca-photo".into(),
+            tls_pin: None,
         };
         assert_eq!(
             resolve_hub_root(&hub, None).unwrap(),
@@ -307,6 +330,7 @@ mod tests {
         let hub = HubEntry {
             instance_id: "x".into(),
             url: "/mnt/nas/photo".into(),
+            tls_pin: None,
         };
         assert_eq!(
             resolve_hub_root(&hub, None).unwrap(),
@@ -319,6 +343,7 @@ mod tests {
         let hub = HubEntry {
             instance_id: "x".into(),
             url: "https://nas.example.com/photo".into(),
+            tls_pin: None,
         };
         match resolve_hub_root(&hub, None) {
             Err(HubRootError::UnsupportedTransport { scheme }) => assert_eq!(scheme, "https"),
@@ -331,6 +356,7 @@ mod tests {
         let hub = HubEntry {
             instance_id: "x".into(),
             url: "https://nas.example.com/photo".into(),
+            tls_pin: None,
         };
         // --root 覆盖优先于 url 解析，即便 url 本身是不支持的 transport。
         let overridden = resolve_hub_root(&hub, Some(Path::new("/mnt/usb/photo"))).unwrap();
@@ -342,6 +368,7 @@ mod tests {
         let hub = HubEntry {
             instance_id: "x".into(),
             url: String::new(),
+            tls_pin: None,
         };
         assert_eq!(
             resolve_hub_root(&hub, None).unwrap_err(),

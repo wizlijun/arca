@@ -2298,6 +2298,7 @@ mod tests {
                     path,
                 })
                 .collect(),
+            tls: None,
         };
         router(Arc::new(Registry::from_config(&cfg)))
     }

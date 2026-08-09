@@ -70,6 +70,145 @@ fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// 按 spec §9 建一个连到 `http(s)://` hub 的 [`HttpTransport`]（M2e Task 4）。
+///
+/// `http://` 直接构造（没有 TLS）；`https://` 先经 [`arca_cli::tls::decide`]
+/// 决定信任配置——配了 pin 就先探测证书、比对指纹，不符即拒连（错误一路
+/// 上抛，绝不"先连上再说"）。
+///
+/// 返回 `Err(String)` 而不是结构化错误：调用方全都只是把它打到 stderr 然后
+/// 退出，而 `PinError` 的 `Display` 已经把"下一步该做什么"写全了。
+fn http_transport(
+    base_url: &str,
+    dataset_id: &str,
+    tls_pin: Option<&str>,
+    sid: Option<arca_format::trace::Sid>,
+) -> Result<HttpTransport, String> {
+    if !base_url.starts_with("https://") {
+        return Ok(HttpTransport::new(base_url, dataset_id, sid));
+    }
+    let trust = arca_cli::tls::decide_for_url(base_url, tls_pin).map_err(|e| e.to_string())?;
+    Ok(HttpTransport::with_trust(base_url, dataset_id, sid, &trust))
+}
+
+/// `https://` 请求失败、且这个 hub 没有 pin 时，把一句语焉不详的握手错误
+/// 换成"这是自签名证书，你需要 pin，指纹是这个"的可执行诊断
+/// （[`arca_cli::tls::explain_handshake_failure`]）。
+///
+/// 只在**没有 pin** 时补——配了 pin 还失败的场合，`http_transport` 里的
+/// 指纹比对早就给出了更准确的结论（[`arca_cli::tls::PinError::Mismatch`]）。
+fn explain_tls_if_helpful(target: &HubTarget, err: &dyn std::fmt::Display) -> String {
+    let HubTarget::Http { base_url, tls_pin } = target else {
+        return err.to_string();
+    };
+    if tls_pin.is_some() || !base_url.starts_with("https://") {
+        return err.to_string();
+    }
+    match arca_cli::tls::host_port(base_url) {
+        Some((host, port)) => format!(
+            "{err}\n{}",
+            arca_cli::tls::explain_handshake_failure(&host, port)
+        ),
+        None => err.to_string(),
+    }
+}
+
+/// `arca hub trust <hub 名> [--fingerprint sha256:…]`（M2e Task 4，spec §9）：
+/// 为一个 `https://` hub 记录自签名证书的指纹 pin。
+///
+/// # 不带 `--fingerprint`：只打印，绝不写入
+///
+/// 这是刻意的，也是这条命令最重要的性质：**arca 绝不"首次使用即信任"**。
+/// TOFU 把"一次静默的中间人机会"做成默认行为——第一次连接恰好被劫持，
+/// 此后所有连接都会忠实地信任攻击者的证书，且再也不会报警。所以这里只把
+/// 服务端此刻出示的指纹打到 stdout，要求用户**用带外渠道核对**（在 hub
+/// 那台机器上 `openssl x509 -in <证书> -noout -fingerprint -sha256`），
+/// 确认无误后把同一个值显式抄回 `--fingerprint`。
+///
+/// 带 `--fingerprint` 且与实测相符 → 写进 `.gitarca` 的
+/// `[hub.<名>].tls_pin`；不符 → 拒绝写入并报出两个值（I5）。
+pub fn hub_trust_cmd(hub_name: &str, fingerprint: Option<&str>) -> ExitCode {
+    let vault = match vault::open(&cwd()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let Some(hub) = vault.registry.hub(hub_name) else {
+        eprintln!("hub {hub_name:?} 未在 .gitarca 登记");
+        return ExitCode::from(1);
+    };
+    if !hub.url.starts_with("https://") {
+        eprintln!(
+            "hub {hub_name:?} 的 url 是 {}，不走 TLS——没有证书可以 pin。\
+             要启用 TLS 请先把 url 改成 https://。",
+            hub.url
+        );
+        return ExitCode::from(1);
+    }
+    let Some((host, port)) = arca_cli::tls::host_port(&hub.url) else {
+        eprintln!("无法从 {} 解析主机与端口", hub.url);
+        return ExitCode::from(1);
+    };
+
+    let der = match arca_cli::tls::probe_leaf_cert(&host, port) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let actual = arca_cli::tls::fingerprint(&der);
+
+    let Some(claimed) = fingerprint else {
+        // 数据走 stdout（可脚本消费/可复制粘贴），解释走 stderr。
+        println!("{actual}");
+        eprintln!(
+            "以上是 {host}:{port} 此刻出示的 TLS 证书指纹。**尚未写入任何东西。**\n\
+             arca 绝不「首次使用即信任」——请先用带外渠道核对它，例如在 hub 那台机器上运行\n\
+                 openssl x509 -in <证书文件> -noout -fingerprint -sha256\n\
+             （它输出的是冒号分隔的大写十六进制，去掉冒号转小写后应与上面完全一致）。\n\
+             确认无误后运行：\n\
+                 arca hub trust {hub_name} --fingerprint {actual}"
+        );
+        return ExitCode::SUCCESS;
+    };
+
+    let claimed = match arca_cli::tls::parse_pin(claimed) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    if claimed != actual {
+        eprintln!(
+            "指纹不符，**未写入任何东西**：\n\
+               你给出的：{claimed}\n\
+               服务端出示的：{actual}\n\
+             要么是你抄错了，要么这条连接上有人在中间。arca 不猜（I5）。"
+        );
+        return ExitCode::from(1);
+    }
+
+    match vault::set_hub_tls_pin(&vault, hub_name, &actual) {
+        Ok(()) => {
+            eprintln!(
+                "已把 {hub_name} 的 tls_pin 写入 .gitarca：{actual}\n\
+                 这个字段**进 git**（自建 hub 的证书指纹是团队共享的事实，让每个协作者\n\
+                 各自 TOFU 一次等于把中间人机会乘以人数；指纹是公开信息，不是密钥）。\n\
+                 今后这个 hub 的证书一旦变化，arca 会**拒绝连接**并要你重新确认。"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 /// `arca init`。
 pub fn init_cmd(path: Option<PathBuf>, no_hook: bool) -> ExitCode {
     let start = path.unwrap_or_else(cwd);
@@ -436,15 +575,28 @@ fn sync_one(path: &str, root: Option<&Path>) -> u8 {
                 &mut sink,
             )
         }
-        HubTarget::Http { base_url } => {
-            let transport =
-                HttpTransport::new(base_url, &resolved.cfg.dataset_id, Some(sid.clone()));
-            sync_lib::sync_transport(
-                &resolved.dataset_dir,
-                &transport,
-                &default_actor(),
-                &mut sink,
-            )
+        HubTarget::Http { base_url, tls_pin } => {
+            // M2e Task 4：`https://` 先按 spec §9 决定信任配置——配了 pin
+            // 就先探测证书、比对指纹，不符即在这里就拒连，**一个字节的
+            // 应用层数据都不会发出去**。
+            match http_transport(
+                base_url,
+                &resolved.cfg.dataset_id,
+                tls_pin.as_deref(),
+                Some(sid.clone()),
+            ) {
+                Ok(transport) => sync_lib::sync_transport(
+                    &resolved.dataset_dir,
+                    &transport,
+                    &default_actor(),
+                    &mut sink,
+                ),
+                Err(e) => {
+                    eprintln!("数据集 {path}（hub={}）：{e}", resolved.hub_name);
+                    flush_trace_if_needed(&sid, &mut sink, false);
+                    return 1;
+                }
+            }
         }
     };
 
@@ -473,7 +625,14 @@ fn sync_one(path: &str, root: Option<&Path>) -> u8 {
                     eprintln!("数据集 {path}（hub={}）离线：{e}", resolved.hub_name);
                 }
                 SyncError::Transport(_) => {
-                    eprintln!("数据集 {path}（hub={}）：{e}", resolved.hub_name);
+                    // M2e Task 4：`https://` 且没有 pin 时，一句语焉不详的
+                    // 握手失败换成"这是自签名证书，指纹是这个，你需要 pin"
+                    // 的可执行诊断。
+                    eprintln!(
+                        "数据集 {path}（hub={}）：{}",
+                        resolved.hub_name,
+                        explain_tls_if_helpful(&resolved.target, &e)
+                    );
                 }
                 _ => {
                     eprintln!("{e}");
@@ -608,9 +767,16 @@ fn status_one(path: &str, root: Option<&Path>) -> u8 {
             };
             status_lib::status(&resolved.dataset_dir, &store_root, &mut sink)
         }
-        HubTarget::Http { base_url } => {
-            let transport = HttpTransport::new(base_url, &resolved.cfg.dataset_id, None);
-            status_lib::status_transport(&resolved.dataset_dir, &transport, &mut sink)
+        HubTarget::Http { base_url, tls_pin } => {
+            match http_transport(base_url, &resolved.cfg.dataset_id, tls_pin.as_deref(), None) {
+                Ok(transport) => {
+                    status_lib::status_transport(&resolved.dataset_dir, &transport, &mut sink)
+                }
+                Err(e) => {
+                    eprintln!("数据集 {path}（hub={}）：{e}", resolved.hub_name);
+                    return 1;
+                }
+            }
         }
     };
 
@@ -659,7 +825,11 @@ fn status_one(path: &str, root: Option<&Path>) -> u8 {
             2
         }
         Err(e @ status_lib::StatusError::Transport(_)) => {
-            eprintln!("数据集 {path}（hub={}）：{e}", resolved.hub_name);
+            eprintln!(
+                "数据集 {path}（hub={}）：{}",
+                resolved.hub_name,
+                explain_tls_if_helpful(&resolved.target, &e)
+            );
             level.max(1)
         }
         Err(e) => {
@@ -830,9 +1000,14 @@ pub fn verify_cmd(path: &str, deep: bool, root: Option<&Path>) -> ExitCode {
             }
             verify_local(path, root_path)
         }
-        HubTarget::Http { base_url } => {
-            let transport = HttpTransport::new(base_url, &resolved.cfg.dataset_id, None);
-            verify_remote(path, &resolved, &transport, deep)
+        HubTarget::Http { base_url, tls_pin } => {
+            match http_transport(base_url, &resolved.cfg.dataset_id, tls_pin.as_deref(), None) {
+                Ok(transport) => verify_remote(path, &resolved, &transport, deep),
+                Err(e) => {
+                    eprintln!("数据集 {path}（hub={}）：{e}", resolved.hub_name);
+                    ExitCode::from(1)
+                }
+            }
         }
     }
 }
@@ -910,7 +1085,11 @@ fn verify_remote(
             return ExitCode::from(2);
         }
         Err(e) => {
-            eprintln!("数据集 {path}（hub={}）：{e}", resolved.hub_name);
+            eprintln!(
+                "数据集 {path}（hub={}）：{}",
+                resolved.hub_name,
+                explain_tls_if_helpful(&resolved.target, &e)
+            );
             return ExitCode::from(1);
         }
     };

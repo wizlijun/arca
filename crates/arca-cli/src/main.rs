@@ -181,6 +181,11 @@ enum Command {
         #[arg(long)]
         root: Option<std::path::PathBuf>,
     },
+    /// hub 端点的本机操作（目前只有 TLS 证书 pin，spec §9）
+    Hub {
+        #[command(subcommand)]
+        action: HubCommand,
+    },
     /// plumbing：hub 侧当前清单（--json 输出，格式见 PROTOCOL.md §5）
     Ls {
         /// 数据集路径，相对 vault 根
@@ -216,6 +221,23 @@ enum Command {
     State {
         #[command(subcommand)]
         action: StateCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum HubCommand {
+    /// 为一个 https:// hub 记录自签名证书的指纹 pin（spec §9）。不带
+    /// --fingerprint 时**只打印**服务端此刻出示的指纹、不写入任何东西：
+    /// arca 绝不"首次使用即信任"，请先用带外渠道核对（在 hub 那台机器上
+    /// `openssl x509 -in <证书> -noout -fingerprint -sha256`），确认无误后
+    /// 把同一个值显式抄回 --fingerprint。pin 一旦记录，该 hub 的证书变化
+    /// 就会让 arca 拒绝连接并要你重新确认
+    Trust {
+        /// hub 名（.gitarca 里的 `[hub.<name>]`）
+        name: String,
+        /// 你已经带外核对过的指纹，形如 sha256:<64 位小写十六进制>
+        #[arg(long)]
+        fingerprint: Option<String>,
     },
 }
 
@@ -349,6 +371,11 @@ fn main() -> std::process::ExitCode {
                 root.as_deref(),
             )
         }
+        Command::Hub { action } => match action {
+            HubCommand::Trust { name, fingerprint } => {
+                commands::porcelain::hub_trust_cmd(&name, fingerprint.as_deref())
+            }
+        },
         Command::Ls {
             path,
             root,

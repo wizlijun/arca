@@ -28,6 +28,12 @@ toml = "1.1.4"
 # 固定同一版本，不引入新的依赖树分支。
 futures-util = { version = "0.3.33", default-features = false, features = ["std"] }
 base64 = "0.23.1"
+# TLS（M2e Task 4，spec §9）：`hub.toml` 里配了 [tls] 才启用，未配置仍是
+# 明文 http://（本机/内网场景合法）。axum-server 是 axum 官方生态里最薄的
+# 那层 TLS accept 循环；rustls 而不是 openssl——不引入系统 C 库依赖，
+# 单二进制部署到 ARM NAS 的形态（spec §1.1 目标 9）不因此变复杂。
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

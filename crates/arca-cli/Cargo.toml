@@ -22,11 +22,23 @@ arca-store = { path = "../arca-store" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 directories = "6.0.0"
-ureq = { version = "3", default-features = false, features = ["json"] }
+# `rustls` feature：`https://`（M2e Task 4，spec §9）。ureq 的 rustls 是
+# **纯同步**实现（直接跑在 std::net::TcpStream 上），不拉任何异步运行时
+# ——`cargo tree -p arca-cli | grep -c tokio` 必须仍然是 0（spec §3.1）。
+ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
+# 直接依赖 rustls 是为了做「只为取证书」的探测握手：ureq 3 没有暴露自定义
+# 证书校验器的钩子（只给 RootCerts 三选一 + 一个完全关掉校验的开关），
+# 而指纹 pin 需要先拿到服务端叶子证书。见 crates/arca-cli/src/tls.rs 模块
+# 文档。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+sha2 = "0.10.9"
 percent-encoding = "2.3.2"
 base64 = "0.23.1"
 toml = "1.1.4"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# 只用于 TLS 测试里现造一张自签名证书（M2e Task 4）——不进生产依赖树。
+rcgen = "0.14"
+rustls-pki-types = "1"
 # 计划依赖（实现时启用）：serde_json（--json 输出，M1）

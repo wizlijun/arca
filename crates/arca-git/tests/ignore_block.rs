@@ -196,6 +196,7 @@ fn check_ignore_写对了不等于_vault_一致_已追踪文件仍被_check_vaul
         HubEntry {
             instance_id: hub_id.to_string(),
             url: "https://example.com".to_string(),
+            tls_pin: None,
         },
     );
     let registry = Registry::new(

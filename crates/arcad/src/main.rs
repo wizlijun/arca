@@ -15,6 +15,19 @@
 //! arcad --check [--config <hub.toml 路径>]
 //! ```
 //!
+//! # TLS（M2e Task 4，spec §9）
+//!
+//! `hub.toml` 里可选地配 `[tls] cert = "…" key = "…"`（PEM）。**未配置就是
+//! 明文 `http://`**——本机/内网场景完全合法，M2b/M2c 一路就是这么跑的，
+//! 这条路径的行为一字未改。配置了就监听 `https://`。
+//!
+//! 两项必须同时给出，只给一项拒绝启动——绝不"忽略 TLS 继续用明文起"
+//! （见 `config::TlsConfig` 的文档：那会让运维以为流量已经加密）。
+//!
+//! 自签名证书的客户端信任由 `.gitarca` 的 `tls_pin` 承担（FORMAT.md §9.1、
+//! `arca-cli::tls`）：服务端这一侧不需要为自签名做任何特殊处理，它只管
+//! 出示证书。
+//!
 //! `--check`：只对配置里的每个数据集做一次挂载检查并把结果打到 stdout，
 //! **不起任何服务**——运维排障用（brief 原文）。任一数据集离线时进程以
 //! 非零状态退出，供脚本/监控直接判断，但**检查本身不会因为某一个根离线
@@ -118,6 +131,7 @@ fn main() -> ExitCode {
         };
     }
 
+    let tls = hub_config.tls.clone();
     let state = Arc::new(registry);
     let app = api::router(state);
 
@@ -133,12 +147,46 @@ fn main() -> ExitCode {
     };
 
     let bind = args.bind.clone();
-    let result = rt.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(&bind).await?;
-        eprintln!("[arcad] 监听 {bind}");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
+    let result: Result<(), String> = rt.block_on(async move {
+        match tls {
+            // 未配置 [tls] → 明文 http://（M2b/M2c 一路的既有行为，一字未改）。
+            None => {
+                let listener = tokio::net::TcpListener::bind(&bind)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                eprintln!("[arcad] 监听 http://{bind}（明文——未配置 [tls]）");
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown_signal())
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            Some(t) => {
+                // 装 ring 作为进程级 CryptoProvider——`axum-server` 用的是
+                // `tls-rustls-no-provider`（不替我们选算法后端），所以必须
+                // 由这里显式安装一次。重复安装返回 Err，忽略即可。
+                let _ = rustls::crypto::ring::default_provider().install_default();
+                let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(&t.cert, &t.key)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "加载 TLS 证书/私钥失败（cert={}，key={}）：{e}",
+                            t.cert.display(),
+                            t.key.display()
+                        )
+                    })?;
+                let addr: std::net::SocketAddr = bind
+                    .parse()
+                    .map_err(|e| format!("--bind {bind} 解析失败：{e}"))?;
+                eprintln!(
+                    "[arcad] 监听 https://{bind}（TLS，证书 {}）",
+                    t.cert.display()
+                );
+                axum_server::bind_rustls(addr, cfg)
+                    .serve(app.into_make_service())
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        }
     });
 
     match result {

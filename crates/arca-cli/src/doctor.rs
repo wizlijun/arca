@@ -287,8 +287,18 @@ pub fn doctor(repo: &Repo, registry: &Registry, root_override: Option<&Path>) ->
         // 类型不工作」。
         let source = match remote_source(&resolved) {
             Ok(s) => s,
-            Err(reason) => {
+            Err(CheckFailure::Offline(reason)) => {
                 datasets.push(DatasetHealth::Offline {
+                    path: resolved.normalized_path,
+                    reason,
+                });
+                continue;
+            }
+            // 证书 pin 不符**不是**"数据集离线"——那是"我不确定对面是不是
+            // 你的 hub"，处置完全不同（离线是等卷挂回来，pin 不符是要人去
+            // 查证）。报成 CheckFailed，不折进 Offline。
+            Err(CheckFailure::Failed(reason)) => {
+                datasets.push(DatasetHealth::CheckFailed {
                     path: resolved.normalized_path,
                     reason,
                 });
@@ -360,19 +370,33 @@ enum CheckFailure {
 /// 不符）——`http(s)://` 这一侧建立 `HttpTransport` 只是构造一个客户端，不
 /// 发任何请求，因此永远成功；它的离线要等到真的 `read_remote()` 收到 503
 /// 才知道（见 `RemoteSource::read_remote`）。
-fn remote_source(resolved: &dataset::ResolvedDataset) -> Result<RemoteSource, String> {
+fn remote_source(resolved: &dataset::ResolvedDataset) -> Result<RemoteSource, CheckFailure> {
     match &resolved.target {
         dataset::HubTarget::Local(root_path) => {
             // I11：先按已知身份打开一次，身份不符/未挂载即离线。
             StorageRoot::open(root_path, Some(&resolved.cfg.dataset_id))
                 .map(RemoteSource::Local)
-                .map_err(|e| e.to_string())
+                .map_err(|e| CheckFailure::Offline(e.to_string()))
         }
-        dataset::HubTarget::Http { base_url } => Ok(RemoteSource::Http(
+        dataset::HubTarget::Http { base_url, tls_pin } => {
+            // M2e Task 4：`https://` 先按 spec §9 决定信任配置（配了 pin 就
+            // 探测 + 比对指纹，不符即拒连）。pin 相关的失败**不是**"数据集
+            // 离线"——它是"我不确定对面是不是你的 hub"，两者的处置完全不同：
+            // 离线是等卷挂回来，pin 不符是要人去查证。所以走 `Err` 而不是
+            // `Ok(Offline)`，由 doctor 报成 `CheckFailed`（I5）。
+            let trust = crate::tls::decide_for_url(base_url, tls_pin.as_deref())
+                .map_err(|e| CheckFailure::Failed(e.to_string()))?;
             // doctor 是一次性巡检，不携带 sid（它不产生 journal 事件，
             // sid 闭环对它没有意义）。
-            crate::transport::http::HttpTransport::new(base_url, &resolved.cfg.dataset_id, None),
-        )),
+            Ok(RemoteSource::Http(
+                crate::transport::http::HttpTransport::with_trust(
+                    base_url,
+                    &resolved.cfg.dataset_id,
+                    None,
+                    &trust,
+                ),
+            ))
+        }
     }
 }
 
@@ -861,10 +885,11 @@ mod tests {
         assert!(!report.is_clean());
     }
 
-    /// 评审 Important #3 的核心复现测试：hub 的 `url` 用了 M2 才支持的
-    /// transport（`https://`）——`register` 本身会拒绝这种 url（见
-    /// `register.rs` 的 `https_url被拒绝`），但既有 `.gitarca` 完全可能是
-    /// 手工改过、或来自更新版本客户端写入的、当前二进制读不懂的 transport。
+    /// 评审 Important #3 的核心复现测试：hub 的 `url` 用了本二进制读不懂的
+    /// transport（这里用 `ftp://`——`https://` 自 M2e Task 4 起已经受支持，
+    /// 不再是"不认识的 transport"了）。`register` 本身会拒绝这种 url（见
+    /// `register.rs` 的 `未知transport仍被拒绝`），但既有 `.gitarca` 完全
+    /// 可能是手工改过、或来自更新版本客户端写入的。
     /// `doctor` 此前用 `let Ok(resolved) = .. else { continue }` 把这种
     /// 数据集整个静默跳过，报告"零问题"；同一状态下 `arca status` 正确
     /// 报错退出非零——这个测试钉住两者必须一致。
@@ -875,8 +900,8 @@ mod tests {
         // 支持的 transport——模拟"既有 .gitarca 被手工改过/来自未来版本"。
         let gitarca_path = vault_dir.path().join(crate::vault::GITARCA_FILE);
         let text = fs::read_to_string(&gitarca_path).unwrap();
-        let patched = text.replace("file://", "https://");
-        assert!(patched.contains("https://"), "测试前置条件：替换应生效");
+        let patched = text.replace("file://", "ftp://");
+        assert!(patched.contains("ftp://"), "测试前置条件：替换应生效");
         fs::write(&gitarca_path, patched).unwrap();
 
         let vault = crate::vault::open(vault_dir.path()).unwrap();

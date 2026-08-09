@@ -395,6 +395,7 @@ mod tests {
             HubEntry {
                 instance_id: instance_id.to_string(),
                 url: "https://example.com".to_string(),
+                tls_pin: None,
             },
         );
         Registry::new(hub, datasets)

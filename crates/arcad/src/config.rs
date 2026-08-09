@@ -38,11 +38,27 @@ pub struct DatasetConfig {
     pub path: PathBuf,
 }
 
+/// TLS 配置（M2e Task 4，spec §9）——**可选**：不配置就是明文 `http://`
+/// （本机/内网场景合法，M2b/M2c 一路就是这么跑的）。
+///
+/// 两项必须同时给出：只给证书不给私钥（或反过来）是配置错误，拒绝启动而
+/// 不是"忽略 TLS 继续用明文起"——后者会让运维以为自己已经在 TLS 后面，
+/// 而实际上所有流量都是明文（I5：绝不静默降级到一个更弱的保证）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsConfig {
+    /// PEM 证书链文件路径（自签名时就是那一张叶子证书）。
+    pub cert: PathBuf,
+    /// PEM 私钥文件路径（PKCS#8 / PKCS#1 / SEC1 皆可）。
+    pub key: PathBuf,
+}
+
 /// 解析后的 `hub.toml`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubConfig {
     pub instance_id: String,
     pub datasets: Vec<DatasetConfig>,
+    /// `None` = 明文 http://（合法且是默认）；`Some` = 启用 TLS。
+    pub tls: Option<TlsConfig>,
 }
 
 /// 配置读取/解析失败——彼此可区分（I5）。
@@ -58,6 +74,8 @@ pub enum ConfigError {
     BadDatasetId { value: String },
     /// 两条 `[[dataset]]` 记录用了同一个 `id`——配置歧义，拒绝，不静默取其一。
     DuplicateDatasetId { value: String },
+    /// `[tls]` 只给了 `cert` 或只给了 `key`——见 [`TlsConfig`] 的文档。
+    IncompleteTls { missing: &'static str },
 }
 
 impl fmt::Display for ConfigError {
@@ -77,6 +95,11 @@ impl fmt::Display for ConfigError {
                 f,
                 "dataset.id {value:?} 在 hub.toml 中出现了不止一次——两个存储根不能映射到\
                  同一个 dataset_id，这是配置歧义，拒绝启动"
+            ),
+            ConfigError::IncompleteTls { missing } => write!(
+                f,
+                "[tls] 缺少 {missing}——证书与私钥必须同时给出。拒绝启动，绝不「忽略 TLS \
+                 继续用明文起」：那会让你以为流量已经加密，而实际上全是明文（I5）。"
             ),
         }
     }
@@ -98,6 +121,17 @@ struct Wire {
     instance_id: String,
     #[serde(default)]
     dataset: Vec<DatasetWire>,
+    #[serde(default)]
+    tls: Option<TlsWire>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsWire {
+    #[serde(default)]
+    cert: Option<PathBuf>,
+    #[serde(default)]
+    key: Option<PathBuf>,
 }
 
 #[derive(serde::Deserialize)]
@@ -136,9 +170,22 @@ impl HubConfig {
             });
         }
 
+        let tls = match wire.tls {
+            None => None,
+            Some(t) => match (t.cert, t.key) {
+                (Some(cert), Some(key)) => Some(TlsConfig { cert, key }),
+                (None, Some(_)) => return Err(ConfigError::IncompleteTls { missing: "cert" }),
+                (Some(_), None) => return Err(ConfigError::IncompleteTls { missing: "key" }),
+                // `[tls]` 空表：等价于没写，按明文处理（不是错误——一个空
+                // 的表段是运维在注释掉配置时的常见中间态）。
+                (None, None) => None,
+            },
+        };
+
         Ok(HubConfig {
             instance_id: wire.instance_id,
             datasets,
+            tls,
         })
     }
 

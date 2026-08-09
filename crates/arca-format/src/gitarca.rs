@@ -18,6 +18,16 @@ const MAX_SCHEMA: u32 = 1;
 pub struct HubEntry {
     pub instance_id: String,
     pub url: String,
+    /// 自签名证书的指纹 pin：`sha256:<64 位小写十六进制>`（服务端叶子证书
+    /// DER 的 SHA-256），字节格式与语义见 `FORMAT.md` §9.1（M2e Task 4，
+    /// spec §9）。
+    ///
+    /// `#[serde(default)]` + `skip_serializing_if`：老的 `.gitarca`（M2e
+    /// 之前写出的）没有这个键，必须照常解析；反过来，没有 pin 的 hub 也
+    /// 不该在文件里留下一行 `tls_pin = ""` 的噪音——`.gitarca` 的设计目标
+    /// 是"一屏内可读完，diff 一目了然"（spec §4.3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_pin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,6 +360,7 @@ hub  = "home"
             HubEntry {
                 instance_id: "3f2a000000000000000000000000beef".to_string(),
                 url: "https://nas.example.com:8443".to_string(),
+                tls_pin: None,
             },
         );
         let dataset = vec![DatasetEntry {

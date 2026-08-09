@@ -196,6 +196,7 @@ mod tests {
                 id: id.to_string(),
                 path: dir.path().to_path_buf(),
             }],
+            tls: None,
         };
         let registry = Registry::from_config(&cfg);
         assert!(registry.get(id).unwrap().open().is_ok());
@@ -212,6 +213,7 @@ mod tests {
                 id: id.to_string(),
                 path: dir.path().to_path_buf(),
             }],
+            tls: None,
         };
         let registry = Registry::from_config(&cfg);
         assert!(registry.get(id).unwrap().open().is_ok());
@@ -229,6 +231,7 @@ mod tests {
         let cfg = HubConfig {
             instance_id: "0".repeat(32),
             datasets: vec![],
+            tls: None,
         };
         let registry = Registry::from_config(&cfg);
         assert!(registry.get("9c41000000000000000000000000abcd").is_none());
@@ -256,6 +259,7 @@ mod tests {
                     path: broken_dir.path().to_path_buf(),
                 },
             ],
+            tls: None,
         };
         let registry = Registry::from_config(&cfg);
         let results = check_all(&registry);
@@ -279,6 +283,7 @@ mod tests {
                 id: expected_id.to_string(),
                 path: dir.path().to_path_buf(),
             }],
+            tls: None,
         };
         let registry = Registry::from_config(&cfg);
         assert!(matches!(
